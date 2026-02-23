@@ -808,6 +808,23 @@ static void InitTrayIcon(HWND hwnd)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
+static void UpdateTooltip(void)
+{
+    if (g_configTitleMatch[0] == '\0' || g_keywordCount == 0) {
+        wcscpy(g_nid.szTip, L"Image pasting is inactive");
+    } else {
+        WCHAR wMatch[128];
+        MultiByteToWideChar(CP_UTF8, 0, g_configTitleMatch, -1, wMatch, 128);
+        /* szTip is 128 wchars max; prefix is ~27 chars, leave room */
+        WCHAR tip[128];
+        swprintf(tip, 128, L"Image pasting active for %s", wMatch);
+        tip[127] = L'\0';
+        wcscpy(g_nid.szTip, tip);
+    }
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
 static void CreateContextMenu(void)
 {
     g_hMenu = CreatePopupMenu();
@@ -1151,12 +1168,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "saveSettings") == 0) {
         char titleMatch[2048] = {0};
         json_get_string(msg, "titleMatch", titleMatch, sizeof(titleMatch));
-        if (titleMatch[0]) {
-            strncpy(g_configTitleMatch, titleMatch, sizeof(g_configTitleMatch) - 1);
-            g_configTitleMatch[sizeof(g_configTitleMatch) - 1] = '\0';
-        }
+        strncpy(g_configTitleMatch, titleMatch, sizeof(g_configTitleMatch) - 1);
+        g_configTitleMatch[sizeof(g_configTitleMatch) - 1] = '\0';
         SaveConfigToRegistry();
         ParseKeywords();
+        UpdateTooltip();
         LogMessage("Configuration updated: TitleMatch=%s", g_configTitleMatch);
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
@@ -1444,6 +1460,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* System tray */
     InitTrayIcon(g_hWndMain);
     CreateContextMenu();
+    UpdateTooltip();
 
     LogMessage("ImagePaster started");
     LogMessage("GDI+ initialized");
