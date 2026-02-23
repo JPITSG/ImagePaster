@@ -1,0 +1,5 @@
+#include "resource.h"
+
+IDI_APPICON      ICON   "assets/icon.ico"
+IDR_HTML_UI      RCDATA "assets/dist/index.html"
+IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
