@@ -1,5 +1,6 @@
 export type PasteMethod = "base64" | "http";
 export type CaptureGapFill = "white" | "black" | "blur";
+export type ImageStorage = "memory" | "disk";
 
 export interface ConfigData {
   titleMatch: string;
@@ -10,6 +11,8 @@ export interface ConfigData {
   httpAllowList: string;
   jpegQuality: number;
   imageHistoryLimit: number;
+  imageStorage: ImageStorage;
+  imageStorageDir: string;
   compatibilityPaste: boolean;
   screenCaptureEnabled: boolean;
   captureGapFill: CaptureGapFill;
@@ -34,6 +37,8 @@ export interface HistoryEntry {
   height: number;
   bytes: number;
   capturedAt: number;
+  storage: ImageStorage;
+  path: string;
   url: string;
   thumb: string;
 }
@@ -181,6 +186,7 @@ export function saveSettings(config: ConfigData) {
     httpAllowList: config.httpAllowList,
     jpegQuality: config.jpegQuality,
     imageHistoryLimit: config.imageHistoryLimit,
+    imageStorage: config.imageStorage,
     compatibilityPaste: config.compatibilityPaste ? 1 : 0,
     screenCaptureEnabled: config.screenCaptureEnabled ? 1 : 0,
     captureGapFill: config.captureGapFill,
@@ -242,6 +248,10 @@ export function copyHistoryUrl(token: string) {
 
 export function openHistoryUrl(token: string) {
   postMessage({ action: "historyOpenUrl", token });
+}
+
+export function revealHistoryFile(token: string) {
+  postMessage({ action: "historyRevealFile", token });
 }
 
 export function saveHistoryImage(token: string) {

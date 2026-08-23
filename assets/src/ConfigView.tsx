@@ -15,6 +15,7 @@ import {
   onUpdateProgress,
   type CaptureGapFill,
   type ConfigData,
+  type ImageStorage,
   type PasteMethod,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
@@ -69,6 +70,9 @@ export default function ConfigView({
   );
   const [httpPort, setHttpPort] = useState(String(config.httpPort));
   const [httpAllowList, setHttpAllowList] = useState(config.httpAllowList);
+  const [imageStorage, setImageStorage] = useState<ImageStorage>(
+    config.imageStorage,
+  );
   const [jpegQuality, setJpegQuality] = useState(String(config.jpegQuality));
   const [imageHistoryLimit, setImageHistoryLimit] = useState(
     String(config.imageHistoryLimit === 0 ? 1 : config.imageHistoryLimit),
@@ -256,6 +260,7 @@ export default function ConfigView({
       bindIp: selectedBindIp,
       httpPort: port,
       httpAllowList: allowEntries.join(", "),
+      imageStorage,
       jpegQuality: quality,
       imageHistoryLimit: historyLimit,
       compatibilityPaste,
@@ -459,7 +464,31 @@ export default function ConfigView({
         </div>
 
         <div className="space-y-1.5">
-          <Label htmlFor="imageHistoryLimit">In-memory Image History</Label>
+          <Label htmlFor="imageStorage">Image Storage</Label>
+          <select
+            id="imageStorage"
+            className={selectClass}
+            value={imageStorage}
+            onChange={(event) =>
+              setImageStorage(event.target.value as ImageStorage)
+            }
+          >
+            <option value="memory">Memory (default)</option>
+            <option value="disk">Disk (%LOCALAPPDATA%\ImagePaster)</option>
+          </select>
+          <p className="text-[11px] leading-snug text-neutral-500">
+            Where newly copied images are kept. Disk stores each JPEG in{" "}
+            <code className="font-mono text-neutral-700">
+              {config.imageStorageDir || "%LOCALAPPDATA%\\ImagePaster"}
+            </code>
+            ; if the folder or file cannot be written, the image stays in
+            memory and the failure is logged. Files are removed when images
+            are evicted and when ImagePaster exits.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="imageHistoryLimit">Image History</Label>
           <div className="grid grid-cols-[1fr_auto] items-center gap-3">
             <Input
               id="imageHistoryLimit"
@@ -486,8 +515,9 @@ export default function ConfigView({
             </label>
           </div>
           <p className="text-[11px] text-neutral-500">
-            Maximum images retained until exit, including the current image. A limit
-            of 1 keeps only the current image.
+            Maximum images retained until exit, whether stored in memory or on
+            disk, including the current image. A limit of 1 keeps only the
+            current image.
           </p>
         </div>
 

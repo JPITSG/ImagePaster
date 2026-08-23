@@ -1,4 +1,4 @@
-# ImagePaster 1.0.18
+# ImagePaster 1.0.19
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -8,9 +8,10 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Selectable paste method:
   - raw base64-encoded PNG text (legacy behavior)
   - a short instruction containing a temporary HTTP JPEG URL
-- Watches the clipboard continuously and keeps the latest image encoded in memory for both methods
-- Retains configurable in-memory JPEG history: 1–1000 total images or Unlimited until exit
-- History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser
+- Watches the clipboard continuously and keeps the latest image encoded and ready for both methods
+- Retains a configurable JPEG history (1–1000 total images or Unlimited) in memory or on disk until exit
+- Selectable image storage: memory (default) or disk under `%LOCALAPPDATA%\ImagePaster`, with graceful fallback to memory when the folder or a file cannot be written and automatic file cleanup on eviction, exit, and startup
+- History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser, and each entry shows whether it is stored in memory or on disk with a click-to-reveal path that opens File Explorer with the file selected
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
 - Optional HTTP client allowlist restricting image downloads to specific IPv4 addresses and CIDR subnets
@@ -40,9 +41,10 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 
 1. A low-level keyboard hook monitors for `Ctrl+V` globally
 2. When detected, it checks if the focused window's title contains any configured keyword
-3. A clipboard listener keeps an in-memory representation of the latest image as:
-   - base64-encoded PNG for the legacy method
-   - JPEG at the configured quality for HTTP delivery
+3. A clipboard listener keeps the latest image ready as:
+   - a base64-encoded PNG, always held in memory, for the legacy method
+   - a JPEG at the configured quality for HTTP delivery, kept in memory or on
+     disk according to the **Image Storage** setting
 4. If a matching window receives `Ctrl+V` while an image is current:
    - Base64 mode places the encoded PNG text on the clipboard.
    - HTTP mode replaces `{URL}` in the configured message with the current image
@@ -54,7 +56,9 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
 
-The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is memory-only and is discarded when ImagePaster exits.
+The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is discarded when ImagePaster exits regardless of the storage setting.
+
+**Image Storage** chooses where retained JPEGs live. Memory (the default) keeps everything in RAM, exactly as before. Disk writes each new image to `%LOCALAPPDATA%\ImagePaster\<image-id>.jpg` and serves HTTP requests, thumbnails, and saves from that file; the base64 PNG for the current image always stays in memory so base64 pasting is unaffected. The setting applies to newly copied images — existing entries keep their location until evicted. Failure handling is deliberately graceful: if the folder cannot be created or a file cannot be written, the failure is logged to the Activity Log and that image is kept in memory instead; nothing crashes and pasting keeps working. Disk files are deleted when their image is evicted, deleted, cleared, or when ImagePaster exits, and stale `<image-id>.jpg` files left by an unclean shutdown are removed at the next startup.
 
 If the **Allowed Clients** list is non-empty, only connections from the listed IPv4 addresses and CIDR subnets are served; everything else is dropped before the request is read and the rejection is recorded in the Activity Log. An empty list allows every client (equivalent to `0.0.0.0/0`).
 
@@ -121,6 +125,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | Allowed Clients | `HttpAllowList` | REG_SZ | Empty (allow all) |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
 | Image History Limit | `ImageHistoryLimit` | REG_DWORD | `1` |
+| Image Storage | `ImageStorage` | REG_DWORD | Memory |
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
 | Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
 | Multi-region Gap Fill | `CaptureGapFill` | REG_DWORD | White |

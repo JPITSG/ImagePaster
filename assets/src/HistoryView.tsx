@@ -6,6 +6,7 @@ import {
   deleteHistoryImage,
   onHistoryActionResult,
   openHistoryUrl,
+  revealHistoryFile,
   saveHistoryImage,
   type HistoryActionResult,
   type HistoryData,
@@ -84,6 +85,18 @@ function HistoryRow({ entry }: { entry: HistoryEntry }) {
         >
           {entry.url}
         </button>
+        {entry.storage === "disk" && entry.path ? (
+          <button
+            type="button"
+            title="Show this file in File Explorer"
+            onClick={() => revealHistoryFile(entry.token)}
+            className="block w-full cursor-pointer truncate text-left text-[10px] text-neutral-400 hover:text-neutral-600 hover:underline focus-visible:underline focus-visible:outline-none"
+          >
+            Disk · <span className="font-mono">{entry.path}</span>
+          </button>
+        ) : (
+          <div className="text-[10px] text-neutral-400">Stored in memory</div>
+        )}
       </div>
 
       <div className="flex shrink-0 flex-col gap-1">
@@ -146,8 +159,8 @@ export default function HistoryView({ history }: Props) {
         <div>
           <div className="text-xs font-medium">Retained Images</div>
           <p className="mt-1 text-[11px] text-neutral-500">
-            Clipboard images kept in memory and served by the built-in HTTP
-            server. Everything here is discarded when ImagePaster exits.
+            Clipboard images retained by the built-in HTTP server, in memory
+            or on disk. Everything here is discarded when ImagePaster exits.
           </p>
         </div>
         <span className="whitespace-nowrap text-[11px] tabular-nums text-neutral-400">
@@ -224,8 +237,9 @@ export default function HistoryView({ history }: Props) {
                 className="text-xs leading-relaxed text-neutral-600"
               >
                 All {history.total} image{history.total === 1 ? "" : "s"} will
-                be removed from memory, including the current paste target.
-                Their URLs stop working immediately and this cannot be undone.
+                be removed, including the current paste target. Disk-stored
+                files are deleted, all URLs stop working immediately, and this
+                cannot be undone.
               </p>
             </div>
             <div className="flex justify-end gap-2">

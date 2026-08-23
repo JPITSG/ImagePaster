@@ -6,7 +6,8 @@
  * PNG string or a short URL served by the built-in HTTP image server.
  *
  * Features:
- *   - Shared in-memory clipboard image cache with configurable JPEG history
+ *   - Shared clipboard image cache (in memory or on disk) with configurable
+ *     JPEG history
  *   - Configurable base64 or HTTP URL paste mode
  *   - Optional multi-monitor Print Screen capture with multi-region selection
  *   - Configurable title matching and HTTP bind settings (registry-persisted)
@@ -192,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.18"
-#define APP_VERSION_W     L"1.0.18"
+#define APP_VERSION_A     "1.0.19"
+#define APP_VERSION_W     L"1.0.19"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -239,6 +240,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 #define REG_VALUE_IGNORED_UPDATE_VERSION "IgnoredUpdateVersion"
 #define REG_VALUE_HTTP_ALLOW_LIST "HttpAllowList"
+#define REG_VALUE_IMAGE_STORAGE "ImageStorage"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
@@ -258,6 +260,9 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define MAX_HTTP_MESSAGE_TEMPLATE_BYTES 8192
 #define PASTE_METHOD_BASE64 0
 #define PASTE_METHOD_HTTP   1
+#define IMAGE_STORAGE_MEMORY 0
+#define IMAGE_STORAGE_DISK   1
+#define IMAGE_STORAGE_DIR_NAME L"ImagePaster"
 #define HTTP_EVENT_SERVED   200
 #define HTTP_EVENT_GONE     410
 #define HTTP_EVENT_NOT_FOUND 404
@@ -328,6 +333,8 @@ static int  g_configHttpPort = DEFAULT_HTTP_PORT;
 static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
 /* Zero means unlimited; finite limits include the current image. */
 static int  g_configImageHistoryLimit = DEFAULT_IMAGE_HISTORY_LIMIT;
+/* Where newly cached JPEGs are kept; memory is the default. */
+static int  g_configImageStorage = IMAGE_STORAGE_MEMORY;
 static BOOL g_configCompatibilityPaste = TRUE;
 static BOOL g_configScreenCaptureEnabled = FALSE;
 static int  g_configCaptureGapFill = CAPTURE_GAP_FILL_WHITE;
@@ -339,14 +346,15 @@ static int   g_keywordCount = 0;
 
 /* Clipboard image cache shared with the HTTP worker thread. */
 typedef struct {
-    BYTE *jpegData;
-    DWORD jpegSize;
+    BYTE *jpegData;  /* NULL when the JPEG lives on disk instead */
+    DWORD jpegSize;  /* JPEG size in bytes regardless of location */
     char *base64Data;
     DWORD base64Len;
     char token[IMAGE_TOKEN_HEX_LEN + 1];
     UINT width;
     UINT height;
     ULONGLONG capturedAtMs; /* Unix epoch milliseconds, UTC */
+    WCHAR *diskPath; /* malloc'd file path when stored on disk, else NULL */
 } CachedImage;
 
 static CachedImage g_cachedImage = {0};
@@ -930,11 +938,182 @@ static void RememberGoneTokenLocked(const char *token)
     g_goneTokenCount++;
 }
 
+/* ── Disk image storage (%LOCALAPPDATA%\ImagePaster) ───────────────────── */
+
+static BOOL BuildImageStorageDirectoryPath(WCHAR directory[MAX_PATH])
+{
+    WCHAR base[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL,
+                                SHGFP_TYPE_CURRENT, base))) {
+        return FALSE;
+    }
+    return swprintf(directory, MAX_PATH, L"%s\\%s", base,
+                    IMAGE_STORAGE_DIR_NAME) > 0;
+}
+
+static BOOL EnsureImageStorageDirectory(WCHAR directory[MAX_PATH])
+{
+    if (!BuildImageStorageDirectoryPath(directory)) {
+        LogMessage("WARNING: Could not resolve %%LOCALAPPDATA%% for disk image storage; keeping image in memory");
+        return FALSE;
+    }
+    if (!CreateDirectoryW(directory, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        LogMessage("WARNING: Could not create disk image storage directory (error %lu); keeping image in memory",
+                   GetLastError());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Writes a cached JPEG to disk storage. Returns the malloc'd file path, or
+   NULL after logging; the caller then keeps the image in memory instead. */
+static WCHAR *StoreImageToDisk(const char *token, const BYTE *jpegData,
+                               DWORD jpegSize)
+{
+    WCHAR directory[MAX_PATH];
+    WCHAR *path;
+    size_t pathChars;
+    HANDLE file;
+    DWORD written = 0;
+    BOOL wrote;
+
+    if (!token || !token[0] || !jpegData || jpegSize == 0) return NULL;
+    if (!EnsureImageStorageDirectory(directory)) return NULL;
+
+    pathChars = wcslen(directory) + 1 + IMAGE_TOKEN_HEX_LEN + 4 + 1;
+    path = (WCHAR *)malloc(pathChars * sizeof(WCHAR));
+    if (!path) return NULL;
+    if (swprintf(path, pathChars, L"%s\\%hs.jpg", directory, token) <= 0) {
+        free(path);
+        return NULL;
+    }
+
+    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        LogMessage("WARNING: Could not create image file in disk storage (error %lu); keeping image in memory",
+                   GetLastError());
+        free(path);
+        return NULL;
+    }
+    wrote = WriteFile(file, jpegData, jpegSize, &written, NULL) &&
+            written == jpegSize;
+    CloseHandle(file);
+    if (!wrote) {
+        LogMessage("WARNING: Could not write image file to disk storage (error %lu); keeping image in memory",
+                   GetLastError());
+        DeleteFileW(path);
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static BOOL IsImageStorageFileName(const WCHAR *fileName)
+{
+    for (int i = 0; i < IMAGE_TOKEN_HEX_LEN; i++) {
+        WCHAR c = fileName[i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) {
+            return FALSE;
+        }
+    }
+    return wcscmp(fileName + IMAGE_TOKEN_HEX_LEN, L".jpg") == 0;
+}
+
+/* Removes image files left behind by an earlier session that did not shut
+   down cleanly. Only files matching the <64-hex>.jpg pattern are touched. */
+static void CleanImageStorageDirectory(void)
+{
+    WCHAR directory[MAX_PATH];
+    WCHAR pattern[MAX_PATH];
+    WIN32_FIND_DATAW findData;
+    HANDLE find;
+    unsigned removed = 0;
+
+    if (!BuildImageStorageDirectoryPath(directory)) return;
+    if (swprintf(pattern, MAX_PATH, L"%s\\*.jpg", directory) <= 0) return;
+    find = FindFirstFileW(pattern, &findData);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            IsImageStorageFileName(findData.cFileName)) {
+            WCHAR path[MAX_PATH];
+            if (swprintf(path, MAX_PATH, L"%s\\%s", directory,
+                         findData.cFileName) > 0 && DeleteFileW(path)) {
+                removed++;
+            }
+        }
+    } while (FindNextFileW(find, &findData));
+    FindClose(find);
+    if (removed > 0) {
+        LogMessage("Removed %u stale image file(s) from disk storage",
+                   removed);
+    }
+}
+
+/* Frees an image's resources; a disk-stored JPEG file is deleted because the
+   cache entry owns it. */
 static void FreeCachedImageData(CachedImage *image)
 {
+    if (image->diskPath) {
+        DeleteFileW(image->diskPath);
+        free(image->diskPath);
+    }
     free(image->jpegData);
     free(image->base64Data);
     ZeroMemory(image, sizeof(*image));
+}
+
+/* Returns a malloc'd copy of the image's JPEG bytes from memory or disk.
+   Caller must hold g_imageLock (shared is enough); safe on the HTTP worker
+   thread, so it must not call LogMessage. */
+static BYTE *LoadCachedImageBytesLocked(const CachedImage *image, DWORD *size)
+{
+    *size = 0;
+    if (image->jpegData && image->jpegSize > 0) {
+        BYTE *copy = (BYTE *)malloc(image->jpegSize);
+        if (!copy) return NULL;
+        memcpy(copy, image->jpegData, image->jpegSize);
+        *size = image->jpegSize;
+        return copy;
+    }
+    if (image->diskPath) {
+        HANDLE file = CreateFileW(image->diskPath, GENERIC_READ,
+                                  FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+        LARGE_INTEGER fileSize;
+        BYTE *data;
+        DWORD readTotal = 0;
+        if (file == INVALID_HANDLE_VALUE) return NULL;
+        if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
+            fileSize.QuadPart > 0x7fffffffLL) {
+            CloseHandle(file);
+            return NULL;
+        }
+        data = (BYTE *)malloc((size_t)fileSize.QuadPart);
+        if (!data) {
+            CloseHandle(file);
+            return NULL;
+        }
+        while (readTotal < (DWORD)fileSize.QuadPart) {
+            DWORD readNow = 0;
+            if (!ReadFile(file, data + readTotal,
+                          (DWORD)fileSize.QuadPart - readTotal,
+                          &readNow, NULL) || readNow == 0) {
+                break;
+            }
+            readTotal += readNow;
+        }
+        CloseHandle(file);
+        if (readTotal != (DWORD)fileSize.QuadPart) {
+            free(data);
+            return NULL;
+        }
+        *size = readTotal;
+        return data;
+    }
+    return NULL;
 }
 
 /* Caller must hold g_imageLock exclusively. A finite setting reserves one
@@ -990,7 +1169,8 @@ static void ArchiveCurrentImageLocked(void)
     free(g_cachedImage.base64Data);
     ZeroMemory(&g_cachedImage, sizeof(g_cachedImage));
 
-    if (HistoricalImageLimitLocked() == 0 || !archived.jpegData) {
+    if (HistoricalImageLimitLocked() == 0 ||
+        (!archived.jpegData && !archived.diskPath)) {
         RememberGoneTokenLocked(archived.token);
         FreeCachedImageData(&archived);
         return;
@@ -1029,9 +1209,12 @@ static ULONGLONG GetUnixTimeMs(void)
     return (value.QuadPart - 116444736000000000ULL) / 10000ULL;
 }
 
+/* Takes ownership of jpegData (may be NULL when diskPath is set), base64Data,
+   and diskPath. */
 static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
                                 char *base64Data, DWORD base64Len,
-                                const char *token, UINT width, UINT height)
+                                const char *token, UINT width, UINT height,
+                                WCHAR *diskPath)
 {
     AcquireSRWLockExclusive(&g_imageLock);
     ArchiveCurrentImageLocked();
@@ -1043,6 +1226,7 @@ static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
     g_cachedImage.width = width;
     g_cachedImage.height = height;
     g_cachedImage.capturedAtMs = GetUnixTimeMs();
+    g_cachedImage.diskPath = diskPath;
     ReleaseSRWLockExclusive(&g_imageLock);
     NotifyHistoryViewChanged();
 }
@@ -1099,7 +1283,9 @@ static BOOL HasCachedImage(void)
     BOOL available;
     AcquireSRWLockShared(&g_imageLock);
     available = g_cachedImage.token[0] != '\0' &&
-                g_cachedImage.jpegData != NULL && g_cachedImage.base64Data != NULL;
+                (g_cachedImage.jpegData != NULL ||
+                 g_cachedImage.diskPath != NULL) &&
+                g_cachedImage.base64Data != NULL;
     ReleaseSRWLockShared(&g_imageLock);
     return available;
 }
@@ -1108,7 +1294,9 @@ static BOOL AnyRetainedImages(void)
 {
     BOOL any;
     AcquireSRWLockShared(&g_imageLock);
-    any = (g_cachedImage.token[0] != '\0' && g_cachedImage.jpegData != NULL) ||
+    any = (g_cachedImage.token[0] != '\0' &&
+           (g_cachedImage.jpegData != NULL ||
+            g_cachedImage.diskPath != NULL)) ||
           g_imageHistoryCount > 0;
     ReleaseSRWLockShared(&g_imageLock);
     return any;
@@ -1138,18 +1326,39 @@ static BOOL CopyRetainedImageByToken(const char *token, BYTE **jpegCopy,
             }
         }
     }
-    if (found && found->jpegData && found->jpegSize > 0) {
-        BYTE *copy = (BYTE *)malloc(found->jpegSize);
-        if (copy) {
-            memcpy(copy, found->jpegData, found->jpegSize);
-            *jpegCopy = copy;
-            *jpegSize = found->jpegSize;
+    if (found) {
+        *jpegCopy = LoadCachedImageBytesLocked(found, jpegSize);
+        if (*jpegCopy) {
             if (capturedAtMs) *capturedAtMs = found->capturedAtMs;
             success = TRUE;
         }
     }
     ReleaseSRWLockShared(&g_imageLock);
     return success;
+}
+
+/* Returns a malloc'd copy of the disk path for a retained image, or NULL if
+   the image is gone or stored in memory. */
+static WCHAR *GetRetainedImageDiskPathCopy(const char *token)
+{
+    WCHAR *path = NULL;
+    const CachedImage *found = NULL;
+
+    if (!token || !token[0]) return NULL;
+    AcquireSRWLockShared(&g_imageLock);
+    if (g_cachedImage.token[0] && strcmp(g_cachedImage.token, token) == 0) {
+        found = &g_cachedImage;
+    } else {
+        for (size_t i = 0; i < g_imageHistoryCount; i++) {
+            if (strcmp(g_imageHistory[i].token, token) == 0) {
+                found = &g_imageHistory[i];
+                break;
+            }
+        }
+    }
+    if (found && found->diskPath) path = _wcsdup(found->diskPath);
+    ReleaseSRWLockShared(&g_imageLock);
+    return path;
 }
 
 /* Removes a retained image; its URL starts answering 410 Gone. Deleting the
@@ -1297,14 +1506,25 @@ cleanup_clipboard:
         goto cleanup;
     }
 
-    ReplaceCurrentImage(jpegData, jpegSize, base64Data, base64Len,
-                        token, width, height);
+    {
+        WCHAR *diskPath = NULL;
+        if (g_configImageStorage == IMAGE_STORAGE_DISK) {
+            diskPath = StoreImageToDisk(token, jpegData, jpegSize);
+            if (diskPath) {
+                free(jpegData);
+                jpegData = NULL;
+            }
+        }
+        ReplaceCurrentImage(jpegData, jpegSize, base64Data, base64Len,
+                            token, width, height, diskPath);
+        LogMessage("Clipboard image cached (%s): %ux%u, JPEG=%lu bytes, quality=%d%%, id=%.12s...",
+                   diskPath ? "disk" : "memory", width, height, jpegSize,
+                   g_configJpegQuality, token);
+    }
     jpegData = NULL;
     base64Data = NULL;
     g_lastClipboardSequence = sequence;
     KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
-    LogMessage("Clipboard image cached: %ux%u, JPEG=%lu bytes, quality=%d%%, id=%.12s...",
-               width, height, jpegSize, g_configJpegQuality, token);
     success = TRUE;
 
 cleanup:
@@ -1421,28 +1641,14 @@ static int FindImageForToken(const char *token, BYTE **jpegCopy, DWORD *jpegSize
 
     AcquireSRWLockShared(&g_imageLock);
     if (g_cachedImage.token[0] && strcmp(g_cachedImage.token, token) == 0) {
-        BYTE *copy = (BYTE *)malloc(g_cachedImage.jpegSize);
-        if (copy) {
-            memcpy(copy, g_cachedImage.jpegData, g_cachedImage.jpegSize);
-            *jpegCopy = copy;
-            *jpegSize = g_cachedImage.jpegSize;
-            status = HTTP_EVENT_SERVED;
-        } else {
-            status = 500;
-        }
+        *jpegCopy = LoadCachedImageBytesLocked(&g_cachedImage, jpegSize);
+        status = *jpegCopy ? HTTP_EVENT_SERVED : 500;
     } else {
         for (size_t i = g_imageHistoryCount; i > 0; i--) {
             CachedImage *historical = &g_imageHistory[i - 1];
             if (strcmp(historical->token, token) == 0) {
-                BYTE *copy = (BYTE *)malloc(historical->jpegSize);
-                if (copy) {
-                    memcpy(copy, historical->jpegData, historical->jpegSize);
-                    *jpegCopy = copy;
-                    *jpegSize = historical->jpegSize;
-                    status = HTTP_EVENT_SERVED;
-                } else {
-                    status = 500;
-                }
+                *jpegCopy = LoadCachedImageBytesLocked(historical, jpegSize);
+                status = *jpegCopy ? HTTP_EVENT_SERVED : 500;
                 break;
             }
         }
@@ -1500,8 +1706,8 @@ static void SendHttpResponse(SOCKET client, int status, BOOL headOnly,
     case HTTP_EVENT_GONE:
         reason = "Gone";
         contentType = "text/plain; charset=utf-8";
-        messageHeader = "This image was evicted from the in-memory image history";
-        body = "This image is no longer available because it was evicted from ImagePaster's in-memory image history.\n";
+        messageHeader = "This image was evicted from the image history";
+        body = "This image is no longer available because it was evicted from ImagePaster's image history.\n";
         bodySize = (DWORD)strlen(body);
         break;
     case 405:
@@ -1696,7 +1902,7 @@ static void HandleHttpClient(SOCKET client)
     SendHttpResponse(client, status, headOnly, jpegCopy, jpegSize);
     free(jpegCopy);
     if (status == HTTP_EVENT_SERVED || status == HTTP_EVENT_GONE ||
-        status == HTTP_EVENT_NOT_FOUND) {
+        status == HTTP_EVENT_NOT_FOUND || status == 500) {
         PostMessage(g_hWndMain, WM_HTTP_EVENT, (WPARAM)status, 0);
     }
 }
@@ -2276,6 +2482,13 @@ static BOOL LoadConfigFromRegistry(void)
     }
     g_configHttpAllowList[sizeof(g_configHttpAllowList) - 1] = '\0';
 
+    size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_IMAGE_STORAGE, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= IMAGE_STORAGE_DISK) {
+        g_configImageStorage = (int)value;
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -2325,6 +2538,9 @@ static void SaveConfigToRegistry(void)
         value = (DWORD)g_configAutoCheckForUpdates;
         RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configImageStorage;
+        RegSetValueExA(hKey, REG_VALUE_IMAGE_STORAGE, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
     }
     RegSetValueExA(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
                    (const BYTE *)g_ignoredUpdateVersion,
@@ -2340,7 +2556,7 @@ static void SaveConfigToRegistry(void)
         snprintf(historyText, sizeof(historyText), "%d",
                  g_configImageHistoryLimit);
     }
-    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, gap=%s, bind=%s:%d, JPEG=%d%%, history=%s, allow=%s, titles=%s",
+    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, gap=%s, bind=%s:%d, JPEG=%d%%, history=%s, storage=%s, allow=%s, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
                g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V",
                g_configScreenCaptureEnabled ? "enabled" : "disabled",
@@ -2349,6 +2565,7 @@ static void SaveConfigToRegistry(void)
                                                                   "white",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
                historyText,
+               g_configImageStorage == IMAGE_STORAGE_DISK ? "disk" : "memory",
                g_configHttpAllowList[0] ? g_configHttpAllowList : "all",
                g_configTitleMatch);
 }
@@ -5940,6 +6157,8 @@ static void webview_push_init_config(void)
     wchar_t wHttpAllowList[MAX_HTTP_ALLOW_LIST_BYTES * 2];
     wchar_t wHttpStatus[512];
     wchar_t wUpdateCompletedVersion[64];
+    WCHAR storageDir[MAX_PATH];
+    wchar_t wStorageDir[MAX_PATH * 2];
     wchar_t ipsJson[4096];
     char ips[MAX_DETECTED_IPS][INET_ADDRSTRLEN];
     int ipCount = EnumerateDetectedIpv4Addresses(ips, MAX_DETECTED_IPS);
@@ -5953,6 +6172,8 @@ static void webview_push_init_config(void)
     json_escape_string(g_configBindIp, wBindIp, 128);
     json_escape_string(g_configHttpAllowList, wHttpAllowList,
                        MAX_HTTP_ALLOW_LIST_BYTES * 2);
+    if (!BuildImageStorageDirectoryPath(storageDir)) storageDir[0] = L'\0';
+    json_escape_wstring(storageDir, wStorageDir, MAX_PATH * 2);
     json_escape_string(g_httpStatus, wHttpStatus, 512);
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_W : L"",
                         wUpdateCompletedVersion, 64);
@@ -5977,6 +6198,8 @@ static void webview_push_init_config(void)
         L"\"httpAllowList\":\"%s\","
         L"\"jpegQuality\":%d,"
         L"\"imageHistoryLimit\":%d,"
+        L"\"imageStorage\":\"%s\","
+        L"\"imageStorageDir\":\"%s\","
         L"\"compatibilityPaste\":%s,"
         L"\"screenCaptureEnabled\":%s,"
         L"\"captureGapFill\":\"%s\","
@@ -5992,6 +6215,8 @@ static void webview_push_init_config(void)
         g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
         wHttpMessageTemplate, wBindIp, g_configHttpPort, wHttpAllowList,
         g_configJpegQuality, g_configImageHistoryLimit,
+        g_configImageStorage == IMAGE_STORAGE_DISK ? L"disk" : L"memory",
+        wStorageDir,
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
@@ -6161,7 +6386,8 @@ static void webview_push_init_history(void)
        the whole snapshot without risking a self-deadlock. */
     AcquireSRWLockShared(&g_imageLock);
 
-    if (g_cachedImage.token[0] && g_cachedImage.jpegData) {
+    if (g_cachedImage.token[0] &&
+        (g_cachedImage.jpegData || g_cachedImage.diskPath)) {
         total++;
         totalBytes += g_cachedImage.jpegSize;
         items[shown] = &g_cachedImage;
@@ -6181,9 +6407,13 @@ static void webview_push_init_history(void)
 
     scriptCap = 512;
     for (size_t i = 0; i < shown; i++) {
-        thumbs[i] = CreateHistoryThumbnailDataUri(items[i]->jpegData,
-                                                  items[i]->jpegSize);
-        scriptCap += (thumbs[i] ? strlen(thumbs[i]) : 0) + 512;
+        DWORD loadedSize = 0;
+        BYTE *loadedBytes = LoadCachedImageBytesLocked(items[i], &loadedSize);
+        thumbs[i] = loadedBytes
+            ? CreateHistoryThumbnailDataUri(loadedBytes, loadedSize)
+            : NULL;
+        free(loadedBytes);
+        scriptCap += (thumbs[i] ? strlen(thumbs[i]) : 0) + 1280;
     }
 
     script = (wchar_t *)malloc(scriptCap * sizeof(wchar_t));
@@ -6198,10 +6428,18 @@ static void webview_push_init_history(void)
             (ULONGLONG)total, (ULONGLONG)shown, totalBytes);
         if (written < 0) formatted = FALSE; else pos += (size_t)written;
         for (size_t i = 0; i < shown && formatted; i++) {
+            wchar_t wDiskPath[MAX_PATH * 2];
+            if (items[i]->diskPath) {
+                json_escape_wstring(items[i]->diskPath, wDiskPath,
+                                    MAX_PATH * 2);
+            } else {
+                wDiskPath[0] = L'\0';
+            }
             written = swprintf(script + pos, scriptCap - pos,
                 L"%s{\"token\":\"%hs\",\"current\":%s,"
                 L"\"width\":%u,\"height\":%u,\"bytes\":%lu,"
                 L"\"capturedAt\":%I64u,"
+                L"\"storage\":\"%s\",\"path\":\"%s\","
                 L"\"url\":\"http://%hs:%d/%hs.jpg\",\"thumb\":\"%hs\"}",
                 i == 0 ? L"" : L",",
                 items[i]->token,
@@ -6209,6 +6447,7 @@ static void webview_push_init_history(void)
                 items[i]->width, items[i]->height,
                 (unsigned long)items[i]->jpegSize,
                 items[i]->capturedAtMs,
+                items[i]->diskPath ? L"disk" : L"memory", wDiskPath,
                 g_configBindIp, g_configHttpPort, items[i]->token,
                 thumbs[i] ? thumbs[i] : "");
             if (written < 0) formatted = FALSE; else pos += (size_t)written;
@@ -6262,7 +6501,7 @@ static void SaveHistoryImageToDisk(const char *token)
     if (!CopyRetainedImageByToken(token, &jpegData, &jpegSize,
                                   &capturedAtMs)) {
         SendHistoryActionResult(FALSE,
-            L"This image is no longer retained in memory.");
+            L"This image is no longer retained.");
         NotifyHistoryViewChanged();
         return;
     }
@@ -6505,6 +6744,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char captureGapFill[16] = {0};
         char bindIp[INET_ADDRSTRLEN] = {0};
         char httpAllowList[MAX_HTTP_ALLOW_LIST_BYTES] = {0};
+        char imageStorage[16] = {0};
         HttpAllowRule allowScratch[MAX_HTTP_ALLOW_RULES];
         int allowScratchCount = 0;
         int httpPort = 0;
@@ -6524,6 +6764,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
         json_get_string(msg, "httpAllowList", httpAllowList,
                         sizeof(httpAllowList));
+        json_get_string(msg, "imageStorage", imageStorage,
+                        sizeof(imageStorage));
         json_get_int(msg, "httpPort", &httpPort);
         json_get_int(msg, "jpegQuality", &jpegQuality);
         json_get_int(msg, "imageHistoryLimit", &imageHistoryLimit);
@@ -6561,6 +6803,12 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         if (!ParseHttpAllowList(httpAllowList, allowScratch,
                                 MAX_HTTP_ALLOW_RULES, &allowScratchCount)) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Allowed clients must be IPv4 addresses or CIDR subnets separated by commas (at most 64 entries).'})");
+            free(msg);
+            return S_OK;
+        }
+        if (strcmp(imageStorage, "memory") != 0 &&
+            strcmp(imageStorage, "disk") != 0) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid image storage location.'})");
             free(msg);
             return S_OK;
         }
@@ -6617,6 +6865,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
                 sizeof(g_configHttpAllowList) - 1);
         g_configHttpAllowList[sizeof(g_configHttpAllowList) - 1] = '\0';
         ApplyHttpAllowList(); /* takes effect immediately, no restart needed */
+        /* Applies to newly copied images; existing entries keep their
+           current location until they are evicted. */
+        g_configImageStorage = strcmp(imageStorage, "disk") == 0
+            ? IMAGE_STORAGE_DISK : IMAGE_STORAGE_MEMORY;
         g_configJpegQuality = jpegQuality;
         {
             size_t evicted = SetImageHistoryLimit(imageHistoryLimit);
@@ -6689,15 +6941,40 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
         json_get_string(msg, "token", token, sizeof(token));
         SaveHistoryImageToDisk(token);
+    } else if (strcmp(action, "historyRevealFile") == 0) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+        WCHAR *path;
+        json_get_string(msg, "token", token, sizeof(token));
+        path = GetRetainedImageDiskPathCopy(token);
+        if (!path) {
+            SendHistoryActionResult(FALSE,
+                L"This image is not stored on disk.");
+        } else {
+            LPITEMIDLIST item = ILCreateFromPathW(path);
+            BOOL revealed = FALSE;
+            if (item) {
+                revealed = SUCCEEDED(
+                    SHOpenFolderAndSelectItems(item, 0, NULL, 0));
+                ILFree(item);
+            }
+            if (revealed) {
+                LogMessage("History image file shown in Explorer (id %.12s...)",
+                           token);
+            } else {
+                SendHistoryActionResult(FALSE,
+                    L"The file could not be shown in Explorer.");
+            }
+            free(path);
+        }
     } else if (strcmp(action, "historyDelete") == 0) {
         char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
         json_get_string(msg, "token", token, sizeof(token));
         if (DeleteRetainedImageByToken(token)) {
             LogMessage("History image %.12s... removed by user", token);
-            SendHistoryActionResult(TRUE, L"Image removed from memory.");
+            SendHistoryActionResult(TRUE, L"Image removed.");
         } else {
             SendHistoryActionResult(FALSE,
-                L"This image is no longer retained in memory.");
+                L"This image is no longer retained.");
         }
         NotifyHistoryViewChanged();
     } else if (strcmp(action, "historyClearAll") == 0) {
@@ -6705,7 +6982,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         wchar_t message[80];
         LogMessage("History cleared by user (%llu image(s) discarded)",
                    (unsigned long long)removed);
-        swprintf(message, 80, L"Removed %I64u image%s from memory.",
+        swprintf(message, 80, L"Removed %I64u retained image%s.",
                  (ULONGLONG)removed, removed == 1 ? L"" : L"s");
         SendHistoryActionResult(TRUE, message);
         NotifyHistoryViewChanged();
@@ -7111,6 +7388,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             LogMessage("HTTP request for evicted image returned 410 Gone");
         } else if ((int)wParam == HTTP_EVENT_NOT_FOUND) {
             LogMessage("HTTP request for unknown image returned 404 Not Found");
+        } else if ((int)wParam == 500) {
+            LogMessage("HTTP request failed: stored image could not be read (500)");
         } else if ((int)wParam == HTTP_EVENT_DENIED) {
             struct in_addr deniedAddress;
             char addressText[INET_ADDRSTRLEN];
@@ -7183,6 +7462,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Load configuration */
     LoadConfigFromRegistry();
     ApplyHttpAllowList();
+    CleanImageStorageDirectory();
     ParseKeywords();
 
     /* Load application icon */
