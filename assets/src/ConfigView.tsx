@@ -1,17 +1,28 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  type UpdateResult,
   saveSettings,
   closeDialog,
   onSaveResult,
+  checkForUpdate,
+  cancelUpdateCheck,
+  installUpdate,
+  dismissUpdate,
+  dismissUpdateConfirmation,
+  onUpdateResult,
+  onUpdateProgress,
   type ConfigData,
   type PasteMethod,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
+import { Checkbox } from "./components/ui/checkbox";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 
 interface Props {
   config: ConfigData;
+  webView2Version: string;
+  updateCompletedVersion: string;
 }
 
 const selectClass =
@@ -29,7 +40,11 @@ function isValidIpv4(value: string) {
   );
 }
 
-export default function ConfigView({ config }: Props) {
+export default function ConfigView({
+  config,
+  webView2Version,
+  updateCompletedVersion,
+}: Props) {
   const configuredIpIsDetected = config.availableIps.includes(config.bindIp);
   const [titleMatch, setTitleMatch] = useState(config.titleMatch);
   const [pasteMethod, setPasteMethod] = useState<PasteMethod>(config.pasteMethod);
@@ -44,7 +59,26 @@ export default function ConfigView({ config }: Props) {
   const [shiftInsertPaste, setShiftInsertPaste] = useState(
     config.shiftInsertPaste,
   );
+  const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
+    config.autoCheckForUpdates ?? true,
+  );
   const [error, setError] = useState("");
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateCancelling, setUpdateCancelling] = useState(false);
+  const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
+  const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
+    updateCompletedVersion
+      ? {
+          status: "completed",
+          title: "Update complete",
+          message: `ImagePaster has been updated to version ${updateCompletedVersion}.`,
+          currentVersion: "",
+          remoteVersion: "",
+        }
+      : null,
+  );
+  const updateRequestMode = useRef<"automatic" | "manual" | null>(null);
+  const automaticUpdateStarted = useRef(false);
 
   const selectedBindIp = useMemo(
     () => (ipChoice === "other" ? customIp.trim() : ipChoice),
@@ -56,6 +90,73 @@ export default function ConfigView({ config }: Props) {
       if (!result.ok) setError(result.message ?? "Could not save the settings.");
     });
   }, []);
+
+  useEffect(() => {
+    const removeResultListener = onUpdateResult((result) => {
+      const wasAutomatic = updateRequestMode.current === "automatic";
+      updateRequestMode.current = null;
+      setUpdateChecking(false);
+      setUpdateCancelling(false);
+      setUpdateSpeedKbps(null);
+      if (result.status === "cancelled") {
+        setUpdateAlert(null);
+      } else if (wasAutomatic && result.status !== "newer") {
+        dismissUpdate();
+        setUpdateAlert(null);
+      } else {
+        setUpdateAlert(result);
+      }
+    });
+    const removeProgressListener = onUpdateProgress((progress) => {
+      setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
+    });
+
+    if (
+      config.autoCheckForUpdates &&
+      !updateCompletedVersion &&
+      !automaticUpdateStarted.current
+    ) {
+      automaticUpdateStarted.current = true;
+      updateRequestMode.current = "automatic";
+      setUpdateChecking(true);
+      checkForUpdate();
+    }
+
+    return () => {
+      removeResultListener();
+      removeProgressListener();
+    };
+  }, [config.autoCheckForUpdates, updateCompletedVersion]);
+
+  function handleUpdate() {
+    if (updateChecking) {
+      setUpdateCancelling(true);
+      cancelUpdateCheck();
+      return;
+    }
+    setUpdateAlert(null);
+    setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
+    updateRequestMode.current = "manual";
+    checkForUpdate();
+  }
+
+  function handleInstallUpdate() {
+    setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
+    installUpdate();
+  }
+
+  function handleDismissUpdate() {
+    if (updateAlert?.status === "completed") {
+      dismissUpdateConfirmation();
+    } else {
+      dismissUpdate();
+    }
+    setUpdateAlert(null);
+  }
 
   const handleSave = () => {
     const port = Number(httpPort);
@@ -83,6 +184,7 @@ export default function ConfigView({ config }: Props) {
       httpPort: port,
       jpegQuality: quality,
       shiftInsertPaste,
+      autoCheckForUpdates,
     });
   };
 
@@ -122,12 +224,10 @@ export default function ConfigView({ config }: Props) {
           htmlFor="shiftInsertPaste"
           className="flex cursor-pointer items-center gap-2 text-xs font-medium"
         >
-          <input
+          <Checkbox
             id="shiftInsertPaste"
-            type="checkbox"
             checked={shiftInsertPaste}
             onChange={(event) => setShiftInsertPaste(event.target.checked)}
-            className="h-4 w-4 rounded border-neutral-300"
           />
           Use Shift+Insert for generated text
         </label>
@@ -212,23 +312,144 @@ export default function ConfigView({ config }: Props) {
         </div>
       </div>
 
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="autoCheckForUpdates"
+          className="mt-0.5"
+          checked={autoCheckForUpdates}
+          onChange={(event) => setAutoCheckForUpdates(event.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="autoCheckForUpdates" className="cursor-pointer">
+            Automatically check for updates
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Checks whenever this dialog opens and prompts only when a newer
+            version is available.
+          </p>
+        </div>
+      </div>
+
       {error && (
         <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
           {error}
         </div>
       )}
 
-      <div className="flex items-center justify-between gap-2 pt-1">
-        <span className="text-[10px] text-neutral-400">v{config.version}</span>
-        <div className="flex gap-2">
-          <Button variant="outline" size="sm" className="w-20" onClick={closeDialog}>
+      <div className="flex items-center justify-between gap-3 pt-1">
+        <span
+          className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
+          title="Application version / WebView2 version"
+        >
+          v{config.version} / {webView2Version}
+        </span>
+        <div className="flex items-center gap-2">
+          <Button
+            variant={updateChecking ? "destructive" : "outline"}
+            size="sm"
+            className="min-w-[5rem]"
+            disabled={updateCancelling}
+            aria-label={
+              updateChecking ? "Stop update check and download" : undefined
+            }
+            title={
+              updateChecking ? "Stop update check and download" : undefined
+            }
+            onClick={handleUpdate}
+          >
+            {updateCancelling
+              ? "Stopping..."
+              : updateChecking
+                ? updateSpeedKbps === null
+                  ? "Checking..."
+                  : `Checking (${updateSpeedKbps.toLocaleString()} KB/s)...`
+                : "Update"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="min-w-[5rem]"
+            onClick={closeDialog}
+          >
             Cancel
           </Button>
-          <Button size="sm" className="w-20" onClick={handleSave}>
+          <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
             Save
           </Button>
         </div>
       </div>
+
+      {updateAlert && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="update-alert-title"
+            aria-describedby="update-alert-message"
+            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
+          >
+            <div className="space-y-1">
+              <h2 id="update-alert-title" className="text-sm font-semibold">
+                {updateAlert.title}
+              </h2>
+              <p
+                id="update-alert-message"
+                className="text-xs leading-relaxed text-neutral-600"
+              >
+                {updateAlert.message}
+              </p>
+            </div>
+            {updateAlert.currentVersion && updateAlert.remoteVersion && (
+              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                <dt className="text-neutral-500">Current version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.currentVersion}
+                </dd>
+                <dt className="text-neutral-500">Remote version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.remoteVersion}
+                </dd>
+              </dl>
+            )}
+            <div className="flex justify-end gap-2">
+              {(updateAlert.status === "newer" ||
+                updateAlert.status === "same") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  autoFocus
+                  disabled={updateChecking}
+                  onClick={handleDismissUpdate}
+                >
+                  Cancel
+                </Button>
+              )}
+              <Button
+                size="sm"
+                autoFocus={
+                  updateAlert.status !== "newer" &&
+                  updateAlert.status !== "same"
+                }
+                disabled={updateChecking}
+                onClick={
+                  updateAlert.status === "newer" ||
+                  updateAlert.status === "same"
+                    ? handleInstallUpdate
+                    : handleDismissUpdate
+                }
+              >
+                {updateChecking
+                  ? "Starting..."
+                  : updateAlert.status === "same"
+                    ? "Force update"
+                    : updateAlert.status === "newer"
+                      ? "Update"
+                      : "OK"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

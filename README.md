@@ -1,4 +1,4 @@
-# ImagePaster 1.0.1
+# ImagePaster 1.0.2
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -16,6 +16,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Uses a random 256-bit image identifier; superseded URLs return `410 Gone`
 - Configurable window title matching (comma-separated keywords)
 - Optional Shift+Insert text-paste compatibility mode for terminals such as Xshell
+- Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
@@ -80,12 +81,37 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | HTTP Port | `HttpPort` | REG_DWORD | `10444` |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
 | Shift+Insert Paste | `ShiftInsertPaste` | REG_DWORD | Enabled |
+| Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
 
 The bind-address menu lists IPv4 addresses on active adapters and includes an **Other** option. If a saved address disappears, such as after a laptop changes networks, ImagePaster retains it, stops the unavailable listener safely, and retries periodically. Selecting a non-loopback address may require a Windows Firewall rule, and the remote machine must be able to route to that address.
 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`.
+
+The footer displays the application and WebView2 runtime versions together as
+`v<application version> / <WebView2 version>`.
+
+When **Automatically check for updates** is enabled, opening the Configuration
+dialog makes a fresh request for the repository's
+[`release/ImagePaster.exe`](release/ImagePaster.exe). A newer build opens the
+update dialog; matching or older builds and failed automatic checks are
+silently discarded. The **Update** button performs the same check manually and
+displays every result.
+
+The update check downloads the executable to the user's temporary directory
+and compares its embedded Windows file version with the running executable's
+version. While downloading, the button displays the current transfer speed and
+can be clicked again to stop the check and remove the partial download. The
+result dialog displays both version numbers. A newer build can be installed
+normally, while a matching build offers a **Force update** action to reinstall
+it; an older repository build is never installed. Installation requests
+standard Windows UAC approval, safely replaces the current executable, and
+restarts ImagePaster. After a successful update, the restarted application
+opens an HTML confirmation with the newly installed version. Dismissing that
+confirmation leaves the configuration dialog open. Cancelling the download,
+result dialog, or UAC prompt leaves the current version running. File size is
+used only to validate the download and enforce its safety limit.
 
 ## Project Structure
 
