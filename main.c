@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.19"
-#define APP_VERSION_W     L"1.0.19"
+#define APP_VERSION_A     "1.0.20"
+#define APP_VERSION_W     L"1.0.20"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -276,9 +276,12 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define CAPTURE_GAP_FILL_WHITE 0
 #define CAPTURE_GAP_FILL_BLACK 1
 #define CAPTURE_GAP_FILL_BLUR  2
-#define CAPTURE_PANEL_WIDTH  264
+#define CAPTURE_PANEL_WIDTH  292
 #define CAPTURE_PANEL_HEIGHT 74
 #define CAPTURE_BUTTON_WIDTH 70
+/* Copy is wider so its label can swap between "Copy All" and
+   "Copy Selection" without clipping. */
+#define CAPTURE_COPY_BUTTON_WIDTH 98
 #define CAPTURE_BUTTON_HEIGHT 54
 #define CAPTURE_BUTTON_GAP    8
 #define CAPTURE_SEPARATOR_GAP 14
@@ -397,6 +400,7 @@ static int g_captureHoveredTool = -1;
 static int g_capturePressedPanel = -1;
 static int g_capturePressedTool = -1;
 static BOOL g_captureDragging = FALSE;
+static BOOL g_captureCopyShowsSelection = FALSE;
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
 static RECT *g_captureSelections = NULL;
@@ -2717,6 +2721,7 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
     int panelWidth;
     int panelHeight;
     int buttonWidth;
+    int copyButtonWidth;
     int buttonHeight;
     int buttonGap;
     int separatorGap;
@@ -2743,6 +2748,7 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
     panelWidth = ScaleCaptureUiValue(dpi, CAPTURE_PANEL_WIDTH);
     panelHeight = ScaleCaptureUiValue(dpi, CAPTURE_PANEL_HEIGHT);
     buttonWidth = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_WIDTH);
+    copyButtonWidth = ScaleCaptureUiValue(dpi, CAPTURE_COPY_BUTTON_WIDTH);
     buttonHeight = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_HEIGHT);
     buttonGap = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_GAP);
     separatorGap = ScaleCaptureUiValue(dpi, CAPTURE_SEPARATOR_GAP);
@@ -2750,7 +2756,8 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
         dpi, CAPTURE_PANEL_BOTTOM_MARGIN);
     panelTopPadding = ScaleCaptureUiValue(dpi, 10);
     horizontalPadding =
-        (panelWidth - (buttonWidth * CAPTURE_TOOL_COUNT) -
+        (panelWidth - (buttonWidth * (CAPTURE_TOOL_COUNT - 1)) -
+         copyButtonWidth -
          (buttonGap * (CAPTURE_TOOL_COUNT - 1)) - separatorGap) / 2;
 
     panelLeft = monitorRect->left - g_captureVirtualX +
@@ -2774,13 +2781,14 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
             panelTop + panelHeight);
     buttonLeft = panelLeft + horizontalPadding;
     for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
+        int width = tool == CAPTURE_TOOL_COPY ? copyButtonWidth : buttonWidth;
         /* Cancel sits apart from the action tools, past a visual divider. */
         if (tool == CAPTURE_TOOL_CANCEL) buttonLeft += separatorGap;
         SetRect(&panel->buttonRects[tool],
                 buttonLeft, panelTop + panelTopPadding,
-                buttonLeft + buttonWidth,
+                buttonLeft + width,
                 panelTop + panelTopPadding + buttonHeight);
-        buttonLeft += buttonWidth + buttonGap;
+        buttonLeft += width + buttonGap;
     }
     return TRUE;
 }
@@ -2887,6 +2895,17 @@ static BOOL GetDisplayedCaptureSelection(size_t index, RECT *selection)
         return IsCaptureSelectionValid(selection);
     }
     return FALSE;
+}
+
+/* TRUE while any stored selection or a valid in-progress drag exists; the
+   Copy tool then acts on the selection instead of the full desktop. */
+static BOOL CaptureHasSelection(void)
+{
+    RECT dragRect;
+    if (g_captureSelectionCount > 0) return TRUE;
+    if (!g_captureDragging) return FALSE;
+    dragRect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
+    return IsCaptureSelectionValid(&dragRect);
 }
 
 static BOOL GetCaptureSelectionBounds(RECT *bounds)
@@ -3104,36 +3123,6 @@ static void DrawCaptureSoftShadow(GpGraphics *graphics, const RECT *rect,
     }
 }
 
-/* Light stroke that hugs the top corners and edge, giving the panel the
-   glass-catching-light rim used by contemporary overlay chrome. */
-static void StrokeCaptureTopHighlight(GpGraphics *graphics, const RECT *rect,
-                                      float radius, DWORD color, float width)
-{
-    GpPath *path = NULL;
-    GpPen *pen = NULL;
-    float inset = width / 2.0f + 0.5f;
-    float left = (float)rect->left + inset;
-    float top = (float)rect->top + inset;
-    float right = (float)rect->right - inset;
-    float diameter = radius * 2.0f;
-
-    if (!graphics || diameter < 1.0f || right - left <= diameter) return;
-    if (GdipCreatePath(CAPTURE_GDIP_FILL_ALTERNATE, &path) != 0 || !path) {
-        return;
-    }
-    GdipAddPathArc(path, left, top, diameter, diameter, 180.0f, 90.0f);
-    GdipAddPathArc(path, right - diameter, top, diameter, diameter,
-                   270.0f, 90.0f);
-    if (GdipCreatePen1(color, width, CAPTURE_GDIP_UNIT_PIXEL, &pen) == 0 &&
-        pen) {
-        GdipSetPenStartCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
-        GdipSetPenEndCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
-        GdipDrawPath(graphics, pen, path);
-        GdipDeletePen(pen);
-    }
-    GdipDeletePath(path);
-}
-
 static GpFont *CreateCaptureFont(float pixelSize)
 {
     GpFontFamily *family = NULL;
@@ -3266,9 +3255,7 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
 
 static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
 {
-    static const WCHAR *labels[CAPTURE_TOOL_COUNT] = {
-        L"Clip", L"Copy", L"Cancel"
-    };
+    const WCHAR *labels[CAPTURE_TOOL_COUNT];
     CapturePanel *panel = &g_capturePanels[panelIndex];
     float panelRadius = ScaleCaptureUiFloat(panel->dpi, 14.0f);
     float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 8.0f);
@@ -3276,6 +3263,11 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.65f);
     GpFont *font;
     GpStringFormat *format;
+
+    labels[CAPTURE_TOOL_CLIP] = L"Clip";
+    labels[CAPTURE_TOOL_COPY] = CaptureHasSelection()
+        ? L"Copy Selection" : L"Copy All";
+    labels[CAPTURE_TOOL_CANCEL] = L"Cancel";
 
     if (hairline < 1.0f) hairline = 1.0f;
     if (borderWidth < 0.6f) borderWidth = 0.6f;
@@ -3287,9 +3279,6 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
                                    panelRadius);
     StrokeCaptureRoundedRect(graphics, &panel->panelRect,
                              RGB(255, 255, 255), 38, borderWidth, panelRadius);
-    StrokeCaptureTopHighlight(graphics, &panel->panelRect, panelRadius,
-                              CaptureArgb(56, RGB(255, 255, 255)),
-                              borderWidth);
 
     /* Divider that sets the destructive Cancel apart from the action tools. */
     {
@@ -3615,6 +3604,18 @@ static void InvalidateCapturePanel(HWND hwnd, int panelIndex)
     InvalidateRect(hwnd, &area, FALSE);
 }
 
+/* Repaints every toolbar when the Copy label needs to flip between
+   "Copy All" and "Copy Selection". */
+static void RefreshCaptureCopyLabels(HWND hwnd)
+{
+    BOOL showsSelection = CaptureHasSelection();
+    if (showsSelection == g_captureCopyShowsSelection) return;
+    g_captureCopyShowsSelection = showsSelection;
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        InvalidateCapturePanel(hwnd, panel);
+    }
+}
+
 static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
                                            const RECT *selection)
 {
@@ -3680,6 +3681,7 @@ static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
         UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
         if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
     }
+    RefreshCaptureCopyLabels(hwnd);
 }
 
 static CaptureBlurSample GetCaptureBlurSample(int coordinate, int blockSize,
@@ -3997,6 +3999,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 g_captureDragStart = point;
                 g_captureDragCurrent = point;
                 SetCapture(hwnd);
+                RefreshCaptureCopyLabels(hwnd);
             }
         }
         return 0;
@@ -4028,6 +4031,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
                 UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
                 if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+                RefreshCaptureCopyLabels(hwnd);
             }
         }
         return 0;
@@ -4048,6 +4052,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                     g_captureSelectedTool = CAPTURE_TOOL_CLIP;
                     InvalidateStoredCaptureSelections(hwnd);
                     ClearCaptureSelections();
+                    RefreshCaptureCopyLabels(hwnd);
                 } else if (pressedTool == CAPTURE_TOOL_COPY) {
                     PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, FALSE, 0);
                 } else if (pressedTool == CAPTURE_TOOL_CANCEL) {
@@ -4160,6 +4165,7 @@ static BOOL BeginScreenCapture(void)
     g_capturePressedPanel = -1;
     g_capturePressedTool = -1;
     g_captureDragging = FALSE;
+    g_captureCopyShowsSelection = FALSE;
     ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,

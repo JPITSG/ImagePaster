@@ -473,7 +473,7 @@ export default function ConfigView({
               setImageStorage(event.target.value as ImageStorage)
             }
           >
-            <option value="memory">Memory (default)</option>
+            <option value="memory">Memory</option>
             <option value="disk">Disk (%LOCALAPPDATA%\ImagePaster)</option>
           </select>
           <p className="text-[11px] leading-snug text-neutral-500">
