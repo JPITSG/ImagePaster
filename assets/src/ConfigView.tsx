@@ -26,6 +26,7 @@ interface Props {
 
 const selectClass =
   "flex h-8 w-full rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400";
+const maxHttpMessageLength = 2000;
 
 function isValidIpv4(value: string) {
   const parts = value.split(".");
@@ -46,6 +47,9 @@ export default function ConfigView({
   const configuredIpIsDetected = config.availableIps.includes(config.bindIp);
   const [titleMatch, setTitleMatch] = useState(config.titleMatch);
   const [pasteMethod, setPasteMethod] = useState<PasteMethod>(config.pasteMethod);
+  const [httpMessageTemplate, setHttpMessageTemplate] = useState(
+    config.httpMessageTemplate,
+  );
   const [ipChoice, setIpChoice] = useState(
     configuredIpIsDetected ? config.bindIp : "other",
   );
@@ -175,6 +179,16 @@ export default function ConfigView({
       setError("Enter a valid IPv4 bind address.");
       return;
     }
+    if (httpMessageTemplate.length > maxHttpMessageLength) {
+      setError(
+        `HTTP paste message must be ${maxHttpMessageLength} characters or fewer.`,
+      );
+      return;
+    }
+    if (!httpMessageTemplate.includes("{URL}")) {
+      setError("HTTP paste message must include {URL}.");
+      return;
+    }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setError("HTTP port must be between 1 and 65535.");
       return;
@@ -195,6 +209,7 @@ export default function ConfigView({
       ...config,
       titleMatch: titleMatch.trim(),
       pasteMethod,
+      httpMessageTemplate,
       bindIp: selectedBindIp,
       httpPort: port,
       jpegQuality: quality,
@@ -278,6 +293,23 @@ export default function ConfigView({
           <p className="mt-1 text-[11px] text-neutral-500">
             The server stays active in both paste modes so the latest clipboard image
             is always ready.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="httpMessageTemplate">HTTP Paste Message</Label>
+          <textarea
+            id="httpMessageTemplate"
+            className="flex min-h-20 w-full resize-y rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs leading-relaxed shadow-sm transition-colors placeholder:text-neutral-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+            rows={4}
+            maxLength={maxHttpMessageLength}
+            value={httpMessageTemplate}
+            onChange={(event) => setHttpMessageTemplate(event.target.value)}
+          />
+          <p className="text-[11px] text-neutral-500">
+            Use <code className="font-mono text-neutral-700">{"{URL}"}</code>{" "}
+            where the current image URL should appear. Every occurrence is
+            replaced when Ctrl+V is intercepted in HTTP mode.
           </p>
         </div>
 

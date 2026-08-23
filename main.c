@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.7"
-#define APP_VERSION_W     L"1.0.7"
+#define APP_VERSION_A     "1.0.8"
+#define APP_VERSION_W     L"1.0.8"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -204,6 +204,7 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define REG_KEY_PATH       "SOFTWARE\\JPIT\\ImagePaster"
 #define REG_VALUE_TITLE    "TitleMatch"
 #define REG_VALUE_METHOD   "PasteMethod"
+#define REG_VALUE_HTTP_MESSAGE_TEMPLATE "HttpMessageTemplate"
 #define REG_VALUE_BIND_IP  "BindIp"
 #define REG_VALUE_PORT     "HttpPort"
 #define REG_VALUE_QUALITY  "JpegQuality"
@@ -223,6 +224,12 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define DEFAULT_JPEG_QUALITY 80
 #define DEFAULT_IMAGE_HISTORY_LIMIT 1
 #define MAX_IMAGE_HISTORY_LIMIT 1000
+#define HTTP_URL_PLACEHOLDER "{URL}"
+#define DEFAULT_HTTP_MESSAGE_TEMPLATE \
+    "[ image available at " HTTP_URL_PLACEHOLDER \
+    " - if you feel this image will be useful later on be sure to save it " \
+    "to /tmp or a temp location for later use ]"
+#define MAX_HTTP_MESSAGE_TEMPLATE_BYTES 8192
 #define PASTE_METHOD_BASE64 0
 #define PASTE_METHOD_HTTP   1
 #define HTTP_EVENT_SERVED   200
@@ -273,6 +280,8 @@ static PFN_RemoveClipboardFormatListener fnRemoveClipboardFormatListener = NULL;
 /* Persisted configuration */
 static char g_configTitleMatch[2048] = "xshell";
 static int  g_configPasteMethod = PASTE_METHOD_BASE64;
+static char g_configHttpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES] =
+    DEFAULT_HTTP_MESSAGE_TEMPLATE;
 static char g_configBindIp[INET_ADDRSTRLEN] = "127.0.0.1";
 static int  g_configHttpPort = DEFAULT_HTTP_PORT;
 static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
@@ -1715,6 +1724,63 @@ static BOOL CopyActivityLogToClipboard(void)
     return TRUE;
 }
 
+static char *BuildHttpPasteText(const char *token, DWORD *textLen)
+{
+    char imageUrl[128];
+    const char *messageTemplate = g_configHttpMessageTemplate;
+    const size_t placeholderLen = sizeof(HTTP_URL_PLACEHOLDER) - 1;
+    size_t templateLen;
+    size_t urlLen;
+    size_t placeholderCount = 0;
+    size_t outputLen;
+    const char *scan;
+    const char *match;
+    char *result;
+    char *write;
+    int urlWritten;
+
+    if (!token || !*token || !textLen) return NULL;
+    *textLen = 0;
+
+    urlWritten = snprintf(imageUrl, sizeof(imageUrl), "http://%s:%d/%s.jpg",
+                          g_configBindIp, g_configHttpPort, token);
+    if (urlWritten <= 0 || urlWritten >= (int)sizeof(imageUrl)) return NULL;
+
+    templateLen = strlen(messageTemplate);
+    urlLen = (size_t)urlWritten;
+    scan = messageTemplate;
+    while ((match = strstr(scan, HTTP_URL_PLACEHOLDER)) != NULL) {
+        placeholderCount++;
+        scan = match + placeholderLen;
+    }
+    if (placeholderCount == 0) return NULL;
+
+    outputLen = templateLen;
+    if (urlLen >= placeholderLen) {
+        outputLen += placeholderCount * (urlLen - placeholderLen);
+    } else {
+        outputLen -= placeholderCount * (placeholderLen - urlLen);
+    }
+    if (outputLen > MAXDWORD) return NULL;
+
+    result = (char *)malloc(outputLen + 1);
+    if (!result) return NULL;
+
+    scan = messageTemplate;
+    write = result;
+    while ((match = strstr(scan, HTTP_URL_PLACEHOLDER)) != NULL) {
+        size_t prefixLen = (size_t)(match - scan);
+        memcpy(write, scan, prefixLen);
+        write += prefixLen;
+        memcpy(write, imageUrl, urlLen);
+        write += urlLen;
+        scan = match + placeholderLen;
+    }
+    strcpy(write, scan);
+    *textLen = (DWORD)outputLen;
+    return result;
+}
+
 static BOOL PasteCachedImage(void)
 {
     char *pasteText = NULL;
@@ -1739,24 +1805,11 @@ static BOOL PasteCachedImage(void)
     }
 
     if (g_configPasteMethod == PASTE_METHOD_HTTP) {
-        char formatted[512];
-        int formattedLen = snprintf(
-            formatted, sizeof(formatted),
-            "[ image available at http://%s:%d/%s.jpg - if you feel this image "
-            "will be useful later on be sure to save it to /tmp or a temp location "
-            "for later use ]",
-            g_configBindIp, g_configHttpPort, token);
-        if (formattedLen > 0 && formattedLen < (int)sizeof(formatted)) {
-            pasteText = (char *)malloc((size_t)formattedLen + 1);
-            if (pasteText) {
-                memcpy(pasteText, formatted, (size_t)formattedLen + 1);
-                textLen = (DWORD)formattedLen;
-            }
-        }
+        pasteText = BuildHttpPasteText(token, &textLen);
     }
 
     if (!pasteText) {
-        LogMessage("ERROR: Could not allocate paste text");
+        LogMessage("ERROR: Could not prepare paste text");
         return FALSE;
     }
 
@@ -1824,6 +1877,17 @@ static BOOL LoadConfigFromRegistry(void)
                          (LPBYTE)&value, &size) == ERROR_SUCCESS &&
         type == REG_DWORD && value <= PASTE_METHOD_HTTP) {
         g_configPasteMethod = (int)value;
+    }
+
+    size = sizeof(g_configHttpMessageTemplate);
+    if (RegQueryValueExA(hKey, REG_VALUE_HTTP_MESSAGE_TEMPLATE, NULL, &type,
+                         (LPBYTE)g_configHttpMessageTemplate, &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        strcpy(g_configHttpMessageTemplate, DEFAULT_HTTP_MESSAGE_TEMPLATE);
+    }
+    g_configHttpMessageTemplate[sizeof(g_configHttpMessageTemplate) - 1] = '\0';
+    if (!strstr(g_configHttpMessageTemplate, HTTP_URL_PLACEHOLDER)) {
+        strcpy(g_configHttpMessageTemplate, DEFAULT_HTTP_MESSAGE_TEMPLATE);
     }
 
     size = sizeof(g_configBindIp);
@@ -1899,6 +1963,9 @@ static void SaveConfigToRegistry(void)
     RegSetValueExA(hKey, REG_VALUE_TITLE, 0, REG_SZ,
                    (const BYTE*)g_configTitleMatch,
                    (DWORD)(strlen(g_configTitleMatch) + 1));
+    RegSetValueExA(hKey, REG_VALUE_HTTP_MESSAGE_TEMPLATE, 0, REG_SZ,
+                   (const BYTE*)g_configHttpMessageTemplate,
+                   (DWORD)(strlen(g_configHttpMessageTemplate) + 1));
     RegSetValueExA(hKey, REG_VALUE_BIND_IP, 0, REG_SZ,
                    (const BYTE*)g_configBindIp,
                    (DWORD)(strlen(g_configBindIp) + 1));
@@ -4341,58 +4408,193 @@ static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
 
 /* ── JSON helpers ──────────────────────────────────────────────────────── */
 
+static int json_hex_value(char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static BOOL json_append_utf8(unsigned int codePoint, char *out, size_t outLen,
+                             size_t *position)
+{
+    unsigned char encoded[4];
+    size_t encodedLen;
+
+    if (codePoint == 0) {
+        return FALSE;
+    } else if (codePoint <= 0x7f) {
+        encoded[0] = (unsigned char)codePoint;
+        encodedLen = 1;
+    } else if (codePoint <= 0x7ff) {
+        encoded[0] = (unsigned char)(0xc0 | (codePoint >> 6));
+        encoded[1] = (unsigned char)(0x80 | (codePoint & 0x3f));
+        encodedLen = 2;
+    } else if (codePoint <= 0xffff) {
+        encoded[0] = (unsigned char)(0xe0 | (codePoint >> 12));
+        encoded[1] = (unsigned char)(0x80 | ((codePoint >> 6) & 0x3f));
+        encoded[2] = (unsigned char)(0x80 | (codePoint & 0x3f));
+        encodedLen = 3;
+    } else if (codePoint <= 0x10ffff) {
+        encoded[0] = (unsigned char)(0xf0 | (codePoint >> 18));
+        encoded[1] = (unsigned char)(0x80 | ((codePoint >> 12) & 0x3f));
+        encoded[2] = (unsigned char)(0x80 | ((codePoint >> 6) & 0x3f));
+        encoded[3] = (unsigned char)(0x80 | (codePoint & 0x3f));
+        encodedLen = 4;
+    } else {
+        return FALSE;
+    }
+
+    if (*position + encodedLen >= outLen) return FALSE;
+    memcpy(out + *position, encoded, encodedLen);
+    *position += encodedLen;
+    return TRUE;
+}
+
+static const char *json_find_value(const char *json, const char *key)
+{
+    const char *p = json;
+    size_t keyLen = strlen(key);
+
+    while (*p) {
+        const char *nameStart;
+        const char *nameEnd;
+        BOOL escaped = FALSE;
+
+        if (*p++ != '"') continue;
+        nameStart = p;
+        while (*p) {
+            if (*p == '\\') {
+                escaped = TRUE;
+                p++;
+                if (*p) p++;
+                continue;
+            }
+            if (*p == '"') break;
+            p++;
+        }
+        if (*p != '"') return NULL;
+        nameEnd = p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != ':') continue;
+        if (!escaped && (size_t)(nameEnd - nameStart) == keyLen &&
+            memcmp(nameStart, key, keyLen) == 0) {
+            p++;
+            while (*p && isspace((unsigned char)*p)) p++;
+            return p;
+        }
+    }
+    return NULL;
+}
+
 static BOOL json_get_string(const char *json, const char *key, char *out, size_t outLen)
 {
-    char search[128];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-    const char *p = strstr(json, search);
+    const char *p;
+    size_t position = 0;
+
+    if (!json || !key || !out || outLen == 0) return FALSE;
+    out[0] = '\0';
+    p = json_find_value(json, key);
     if (!p) return FALSE;
-    p += strlen(search);
-    while (*p == ' ' || *p == ':') p++;
     if (*p != '"') return FALSE;
     p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < outLen - 1) {
-        out[i++] = *p++;
+
+    while (*p) {
+        unsigned char value = (unsigned char)*p++;
+        if (value == '"') {
+            out[position] = '\0';
+            return TRUE;
+        }
+        if (value < 0x20) return FALSE;
+        if (value != '\\') {
+            if (position + 1 >= outLen) return FALSE;
+            out[position++] = (char)value;
+            continue;
+        }
+
+        value = (unsigned char)*p++;
+        if (!value) return FALSE;
+        if (value == '"' || value == '\\' || value == '/') {
+            if (position + 1 >= outLen) return FALSE;
+            out[position++] = (char)value;
+        } else if (value == 'b' || value == 'f' || value == 'n' ||
+                   value == 'r' || value == 't') {
+            static const char escapedValues[] = {'\b', '\f', '\n', '\r', '\t'};
+            const char escapedNames[] = {'b', 'f', 'n', 'r', 't'};
+            size_t escapeIndex = 0;
+            while (escapedNames[escapeIndex] != (char)value) escapeIndex++;
+            if (position + 1 >= outLen) return FALSE;
+            out[position++] = escapedValues[escapeIndex];
+        } else if (value == 'u') {
+            unsigned int codePoint = 0;
+            if (strlen(p) < 4) return FALSE;
+            for (int digit = 0; digit < 4; digit++) {
+                int hexValue = json_hex_value(p[digit]);
+                if (hexValue < 0) return FALSE;
+                codePoint = (codePoint << 4) | (unsigned int)hexValue;
+            }
+            p += 4;
+
+            if (codePoint >= 0xd800 && codePoint <= 0xdbff &&
+                p[0] == '\\' && p[1] == 'u') {
+                unsigned int lowSurrogate = 0;
+                if (strlen(p) < 6) return FALSE;
+                for (int digit = 0; digit < 4; digit++) {
+                    int hexValue = json_hex_value(p[2 + digit]);
+                    if (hexValue < 0) return FALSE;
+                    lowSurrogate = (lowSurrogate << 4) | (unsigned int)hexValue;
+                }
+                if (lowSurrogate >= 0xdc00 && lowSurrogate <= 0xdfff) {
+                    codePoint = 0x10000 + ((codePoint - 0xd800) << 10) +
+                                (lowSurrogate - 0xdc00);
+                    p += 6;
+                } else {
+                    codePoint = 0xfffd;
+                }
+            } else if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+                codePoint = 0xfffd;
+            }
+
+            if (!json_append_utf8(codePoint, out, outLen, &position)) return FALSE;
+        } else {
+            return FALSE;
+        }
     }
-    out[i] = '\0';
-    return TRUE;
+    return FALSE;
 }
 
 static BOOL json_get_int(const char *json, const char *key, int *out)
 {
-    char search[128];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-    const char *p = strstr(json, search);
+    const char *p;
+    if (!json || !key || !out) return FALSE;
+    p = json_find_value(json, key);
     if (!p) return FALSE;
-    p += strlen(search);
-    while (*p == ' ' || *p == ':') p++;
     *out = atoi(p);
     return TRUE;
 }
 
+static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen);
+
 static void json_escape_string(const char *in, wchar_t *out, size_t outLen)
 {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j < outLen - 2; i++) {
-        char c = in[i];
-        if (c == '"' || c == '\\') {
-            if (j + 2 >= outLen) break;
-            out[j++] = L'\\';
-            out[j++] = (wchar_t)c;
-        } else if (c == '\n') {
-            if (j + 2 >= outLen) break;
-            out[j++] = L'\\';
-            out[j++] = L'n';
-        } else if (c == '\r') {
-            if (j + 2 >= outLen) break;
-            out[j++] = L'\\';
-            out[j++] = L'r';
-        } else {
-            out[j++] = (wchar_t)(unsigned char)c;
-        }
+    int wideLen;
+    wchar_t *wide;
+
+    if (!out || outLen == 0) return;
+    out[0] = L'\0';
+    if (!in) return;
+
+    wideLen = MultiByteToWideChar(CP_UTF8, 0, in, -1, NULL, 0);
+    if (wideLen <= 0) return;
+    wide = (wchar_t *)malloc((size_t)wideLen * sizeof(wchar_t));
+    if (!wide) return;
+    if (MultiByteToWideChar(CP_UTF8, 0, in, -1, wide, wideLen) <= 0) {
+        free(wide);
+        return;
     }
-    out[j] = L'\0';
+    json_escape_wstring(wide, out, outLen);
+    free(wide);
 }
 
 static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen)
@@ -4416,6 +4618,23 @@ static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen)
             if (j + 2 >= outLen) break;
             out[j++] = L'\\';
             out[j++] = L't';
+        } else if (c == L'\b') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'b';
+        } else if (c == L'\f') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'f';
+        } else if (c < 0x20 || c == 0x2028 || c == 0x2029) {
+            static const wchar_t hex[] = L"0123456789abcdef";
+            if (j + 6 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'u';
+            out[j++] = hex[(c >> 12) & 0xf];
+            out[j++] = hex[(c >> 8) & 0xf];
+            out[j++] = hex[(c >> 4) & 0xf];
+            out[j++] = hex[c & 0xf];
         } else {
             out[j++] = c;
         }
@@ -4712,6 +4931,7 @@ static void InstallPreparedUpdate(void) {
 static void webview_push_init_config(void)
 {
     wchar_t wTitleMatch[4096];
+    wchar_t wHttpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES * 2];
     wchar_t wBindIp[128];
     wchar_t wHttpStatus[512];
     wchar_t wUpdateCompletedVersion[64];
@@ -4720,6 +4940,8 @@ static void webview_push_init_config(void)
     int ipCount = EnumerateDetectedIpv4Addresses(ips, MAX_DETECTED_IPS);
     size_t pos = 0;
     json_escape_string(g_configTitleMatch, wTitleMatch, 4096);
+    json_escape_string(g_configHttpMessageTemplate, wHttpMessageTemplate,
+                       MAX_HTTP_MESSAGE_TEMPLATE_BYTES * 2);
     json_escape_string(g_configBindIp, wBindIp, 128);
     json_escape_string(g_httpStatus, wHttpStatus, 512);
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_W : L"",
@@ -4734,11 +4956,12 @@ static void webview_push_init_config(void)
     }
     swprintf(ipsJson + pos, 4096 - pos, L"]");
 
-    wchar_t script[16384];
-    swprintf(script, 16384,
+    wchar_t script[32768];
+    swprintf(script, 32768,
         L"window.onInit({\"view\":\"config\",\"config\":{"
         L"\"titleMatch\":\"%s\","
         L"\"pasteMethod\":\"%s\","
+        L"\"httpMessageTemplate\":\"%s\","
         L"\"bindIp\":\"%s\","
         L"\"httpPort\":%d,"
         L"\"jpegQuality\":%d,"
@@ -4753,7 +4976,7 @@ static void webview_push_init_config(void)
         L"\"updateCompletedVersion\":\"%s\"})",
         wTitleMatch,
         g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
-        wBindIp, g_configHttpPort, g_configJpegQuality,
+        wHttpMessageTemplate, wBindIp, g_configHttpPort, g_configJpegQuality,
         g_configImageHistoryLimit,
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
@@ -4960,6 +5183,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "saveSettings") == 0) {
         char titleMatch[2048] = {0};
         char pasteMethod[32] = {0};
+        char httpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES] = {0};
         char bindIp[INET_ADDRSTRLEN] = {0};
         int httpPort = 0;
         int jpegQuality = -1;
@@ -4967,10 +5191,14 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         int compatibilityPaste = -1;
         int screenCaptureEnabled = -1;
         int autoCheckForUpdates = -1;
+        BOOL httpMessageParsed;
         IN_ADDR parsedAddress;
 
         json_get_string(msg, "titleMatch", titleMatch, sizeof(titleMatch));
         json_get_string(msg, "pasteMethod", pasteMethod, sizeof(pasteMethod));
+        httpMessageParsed = json_get_string(
+            msg, "httpMessageTemplate", httpMessageTemplate,
+            sizeof(httpMessageTemplate));
         json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
         json_get_int(msg, "httpPort", &httpPort);
         json_get_int(msg, "jpegQuality", &jpegQuality);
@@ -4981,6 +5209,16 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid paste method.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (!httpMessageParsed) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'The HTTP paste message is invalid or too long.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (!strstr(httpMessageTemplate, HTTP_URL_PLACEHOLDER)) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'The HTTP paste message must include {URL}.'})");
             free(msg);
             return S_OK;
         }
@@ -5029,6 +5267,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         g_configTitleMatch[sizeof(g_configTitleMatch) - 1] = '\0';
         g_configPasteMethod = strcmp(pasteMethod, "http") == 0
             ? PASTE_METHOD_HTTP : PASTE_METHOD_BASE64;
+        strncpy(g_configHttpMessageTemplate, httpMessageTemplate,
+                sizeof(g_configHttpMessageTemplate) - 1);
+        g_configHttpMessageTemplate[
+            sizeof(g_configHttpMessageTemplate) - 1] = '\0';
         strncpy(g_configBindIp, bindIp, sizeof(g_configBindIp) - 1);
         g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
         g_configHttpPort = httpPort;

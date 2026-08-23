@@ -1,4 +1,4 @@
-# ImagePaster 1.0.7
+# ImagePaster 1.0.8
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -12,6 +12,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Retains configurable in-memory JPEG history: 1–1000 total images or Unlimited until exit
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
+- Customizable HTTP paste message with case-sensitive `{URL}` substitution
 - Detects active local IPv4 addresses for selection in the configuration dialog
 - Keeps an unavailable saved address and automatically starts listening if that address returns
 - Uses a random 256-bit image identifier; retained URLs stay available and evicted URLs return `410 Gone`
@@ -41,7 +42,8 @@ A Windows system tray utility that makes clipboard images usable in terminal app
    - JPEG at the configured quality for HTTP delivery
 4. If a matching window receives `Ctrl+V` while an image is current:
    - Base64 mode places the encoded PNG text on the clipboard.
-   - HTTP mode places text similar to the following on the clipboard:
+   - HTTP mode replaces `{URL}` in the configured message with the current image
+     URL and places the resulting text on the clipboard. The default is:
 
      ```text
      [ image available at http://192.168.1.100:10444/<random-id>.jpg - if you feel this image will be useful later on be sure to save it to /tmp or a temp location for later use ]
@@ -102,6 +104,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 |---------|---------------|------|---------|
 | Title Match | `TitleMatch` | REG_SZ | `xshell` |
 | Paste Method | `PasteMethod` | REG_DWORD | Base64 |
+| HTTP Paste Message | `HttpMessageTemplate` | REG_SZ | `[ image available at {URL} - ... ]` |
 | HTTP Bind Address | `BindIp` | REG_SZ | `127.0.0.1` |
 | HTTP Port | `HttpPort` | REG_DWORD | `10444` |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
@@ -111,6 +114,11 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
+
+The HTTP paste message is used when HTTP mode intercepts `Ctrl+V`. It must
+contain the case-sensitive `{URL}` placeholder; every occurrence is replaced
+with the current image URL. Quotes, backslashes, line breaks, and Unicode text
+are preserved.
 
 The bind-address menu lists IPv4 addresses on active adapters and includes an **Other** option. If a saved address disappears, such as after a laptop changes networks, ImagePaster retains it, stops the unavailable listener safely, and retries periodically. Selecting a non-loopback address may require a Windows Firewall rule, and the remote machine must be able to route to that address.
 

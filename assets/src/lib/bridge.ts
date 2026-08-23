@@ -3,6 +3,7 @@ export type PasteMethod = "base64" | "http";
 export interface ConfigData {
   titleMatch: string;
   pasteMethod: PasteMethod;
+  httpMessageTemplate: string;
   bindIp: string;
   httpPort: number;
   jpegQuality: number;
@@ -134,6 +135,7 @@ export function saveSettings(config: ConfigData) {
     action: "saveSettings",
     titleMatch: config.titleMatch,
     pasteMethod: config.pasteMethod,
+    httpMessageTemplate: config.httpMessageTemplate,
     bindIp: config.bindIp,
     httpPort: config.httpPort,
     jpegQuality: config.jpegQuality,
