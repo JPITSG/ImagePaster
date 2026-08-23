@@ -1,4 +1,4 @@
-# ImagePaster 1.0.5
+# ImagePaster 1.0.6
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -19,6 +19,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Optional, application-neutral compatibility paste mode using Shift+Insert
 - Optional interactive Print Screen capture across the full multi-monitor desktop
 - Dimmed capture overlay with cross-monitor selection and a glass-style toolbar on every display
+- Double-buffered, anti-aliased capture rendering for smooth selection feedback
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)

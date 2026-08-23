@@ -54,6 +54,22 @@
 typedef int GpStatus;
 typedef void GpBitmap;
 typedef void GpImage;
+typedef void GpBrush;
+typedef void GpSolidFill;
+typedef void GpFont;
+typedef void GpFontCollection;
+typedef void GpFontFamily;
+typedef void GpGraphics;
+typedef void GpPath;
+typedef void GpPen;
+typedef void GpStringFormat;
+
+typedef struct {
+    float X;
+    float Y;
+    float Width;
+    float Height;
+} CaptureGpRectF;
 
 #pragma pack(push, 8)
 typedef struct {
@@ -102,12 +118,62 @@ GpStatus __stdcall GdipSaveImageToStream(GpImage *image, IStream *stream, const 
 GpStatus __stdcall GdipDisposeImage(GpImage *image);
 GpStatus __stdcall GdipGetImageWidth(GpImage *image, UINT *width);
 GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
+GpStatus __stdcall GdipCreateFromHDC(HDC dc, GpGraphics **graphics);
+GpStatus __stdcall GdipDeleteGraphics(GpGraphics *graphics);
+GpStatus __stdcall GdipSetCompositingQuality(GpGraphics *graphics, int quality);
+GpStatus __stdcall GdipSetSmoothingMode(GpGraphics *graphics, int mode);
+GpStatus __stdcall GdipSetPixelOffsetMode(GpGraphics *graphics, int mode);
+GpStatus __stdcall GdipSetTextRenderingHint(GpGraphics *graphics, int hint);
+GpStatus __stdcall GdipCreatePen1(DWORD color, float width, int unit,
+                                  GpPen **pen);
+GpStatus __stdcall GdipDeletePen(GpPen *pen);
+GpStatus __stdcall GdipSetPenStartCap(GpPen *pen, int cap);
+GpStatus __stdcall GdipSetPenEndCap(GpPen *pen, int cap);
+GpStatus __stdcall GdipSetPenDashCap197819(GpPen *pen, int cap);
+GpStatus __stdcall GdipSetPenLineJoin(GpPen *pen, int join);
+GpStatus __stdcall GdipSetPenDashStyle(GpPen *pen, int style);
+GpStatus __stdcall GdipDrawLine(GpGraphics *graphics, GpPen *pen,
+                                float x1, float y1, float x2, float y2);
+GpStatus __stdcall GdipCreatePath(int fillMode, GpPath **path);
+GpStatus __stdcall GdipDeletePath(GpPath *path);
+GpStatus __stdcall GdipAddPathArc(GpPath *path, float x, float y,
+                                  float width, float height,
+                                  float startAngle, float sweepAngle);
+GpStatus __stdcall GdipAddPathLine(GpPath *path, float x1, float y1,
+                                   float x2, float y2);
+GpStatus __stdcall GdipClosePathFigure(GpPath *path);
+GpStatus __stdcall GdipDrawPath(GpGraphics *graphics, GpPen *pen,
+                                GpPath *path);
+GpStatus __stdcall GdipFillPath(GpGraphics *graphics, GpBrush *brush,
+                                GpPath *path);
+GpStatus __stdcall GdipCreateSolidFill(DWORD color, GpSolidFill **brush);
+GpStatus __stdcall GdipDeleteBrush(GpBrush *brush);
+GpStatus __stdcall GdipCreateFontFamilyFromName(
+    const WCHAR *name, GpFontCollection *collection, GpFontFamily **family);
+GpStatus __stdcall GdipGetGenericFontFamilySansSerif(GpFontFamily **family);
+GpStatus __stdcall GdipDeleteFontFamily(GpFontFamily *family);
+GpStatus __stdcall GdipCreateFont(const GpFontFamily *family, float size,
+                                  int style, int unit, GpFont **font);
+GpStatus __stdcall GdipDeleteFont(GpFont *font);
+GpStatus __stdcall GdipCreateStringFormat(int flags, LANGID language,
+                                          GpStringFormat **format);
+GpStatus __stdcall GdipSetStringFormatFlags(GpStringFormat *format, int flags);
+GpStatus __stdcall GdipSetStringFormatAlign(GpStringFormat *format,
+                                            int alignment);
+GpStatus __stdcall GdipSetStringFormatLineAlign(GpStringFormat *format,
+                                                int alignment);
+GpStatus __stdcall GdipDeleteStringFormat(GpStringFormat *format);
+GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
+                                  int length, const GpFont *font,
+                                  const CaptureGpRectF *layout,
+                                  const GpStringFormat *format,
+                                  const GpBrush *brush);
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.5"
-#define APP_VERSION_W     L"1.0.5"
+#define APP_VERSION_A     "1.0.6"
+#define APP_VERSION_W     L"1.0.6"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -242,6 +308,7 @@ static size_t g_goneTokenCapacity = 0;
 /* Interactive Print Screen capture overlay. Coordinates are relative to the
    top-left of the Windows virtual desktop, which can have a negative origin. */
 typedef struct {
+    RECT monitorRect;
     RECT panelRect;
     RECT buttonRects[CAPTURE_TOOL_COUNT];
     UINT dpi;
@@ -249,6 +316,7 @@ typedef struct {
 
 static HWND g_captureOverlayHwnd = NULL;
 static HBITMAP g_captureOriginalBitmap = NULL;
+static HBITMAP g_captureFrameBitmap = NULL;
 static DWORD *g_captureOriginalPixels = NULL;
 static int g_captureVirtualX = 0;
 static int g_captureVirtualY = 0;
@@ -1924,7 +1992,9 @@ static HBITMAP CreateTopDownCaptureBitmap(HDC referenceDc, int width, int height
 static void ReleaseScreenCaptureBitmaps(void)
 {
     if (g_captureOriginalBitmap) DeleteObject(g_captureOriginalBitmap);
+    if (g_captureFrameBitmap) DeleteObject(g_captureFrameBitmap);
     g_captureOriginalBitmap = NULL;
+    g_captureFrameBitmap = NULL;
     g_captureOriginalPixels = NULL;
     g_captureWidth = 0;
     g_captureHeight = 0;
@@ -1935,6 +2005,7 @@ static BOOL CaptureVirtualDesktopSnapshot(void)
     HDC screenDc = NULL;
     HDC memoryDc = NULL;
     HGDIOBJ previousBitmap = NULL;
+    DWORD *framePixels = NULL;
     size_t pixelCount;
     BOOL captured = FALSE;
 
@@ -1960,6 +2031,9 @@ static BOOL CaptureVirtualDesktopSnapshot(void)
     if (!g_captureOriginalBitmap || !g_captureOriginalPixels) {
         goto cleanup;
     }
+    g_captureFrameBitmap = CreateTopDownCaptureBitmap(
+        screenDc, g_captureWidth, g_captureHeight, &framePixels);
+    if (!g_captureFrameBitmap || !framePixels) goto cleanup;
 
     previousBitmap = SelectObject(memoryDc, g_captureOriginalBitmap);
     if (!BitBlt(memoryDc, 0, 0, g_captureWidth, g_captureHeight,
@@ -2060,6 +2134,11 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
 
     panel = &g_capturePanels[g_capturePanelCount++];
     panel->dpi = dpi;
+    SetRect(&panel->monitorRect,
+            monitorRect->left - g_captureVirtualX,
+            monitorRect->top - g_captureVirtualY,
+            monitorRect->right - g_captureVirtualX,
+            monitorRect->bottom - g_captureVirtualY);
     SetRect(&panel->panelRect, panelLeft, panelTop,
             panelLeft + panelWidth,
             panelTop + panelHeight);
@@ -2170,156 +2249,265 @@ static void AlphaFillRect(HDC destinationDc, const RECT *rect,
     DeleteDC(sourceDc);
 }
 
-static void AlphaFillRoundedRect(HDC destinationDc, const RECT *rect,
-                                 COLORREF color, BYTE opacity, int radius)
+enum {
+    CAPTURE_GDIP_COMPOSITING_HIGH_QUALITY = 2,
+    CAPTURE_GDIP_SMOOTHING_ANTIALIAS_8X8 = 5,
+    CAPTURE_GDIP_PIXEL_OFFSET_HIGH_QUALITY = 2,
+    CAPTURE_GDIP_TEXT_ANTIALIAS_GRID_FIT = 3,
+    CAPTURE_GDIP_UNIT_PIXEL = 2,
+    CAPTURE_GDIP_FONT_REGULAR = 0,
+    CAPTURE_GDIP_FONT_BOLD = 1,
+    CAPTURE_GDIP_FILL_ALTERNATE = 0,
+    CAPTURE_GDIP_LINE_CAP_ROUND = 2,
+    CAPTURE_GDIP_LINE_JOIN_ROUND = 2,
+    CAPTURE_GDIP_DASH_CAP_ROUND = 2,
+    CAPTURE_GDIP_DASH_STYLE_DASH = 1,
+    CAPTURE_GDIP_STRING_ALIGN_CENTER = 1,
+    CAPTURE_GDIP_STRING_NO_WRAP = 0x1000
+};
+
+static float ScaleCaptureUiFloat(UINT dpi, float value)
 {
-    int width = rect->right - rect->left;
-    int height = rect->bottom - rect->top;
-    HDC sourceDc;
-    HBITMAP sourceBitmap;
-    HGDIOBJ oldBitmap;
-    BITMAPINFO bitmapInfo;
-    DWORD *pixels = NULL;
-    HRGN roundedRegion;
-    int savedDc;
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, opacity, 0};
-
-    if (width <= 0 || height <= 0) return;
-    sourceDc = CreateCompatibleDC(destinationDc);
-    if (!sourceDc) return;
-    ZeroMemory(&bitmapInfo, sizeof(bitmapInfo));
-    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmapInfo.bmiHeader.biWidth = width;
-    bitmapInfo.bmiHeader.biHeight = -height;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-    sourceBitmap = CreateDIBSection(destinationDc, &bitmapInfo, DIB_RGB_COLORS,
-                                    (void **)&pixels, NULL, 0);
-    if (!sourceBitmap || !pixels) {
-        if (sourceBitmap) DeleteObject(sourceBitmap);
-        DeleteDC(sourceDc);
-        return;
-    }
-    {
-        DWORD pixel = (DWORD)GetBValue(color) |
-                      ((DWORD)GetGValue(color) << 8) |
-                      ((DWORD)GetRValue(color) << 16);
-        size_t pixelCount = (size_t)width * (size_t)height;
-        for (size_t i = 0; i < pixelCount; i++) pixels[i] = pixel;
-    }
-
-    oldBitmap = SelectObject(sourceDc, sourceBitmap);
-    roundedRegion = CreateRoundRectRgn(rect->left, rect->top,
-                                       rect->right + 1, rect->bottom + 1,
-                                       radius, radius);
-    savedDc = SaveDC(destinationDc);
-    if (roundedRegion && savedDc != 0) {
-        ExtSelectClipRgn(destinationDc, roundedRegion, RGN_AND);
-        AlphaBlend(destinationDc, rect->left, rect->top, width, height,
-                   sourceDc, 0, 0, width, height, blend);
-    }
-    if (savedDc != 0) RestoreDC(destinationDc, savedDc);
-    if (roundedRegion) DeleteObject(roundedRegion);
-    SelectObject(sourceDc, oldBitmap);
-    DeleteObject(sourceBitmap);
-    DeleteDC(sourceDc);
+    return value * (float)dpi / 96.0f;
 }
 
-static void DrawCaptureToolIcon(HDC dc, int tool, const RECT *buttonRect,
-                                COLORREF color, UINT dpi)
+static DWORD CaptureArgb(BYTE opacity, COLORREF color)
 {
-    int centerX = (buttonRect->left + buttonRect->right) / 2;
-    int top = buttonRect->top + ScaleCaptureUiValue(dpi, 7);
-    int inner = ScaleCaptureUiValue(dpi, 10);
-    int middle = ScaleCaptureUiValue(dpi, 4);
-    int shortStep = ScaleCaptureUiValue(dpi, 6);
-    int iconHeight = ScaleCaptureUiValue(dpi, 18);
-    int penWidth = ScaleCaptureUiValue(dpi, 2);
-    HPEN pen;
-    HGDIOBJ oldPen;
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    return ((DWORD)opacity << 24) |
+           ((DWORD)GetRValue(color) << 16) |
+           ((DWORD)GetGValue(color) << 8) |
+           (DWORD)GetBValue(color);
+}
 
-    if (penWidth < 1) penWidth = 1;
-    pen = CreatePen(PS_SOLID, penWidth, color);
-    if (!pen) {
-        SelectObject(dc, oldBrush);
+static GpPath *CreateCaptureRoundedRectPath(const RECT *rect, float radius)
+{
+    GpPath *path = NULL;
+    float left = (float)rect->left;
+    float top = (float)rect->top;
+    float width = (float)(rect->right - rect->left);
+    float height = (float)(rect->bottom - rect->top);
+    float diameter;
+
+    if (width <= 0.0f || height <= 0.0f ||
+        GdipCreatePath(CAPTURE_GDIP_FILL_ALTERNATE, &path) != 0 || !path) {
+        return NULL;
+    }
+    if (radius < 0.0f) radius = 0.0f;
+    if (radius > width / 2.0f) radius = width / 2.0f;
+    if (radius > height / 2.0f) radius = height / 2.0f;
+    diameter = radius * 2.0f;
+
+    if (diameter < 1.0f) {
+        GdipAddPathLine(path, left, top, left + width, top);
+        GdipAddPathLine(path, left + width, top,
+                        left + width, top + height);
+        GdipAddPathLine(path, left + width, top + height,
+                        left, top + height);
+        GdipAddPathLine(path, left, top + height, left, top);
+    } else {
+        GdipAddPathArc(path, left, top, diameter, diameter, 180.0f, 90.0f);
+        GdipAddPathArc(path, left + width - diameter, top,
+                       diameter, diameter, 270.0f, 90.0f);
+        GdipAddPathArc(path, left + width - diameter,
+                       top + height - diameter,
+                       diameter, diameter, 0.0f, 90.0f);
+        GdipAddPathArc(path, left, top + height - diameter,
+                       diameter, diameter, 90.0f, 90.0f);
+    }
+    GdipClosePathFigure(path);
+    return path;
+}
+
+static void FillCaptureRoundedRect(GpGraphics *graphics, const RECT *rect,
+                                   COLORREF color, BYTE opacity, float radius)
+{
+    GpPath *path;
+    GpSolidFill *brush = NULL;
+
+    if (!graphics) return;
+    path = CreateCaptureRoundedRectPath(rect, radius);
+    if (!path) return;
+    if (GdipCreateSolidFill(CaptureArgb(opacity, color), &brush) == 0 && brush) {
+        GdipFillPath(graphics, (GpBrush *)brush, path);
+        GdipDeleteBrush((GpBrush *)brush);
+    }
+    GdipDeletePath(path);
+}
+
+static void StrokeCaptureRoundedRect(GpGraphics *graphics, const RECT *rect,
+                                     COLORREF color, BYTE opacity,
+                                     float width, float radius)
+{
+    GpPath *path;
+    GpPen *pen = NULL;
+
+    if (!graphics) return;
+    path = CreateCaptureRoundedRectPath(rect, radius);
+    if (!path) return;
+    if (GdipCreatePen1(CaptureArgb(opacity, color), width,
+                       CAPTURE_GDIP_UNIT_PIXEL, &pen) == 0 && pen) {
+        GdipSetPenLineJoin(pen, CAPTURE_GDIP_LINE_JOIN_ROUND);
+        GdipDrawPath(graphics, pen, path);
+        GdipDeletePen(pen);
+    }
+    GdipDeletePath(path);
+}
+
+static GpFont *CreateCaptureFont(float pixelSize)
+{
+    GpFontFamily *family = NULL;
+    GpFont *font = NULL;
+    int style = CAPTURE_GDIP_FONT_REGULAR;
+
+    if (GdipCreateFontFamilyFromName(L"Segoe UI Semibold", NULL, &family) != 0 ||
+        !family) {
+        family = NULL;
+        style = CAPTURE_GDIP_FONT_BOLD;
+        if (GdipCreateFontFamilyFromName(L"Segoe UI", NULL, &family) != 0 ||
+            !family) {
+            family = NULL;
+            GdipGetGenericFontFamilySansSerif(&family);
+        }
+    }
+    if (family) {
+        if (GdipCreateFont(family, pixelSize, style,
+                           CAPTURE_GDIP_UNIT_PIXEL, &font) != 0) {
+            font = NULL;
+        }
+        GdipDeleteFontFamily(family);
+    }
+    return font;
+}
+
+static GpStringFormat *CreateCaptureCenteredTextFormat(void)
+{
+    GpStringFormat *format = NULL;
+    if (GdipCreateStringFormat(0, 0, &format) != 0 || !format) return NULL;
+    GdipSetStringFormatFlags(format, CAPTURE_GDIP_STRING_NO_WRAP);
+    GdipSetStringFormatAlign(format, CAPTURE_GDIP_STRING_ALIGN_CENTER);
+    GdipSetStringFormatLineAlign(format, CAPTURE_GDIP_STRING_ALIGN_CENTER);
+    return format;
+}
+
+static void DrawCaptureCenteredText(GpGraphics *graphics, const WCHAR *text,
+                                    const RECT *rect, COLORREF color,
+                                    GpFont *font, GpStringFormat *format)
+{
+    GpSolidFill *brush = NULL;
+    CaptureGpRectF layout;
+
+    if (!graphics || !text || !font || !format) return;
+    if (GdipCreateSolidFill(CaptureArgb(255, color), &brush) != 0 || !brush) {
         return;
     }
-    oldPen = SelectObject(dc, pen);
+    layout.X = (float)rect->left;
+    layout.Y = (float)rect->top;
+    layout.Width = (float)(rect->right - rect->left);
+    layout.Height = (float)(rect->bottom - rect->top);
+    GdipDrawString(graphics, text, -1, font, &layout, format,
+                   (GpBrush *)brush);
+    GdipDeleteBrush((GpBrush *)brush);
+}
+
+static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
+                                const RECT *buttonRect, COLORREF color,
+                                UINT dpi)
+{
+    float centerX = ((float)buttonRect->left + (float)buttonRect->right) / 2.0f;
+    float top = (float)buttonRect->top + ScaleCaptureUiFloat(dpi, 7.0f);
+    float inner = ScaleCaptureUiFloat(dpi, 10.0f);
+    float middle = ScaleCaptureUiFloat(dpi, 4.0f);
+    float shortStep = ScaleCaptureUiFloat(dpi, 6.0f);
+    float iconHeight = ScaleCaptureUiFloat(dpi, 18.0f);
+    float penWidth = ScaleCaptureUiFloat(dpi, 1.8f);
+    GpPen *pen = NULL;
+
+    if (penWidth < 1.4f) penWidth = 1.4f;
+    if (GdipCreatePen1(CaptureArgb(255, color), penWidth,
+                       CAPTURE_GDIP_UNIT_PIXEL, &pen) != 0 || !pen) {
+        return;
+    }
+    GdipSetPenStartCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
+    GdipSetPenEndCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
+    GdipSetPenLineJoin(pen, CAPTURE_GDIP_LINE_JOIN_ROUND);
 
     if (tool == CAPTURE_TOOL_CLIP) {
-        MoveToEx(dc, centerX - inner, top + shortStep, NULL);
-        LineTo(dc, centerX - inner, top);
-        LineTo(dc, centerX - middle, top);
-        MoveToEx(dc, centerX + middle, top, NULL);
-        LineTo(dc, centerX + inner, top);
-        LineTo(dc, centerX + inner, top + shortStep);
-        MoveToEx(dc, centerX + inner, top + iconHeight - shortStep, NULL);
-        LineTo(dc, centerX + inner, top + iconHeight);
-        LineTo(dc, centerX + middle, top + iconHeight);
-        MoveToEx(dc, centerX - middle, top + iconHeight, NULL);
-        LineTo(dc, centerX - inner, top + iconHeight);
-        LineTo(dc, centerX - inner, top + iconHeight - shortStep);
+        GdipDrawLine(graphics, pen, centerX - inner, top + shortStep,
+                     centerX - inner, top);
+        GdipDrawLine(graphics, pen, centerX - inner, top,
+                     centerX - middle, top);
+        GdipDrawLine(graphics, pen, centerX + middle, top,
+                     centerX + inner, top);
+        GdipDrawLine(graphics, pen, centerX + inner, top,
+                     centerX + inner, top + shortStep);
+        GdipDrawLine(graphics, pen, centerX + inner,
+                     top + iconHeight - shortStep,
+                     centerX + inner, top + iconHeight);
+        GdipDrawLine(graphics, pen, centerX + inner, top + iconHeight,
+                     centerX + middle, top + iconHeight);
+        GdipDrawLine(graphics, pen, centerX - middle, top + iconHeight,
+                     centerX - inner, top + iconHeight);
+        GdipDrawLine(graphics, pen, centerX - inner, top + iconHeight,
+                     centerX - inner, top + iconHeight - shortStep);
     } else if (tool == CAPTURE_TOOL_COPY) {
         int overlap = ScaleCaptureUiValue(dpi, 5);
-        int corner = ScaleCaptureUiValue(dpi, 3);
-        RoundRect(dc, centerX - inner, top, centerX + overlap,
-                  top + ScaleCaptureUiValue(dpi, 13), corner, corner);
-        RoundRect(dc, centerX - overlap, top + overlap, centerX + inner,
-                  top + iconHeight, corner, corner);
+        RECT backRect = {
+            (LONG)(centerX - inner), (LONG)top,
+            (LONG)(centerX + (float)overlap),
+            (LONG)(top + ScaleCaptureUiFloat(dpi, 13.0f))
+        };
+        RECT frontRect = {
+            (LONG)(centerX - (float)overlap), (LONG)(top + (float)overlap),
+            (LONG)(centerX + inner), (LONG)(top + iconHeight)
+        };
+        GpPath *backPath = CreateCaptureRoundedRectPath(
+            &backRect, ScaleCaptureUiFloat(dpi, 2.5f));
+        GpPath *frontPath = CreateCaptureRoundedRectPath(
+            &frontRect, ScaleCaptureUiFloat(dpi, 2.5f));
+        if (backPath) {
+            GdipDrawPath(graphics, pen, backPath);
+            GdipDeletePath(backPath);
+        }
+        if (frontPath) {
+            GdipDrawPath(graphics, pen, frontPath);
+            GdipDeletePath(frontPath);
+        }
     } else {
-        int cross = ScaleCaptureUiValue(dpi, 8);
-        MoveToEx(dc, centerX - cross, top, NULL);
-        LineTo(dc, centerX + cross, top + iconHeight);
-        MoveToEx(dc, centerX + cross, top, NULL);
-        LineTo(dc, centerX - cross, top + iconHeight);
+        float cross = ScaleCaptureUiFloat(dpi, 8.0f);
+        GdipDrawLine(graphics, pen, centerX - cross, top,
+                     centerX + cross, top + iconHeight);
+        GdipDrawLine(graphics, pen, centerX + cross, top,
+                     centerX - cross, top + iconHeight);
     }
-
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    GdipDeletePen(pen);
 }
 
-static void DrawCapturePanel(HDC dc, int panelIndex)
+static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
 {
     static const WCHAR *labels[CAPTURE_TOOL_COUNT] = {
         L"Clip", L"Copy", L"Cancel"
     };
     CapturePanel *panel = &g_capturePanels[panelIndex];
     RECT shadowRect = panel->panelRect;
-    int shadowOffset = ScaleCaptureUiValue(panel->dpi, 5);
-    int panelRadius = ScaleCaptureUiValue(panel->dpi, 22);
-    int buttonRadius = ScaleCaptureUiValue(panel->dpi, 14);
-    HPEN borderPen;
-    HGDIOBJ oldPen;
-    HGDIOBJ oldBrush;
-    HFONT font;
-    HGDIOBJ oldFont;
+    float shadowOffset = ScaleCaptureUiFloat(panel->dpi, 5.0f);
+    float panelRadius = ScaleCaptureUiFloat(panel->dpi, 11.0f);
+    float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 7.0f);
+    float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.8f);
+    GpFont *font;
+    GpStringFormat *format;
 
-    if (!RectVisible(dc, &panel->panelRect)) return;
-    OffsetRect(&shadowRect, 0, shadowOffset);
-    AlphaFillRoundedRect(dc, &shadowRect, RGB(0, 0, 0), 110, panelRadius);
-    AlphaFillRoundedRect(dc, &panel->panelRect, RGB(25, 30, 38), 225,
-                         panelRadius);
+    if (borderWidth < 1.0f) borderWidth = 1.0f;
+    OffsetRect(&shadowRect, 0, (int)(shadowOffset + 0.5f));
+    FillCaptureRoundedRect(graphics, &shadowRect, RGB(0, 0, 0), 110,
+                           panelRadius);
+    FillCaptureRoundedRect(graphics, &panel->panelRect, RGB(25, 30, 38), 225,
+                           panelRadius);
+    StrokeCaptureRoundedRect(graphics, &panel->panelRect,
+                             RGB(118, 132, 151), 205,
+                             borderWidth, panelRadius);
 
-    borderPen = CreatePen(PS_SOLID, 1, RGB(105, 118, 135));
-    oldPen = SelectObject(dc, borderPen);
-    oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    RoundRect(dc, panel->panelRect.left, panel->panelRect.top,
-              panel->panelRect.right, panel->panelRect.bottom,
-              panelRadius, panelRadius);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(borderPen);
-
-    font = CreateFontW(-ScaleCaptureUiValue(panel->dpi, 12),
-                       0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    oldFont = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
-
+    font = CreateCaptureFont(ScaleCaptureUiFloat(panel->dpi, 12.0f));
+    format = CreateCaptureCenteredTextFormat();
     for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
         RECT buttonRect = panel->buttonRects[tool];
         RECT labelRect = buttonRect;
@@ -2336,115 +2524,211 @@ static void DrawCapturePanel(HDC dc, int panelIndex)
         if (pressed) {
             COLORREF pressedColor = tool == CAPTURE_TOOL_CANCEL
                 ? RGB(118, 35, 42) : RGB(28, 103, 132);
-            AlphaFillRoundedRect(dc, &buttonRect, pressedColor, 220,
-                                 buttonRadius);
+            FillCaptureRoundedRect(graphics, &buttonRect, pressedColor, 220,
+                                   buttonRadius);
         } else if (selected) {
-            AlphaFillRoundedRect(dc, &buttonRect, RGB(35, 126, 158), 185,
-                                 buttonRadius);
+            FillCaptureRoundedRect(graphics, &buttonRect,
+                                   RGB(35, 126, 158), 185, buttonRadius);
         } else if (hovered) {
             COLORREF hoverColor = tool == CAPTURE_TOOL_CANCEL
                 ? RGB(142, 48, 55) : RGB(74, 87, 104);
-            AlphaFillRoundedRect(dc, &buttonRect, hoverColor, 175,
-                                 buttonRadius);
+            FillCaptureRoundedRect(graphics, &buttonRect, hoverColor, 175,
+                                   buttonRadius);
         }
-        DrawCaptureToolIcon(dc, tool, &buttonRect,
-                            selected || hovered || pressed ? accent : foreground,
-                            panel->dpi);
-        labelRect.top = buttonRect.top + ScaleCaptureUiValue(panel->dpi, 32);
-        SetTextColor(dc, foreground);
-        DrawTextW(dc, labels[tool], -1, &labelRect,
-                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        DrawCaptureToolIcon(
+            graphics, tool, &buttonRect,
+            selected || hovered || pressed ? accent : foreground, panel->dpi);
+        labelRect.top = buttonRect.top + ScaleCaptureUiValue(panel->dpi, 31);
+        DrawCaptureCenteredText(graphics, labels[tool], &labelRect,
+                                foreground, font, format);
     }
-
-    SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
+    if (format) GdipDeleteStringFormat(format);
+    if (font) GdipDeleteFont(font);
 }
 
-static void DrawCaptureSelection(HDC dc, const RECT *selection)
+static RECT GetCapturePanelPaintRect(int panelIndex)
 {
-    HDC sourceDc = CreateCompatibleDC(dc);
-    HGDIOBJ oldBitmap;
-    HGDIOBJ oldBrush;
-    HPEN outlinePen;
-    HGDIOBJ oldPen;
+    RECT area = g_capturePanels[panelIndex].panelRect;
+    InflateRect(&area,
+                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 6),
+                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 8));
+    return area;
+}
+
+static UINT GetCaptureDpiAtPoint(POINT point)
+{
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        if (PtInRect(&g_capturePanels[panel].monitorRect, point)) {
+            return g_capturePanels[panel].dpi;
+        }
+    }
+    return g_capturePanelCount > 0 ? g_capturePanels[0].dpi : 96;
+}
+
+static UINT GetCaptureSelectionLabelRect(const RECT *selection,
+                                         RECT *labelRect)
+{
+    POINT anchor = {selection->left, selection->top};
+    UINT dpi = GetCaptureDpiAtPoint(anchor);
+    int labelWidth = ScaleCaptureUiValue(dpi, 112);
+    int labelHeight = ScaleCaptureUiValue(dpi, 24);
+    int gap = ScaleCaptureUiValue(dpi, 6);
+
+    labelRect->left = selection->left;
+    labelRect->top = selection->top >= labelHeight + gap * 2
+        ? selection->top - labelHeight - gap
+        : selection->top + gap;
+    labelRect->right = labelRect->left + labelWidth;
+    labelRect->bottom = labelRect->top + labelHeight;
+    if (labelRect->right > g_captureWidth) {
+        OffsetRect(labelRect, g_captureWidth - labelRect->right, 0);
+    }
+    if (labelRect->left < 0) OffsetRect(labelRect, -labelRect->left, 0);
+    if (labelRect->bottom > g_captureHeight) {
+        OffsetRect(labelRect, 0, g_captureHeight - labelRect->bottom);
+    }
+    if (labelRect->top < 0) OffsetRect(labelRect, 0, -labelRect->top);
+    return dpi;
+}
+
+static void DrawCaptureSelectionEdges(GpGraphics *graphics, GpPen *pen,
+                                      const RECT *selection, float inset)
+{
+    float left = (float)selection->left + inset;
+    float top = (float)selection->top + inset;
+    float right = (float)selection->right - inset;
+    float bottom = (float)selection->bottom - inset;
+    if (right <= left || bottom <= top) return;
+    /* Draw the sides independently so the dash phase stays stable as the
+       selection grows instead of crawling around the perimeter. */
+    GdipDrawLine(graphics, pen, left, top, right, top);
+    GdipDrawLine(graphics, pen, right, top, right, bottom);
+    GdipDrawLine(graphics, pen, right, bottom, left, bottom);
+    GdipDrawLine(graphics, pen, left, bottom, left, top);
+}
+
+static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
+{
     WCHAR dimensions[64];
     RECT labelRect;
-    HFONT font;
-    HGDIOBJ oldFont;
+    UINT dpi = GetCaptureSelectionLabelRect(selection, &labelRect);
+    float outlineWidth = ScaleCaptureUiFloat(dpi, 1.4f);
+    float shadowWidth;
+    GpPen *shadowPen = NULL;
+    GpPen *outlinePen = NULL;
+    GpFont *font;
+    GpStringFormat *format;
 
-    if (!sourceDc) return;
-    oldBitmap = SelectObject(sourceDc, g_captureOriginalBitmap);
-    BitBlt(dc, selection->left, selection->top,
-           selection->right - selection->left,
-           selection->bottom - selection->top,
-           sourceDc, selection->left, selection->top, SRCCOPY);
-    SelectObject(sourceDc, oldBitmap);
-    DeleteDC(sourceDc);
-
-    outlinePen = CreatePen(PS_DASH, 1, RGB(235, 248, 255));
-    oldPen = SelectObject(dc, outlinePen);
-    oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    SetBkMode(dc, TRANSPARENT);
-    Rectangle(dc, selection->left, selection->top,
-              selection->right, selection->bottom);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(outlinePen);
+    if (outlineWidth < 1.25f) outlineWidth = 1.25f;
+    shadowWidth = outlineWidth + ScaleCaptureUiFloat(dpi, 2.0f);
+    if (GdipCreatePen1(CaptureArgb(150, RGB(0, 0, 0)), shadowWidth,
+                       CAPTURE_GDIP_UNIT_PIXEL, &shadowPen) == 0 && shadowPen) {
+        GdipSetPenStartCap(shadowPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        GdipSetPenEndCap(shadowPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        DrawCaptureSelectionEdges(graphics, shadowPen, selection,
+                                  shadowWidth / 2.0f);
+        GdipDeletePen(shadowPen);
+    }
+    if (GdipCreatePen1(CaptureArgb(245, RGB(226, 247, 255)), outlineWidth,
+                       CAPTURE_GDIP_UNIT_PIXEL, &outlinePen) == 0 && outlinePen) {
+        GdipSetPenStartCap(outlinePen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        GdipSetPenEndCap(outlinePen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        GdipSetPenDashCap197819(outlinePen, CAPTURE_GDIP_DASH_CAP_ROUND);
+        GdipSetPenDashStyle(outlinePen, CAPTURE_GDIP_DASH_STYLE_DASH);
+        DrawCaptureSelectionEdges(graphics, outlinePen, selection,
+                                  outlineWidth / 2.0f);
+        GdipDeletePen(outlinePen);
+    }
 
     swprintf(dimensions, sizeof(dimensions) / sizeof(dimensions[0]),
              L"%d × %d", selection->right - selection->left,
              selection->bottom - selection->top);
-    labelRect.left = selection->left;
-    labelRect.top = selection->top >= 32
-        ? selection->top - 28 : selection->top + 6;
-    labelRect.right = labelRect.left + 104;
-    labelRect.bottom = labelRect.top + 23;
-    if (labelRect.right > g_captureWidth) {
-        OffsetRect(&labelRect, g_captureWidth - labelRect.right, 0);
-    }
-    AlphaFillRoundedRect(dc, &labelRect, RGB(20, 25, 32), 220, 10);
-    font = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    oldFont = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
-    SetTextColor(dc, RGB(240, 248, 255));
-    SetBkMode(dc, TRANSPARENT);
-    DrawTextW(dc, dimensions, -1, &labelRect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
+    FillCaptureRoundedRect(graphics, &labelRect, RGB(20, 25, 32), 225,
+                           ScaleCaptureUiFloat(dpi, 6.0f));
+    StrokeCaptureRoundedRect(graphics, &labelRect, RGB(128, 145, 165), 180,
+                             ScaleCaptureUiFloat(dpi, 0.8f),
+                             ScaleCaptureUiFloat(dpi, 6.0f));
+    font = CreateCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
+    format = CreateCaptureCenteredTextFormat();
+    DrawCaptureCenteredText(graphics, dimensions, &labelRect,
+                            RGB(240, 248, 255), font, format);
+    if (format) GdipDeleteStringFormat(format);
+    if (font) GdipDeleteFont(font);
 }
 
 static void PaintScreenCaptureOverlay(HWND hwnd)
 {
     PAINTSTRUCT paint;
     HDC dc = BeginPaint(hwnd, &paint);
-    HDC sourceDc;
-    HGDIOBJ oldBitmap;
+    HDC sourceDc = NULL;
+    HDC frameDc = NULL;
+    HGDIOBJ oldSourceBitmap = NULL;
+    HGDIOBJ oldFrameBitmap = NULL;
+    GpGraphics *graphics = NULL;
     RECT selection;
+    int paintWidth = paint.rcPaint.right - paint.rcPaint.left;
+    int paintHeight = paint.rcPaint.bottom - paint.rcPaint.top;
 
     if (!dc) return;
-    sourceDc = CreateCompatibleDC(dc);
-    if (sourceDc && g_captureOriginalBitmap) {
-        oldBitmap = SelectObject(sourceDc, g_captureOriginalBitmap);
-        BitBlt(dc, paint.rcPaint.left, paint.rcPaint.top,
-               paint.rcPaint.right - paint.rcPaint.left,
-               paint.rcPaint.bottom - paint.rcPaint.top,
-               sourceDc, paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
-        SelectObject(sourceDc, oldBitmap);
-        DeleteDC(sourceDc);
-        AlphaFillRect(dc, &paint.rcPaint, RGB(0, 0, 0), 102);
-    } else {
-        if (sourceDc) DeleteDC(sourceDc);
-        FillRect(dc, &paint.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    if (paintWidth <= 0 || paintHeight <= 0 ||
+        !g_captureOriginalBitmap || !g_captureFrameBitmap) {
+        EndPaint(hwnd, &paint);
+        return;
     }
 
+    sourceDc = CreateCompatibleDC(dc);
+    frameDc = CreateCompatibleDC(dc);
+    if (!sourceDc || !frameDc) goto cleanup;
+    oldSourceBitmap = SelectObject(sourceDc, g_captureOriginalBitmap);
+    oldFrameBitmap = SelectObject(frameDc, g_captureFrameBitmap);
+    IntersectClipRect(frameDc, paint.rcPaint.left, paint.rcPaint.top,
+                      paint.rcPaint.right, paint.rcPaint.bottom);
+
+    /* Assemble the complete dirty region off-screen, then publish it with one
+       BitBlt. This prevents the dim layer and bright selection from appearing
+       as separate frames while the pointer is moving. */
+    BitBlt(frameDc, paint.rcPaint.left, paint.rcPaint.top,
+           paintWidth, paintHeight, sourceDc,
+           paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
+    AlphaFillRect(frameDc, &paint.rcPaint, RGB(0, 0, 0), 102);
     if (GetActiveCaptureSelection(&selection)) {
-        DrawCaptureSelection(dc, &selection);
+        BitBlt(frameDc, selection.left, selection.top,
+               selection.right - selection.left,
+               selection.bottom - selection.top,
+               sourceDc, selection.left, selection.top, SRCCOPY);
     }
-    for (int panel = 0; panel < g_capturePanelCount; panel++) {
-        DrawCapturePanel(dc, panel);
+
+    if (GdipCreateFromHDC(frameDc, &graphics) == 0 && graphics) {
+        GdipSetCompositingQuality(
+            graphics, CAPTURE_GDIP_COMPOSITING_HIGH_QUALITY);
+        GdipSetSmoothingMode(graphics, CAPTURE_GDIP_SMOOTHING_ANTIALIAS_8X8);
+        GdipSetPixelOffsetMode(
+            graphics, CAPTURE_GDIP_PIXEL_OFFSET_HIGH_QUALITY);
+        GdipSetTextRenderingHint(
+            graphics, CAPTURE_GDIP_TEXT_ANTIALIAS_GRID_FIT);
+        if (GetActiveCaptureSelection(&selection)) {
+            DrawCaptureSelection(graphics, &selection);
+        }
+        for (int panel = 0; panel < g_capturePanelCount; panel++) {
+            RECT intersection;
+            RECT panelPaintRect = GetCapturePanelPaintRect(panel);
+            if (IntersectRect(&intersection, &paint.rcPaint, &panelPaintRect)) {
+                DrawCapturePanel(graphics, panel);
+            }
+        }
+        GdipDeleteGraphics(graphics);
+        graphics = NULL;
     }
+    BitBlt(dc, paint.rcPaint.left, paint.rcPaint.top,
+           paintWidth, paintHeight, frameDc,
+           paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
+
+cleanup:
+    if (graphics) GdipDeleteGraphics(graphics);
+    if (oldFrameBitmap && frameDc) SelectObject(frameDc, oldFrameBitmap);
+    if (oldSourceBitmap && sourceDc) SelectObject(sourceDc, oldSourceBitmap);
+    if (frameDc) DeleteDC(frameDc);
+    if (sourceDc) DeleteDC(sourceDc);
     EndPaint(hwnd, &paint);
 }
 
@@ -2470,14 +2754,37 @@ static BOOL IsPointInCapturePanel(POINT point)
     return FALSE;
 }
 
-static void InvalidateCapturePanels(HWND hwnd)
+static void InvalidateCapturePanel(HWND hwnd, int panelIndex)
 {
-    for (int panel = 0; panel < g_capturePanelCount; panel++) {
-        RECT area = g_capturePanels[panel].panelRect;
-        InflateRect(&area,
-                    ScaleCaptureUiValue(g_capturePanels[panel].dpi, 6),
-                    ScaleCaptureUiValue(g_capturePanels[panel].dpi, 8));
-        InvalidateRect(hwnd, &area, FALSE);
+    RECT area;
+    if (panelIndex < 0 || panelIndex >= g_capturePanelCount) return;
+    area = GetCapturePanelPaintRect(panelIndex);
+    InvalidateRect(hwnd, &area, FALSE);
+}
+
+static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
+                                           const RECT *selection)
+{
+    RECT area;
+    RECT labelRect;
+    UINT dpi;
+
+    if (selection->right - selection->left < 2 ||
+        selection->bottom - selection->top < 2) {
+        return;
+    }
+    area = *selection;
+    dpi = GetCaptureSelectionLabelRect(selection, &labelRect);
+    InflateRect(&area, ScaleCaptureUiValue(dpi, 4),
+                 ScaleCaptureUiValue(dpi, 4));
+    UnionRect(&area, &area, &labelRect);
+    InflateRect(&area, ScaleCaptureUiValue(dpi, 2),
+                 ScaleCaptureUiValue(dpi, 2));
+    if (*hasDirty) {
+        UnionRect(dirtyRect, dirtyRect, &area);
+    } else {
+        *dirtyRect = area;
+        *hasDirty = TRUE;
     }
 }
 
@@ -2566,15 +2873,23 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 g_capturePressedPanel = panelIndex;
                 g_capturePressedTool = tool;
                 SetCapture(hwnd);
-                InvalidateCapturePanels(hwnd);
+                InvalidateCapturePanel(hwnd, panelIndex);
             } else if (!IsPointInCapturePanel(point) &&
                        g_captureSelectedTool == CAPTURE_TOOL_CLIP) {
+                RECT oldSelection = g_captureSelection;
+                BOOL hadSelection = g_captureHasSelection;
                 g_captureHasSelection = FALSE;
                 g_captureDragging = TRUE;
                 g_captureDragStart = point;
                 g_captureDragCurrent = point;
                 SetCapture(hwnd);
-                InvalidateRect(hwnd, NULL, FALSE);
+                if (hadSelection) {
+                    RECT dirtyRect = {0};
+                    BOOL hasDirty = FALSE;
+                    UnionCaptureSelectionDirtyRect(
+                        &dirtyRect, &hasDirty, &oldSelection);
+                    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+                }
             }
         }
         return 0;
@@ -2586,21 +2901,26 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             int tool = HitTestCaptureToolbar(point, &panelIndex);
             if (panelIndex != g_captureHoveredPanel ||
                 tool != g_captureHoveredTool) {
+                int oldPanel = g_captureHoveredPanel;
                 g_captureHoveredPanel = panelIndex;
                 g_captureHoveredTool = tool;
-                InvalidateCapturePanels(hwnd);
+                InvalidateCapturePanel(hwnd, oldPanel);
+                if (panelIndex != oldPanel) {
+                    InvalidateCapturePanel(hwnd, panelIndex);
+                }
             }
             if (g_captureDragging) {
                 RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
                                                     g_captureDragCurrent);
                 RECT newRect;
-                RECT dirtyRect;
+                RECT dirtyRect = {0};
+                BOOL hasDirty = FALSE;
                 g_captureDragCurrent = point;
                 newRect = NormalizeCaptureRect(g_captureDragStart,
                                                g_captureDragCurrent);
-                UnionRect(&dirtyRect, &oldRect, &newRect);
-                InflateRect(&dirtyRect, 120, 36);
-                InvalidateRect(hwnd, &dirtyRect, FALSE);
+                UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
+                UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
+                if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
             }
         }
         return 0;
@@ -2615,12 +2935,20 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             g_capturePressedPanel = -1;
             g_capturePressedTool = -1;
             if (GetCapture() == hwnd) ReleaseCapture();
-            InvalidateCapturePanels(hwnd);
+            InvalidateCapturePanel(hwnd, pressedPanel);
             if (releasePanel == pressedPanel && releaseTool == pressedTool) {
                 if (pressedTool == CAPTURE_TOOL_CLIP) {
+                    RECT oldSelection = g_captureSelection;
+                    BOOL hadSelection = g_captureHasSelection;
                     g_captureSelectedTool = CAPTURE_TOOL_CLIP;
                     g_captureHasSelection = FALSE;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    if (hadSelection) {
+                        RECT dirtyRect = {0};
+                        BOOL hasDirty = FALSE;
+                        UnionCaptureSelectionDirtyRect(
+                            &dirtyRect, &hasDirty, &oldSelection);
+                        if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+                    }
                 } else if (pressedTool == CAPTURE_TOOL_COPY) {
                     PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, FALSE, 0);
                 } else if (pressedTool == CAPTURE_TOOL_CANCEL) {
@@ -2630,6 +2958,10 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             return 0;
         }
         if (g_captureDragging) {
+            RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
+                                                g_captureDragCurrent);
+            RECT dirtyRect = {0};
+            BOOL hasDirty = FALSE;
             g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
             g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
                                                       g_captureDragCurrent);
@@ -2638,17 +2970,28 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 g_captureSelection.bottom - g_captureSelection.top >= 2;
             g_captureDragging = FALSE;
             if (GetCapture() == hwnd) ReleaseCapture();
-            InvalidateRect(hwnd, NULL, FALSE);
+            if (!EqualRect(&oldRect, &g_captureSelection)) {
+                UnionCaptureSelectionDirtyRect(
+                    &dirtyRect, &hasDirty, &oldRect);
+                UnionCaptureSelectionDirtyRect(
+                    &dirtyRect, &hasDirty, &g_captureSelection);
+                if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+            }
         }
         return 0;
 
     case WM_CAPTURECHANGED:
         if (g_capturePressedTool >= 0) {
+            int oldPanel = g_capturePressedPanel;
             g_capturePressedPanel = -1;
             g_capturePressedTool = -1;
-            InvalidateCapturePanels(hwnd);
+            InvalidateCapturePanel(hwnd, oldPanel);
         }
         if (g_captureDragging) {
+            RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
+                                                g_captureDragCurrent);
+            RECT dirtyRect = {0};
+            BOOL hasDirty = FALSE;
             g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
             g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
                                                       g_captureDragCurrent);
@@ -2656,7 +2999,13 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 g_captureSelection.right - g_captureSelection.left >= 2 &&
                 g_captureSelection.bottom - g_captureSelection.top >= 2;
             g_captureDragging = FALSE;
-            InvalidateRect(hwnd, NULL, FALSE);
+            if (!EqualRect(&oldRect, &g_captureSelection)) {
+                UnionCaptureSelectionDirtyRect(
+                    &dirtyRect, &hasDirty, &oldRect);
+                UnionCaptureSelectionDirtyRect(
+                    &dirtyRect, &hasDirty, &g_captureSelection);
+                if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+            }
         }
         return 0;
 
