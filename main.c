@@ -60,6 +60,7 @@ typedef void GpFont;
 typedef void GpFontCollection;
 typedef void GpFontFamily;
 typedef void GpGraphics;
+typedef void GpLineGradient;
 typedef void GpPath;
 typedef void GpPen;
 typedef void GpStringFormat;
@@ -147,6 +148,9 @@ GpStatus __stdcall GdipDrawPath(GpGraphics *graphics, GpPen *pen,
 GpStatus __stdcall GdipFillPath(GpGraphics *graphics, GpBrush *brush,
                                 GpPath *path);
 GpStatus __stdcall GdipCreateSolidFill(DWORD color, GpSolidFill **brush);
+GpStatus __stdcall GdipCreateLineBrushFromRect(
+    const CaptureGpRectF *rect, DWORD color1, DWORD color2,
+    int mode, int wrapMode, GpLineGradient **lineGradient);
 GpStatus __stdcall GdipDeleteBrush(GpBrush *brush);
 GpStatus __stdcall GdipCreateFontFamilyFromName(
     const WCHAR *name, GpFontCollection *collection, GpFontFamily **family);
@@ -168,12 +172,18 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
                                   const CaptureGpRectF *layout,
                                   const GpStringFormat *format,
                                   const GpBrush *brush);
+GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
+                                     int length, const GpFont *font,
+                                     const CaptureGpRectF *layout,
+                                     const GpStringFormat *format,
+                                     CaptureGpRectF *boundingBox,
+                                     int *codepointsFitted, int *linesFilled);
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.12"
-#define APP_VERSION_W     L"1.0.12"
+#define APP_VERSION_A     "1.0.13"
+#define APP_VERSION_W     L"1.0.13"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -246,11 +256,12 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define CAPTURE_GAP_FILL_WHITE 0
 #define CAPTURE_GAP_FILL_BLACK 1
 #define CAPTURE_GAP_FILL_BLUR  2
-#define CAPTURE_PANEL_WIDTH  250
+#define CAPTURE_PANEL_WIDTH  264
 #define CAPTURE_PANEL_HEIGHT 74
 #define CAPTURE_BUTTON_WIDTH 70
 #define CAPTURE_BUTTON_HEIGHT 54
 #define CAPTURE_BUTTON_GAP    8
+#define CAPTURE_SEPARATOR_GAP 14
 #define CAPTURE_PANEL_BOTTOM_MARGIN 40
 
 /* ── Log ring buffer ───────────────────────────────────────────────────── */
@@ -2202,6 +2213,7 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
     int buttonWidth;
     int buttonHeight;
     int buttonGap;
+    int separatorGap;
     int panelBottomMargin;
     int panelTopPadding;
     int panelLeft;
@@ -2227,12 +2239,13 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
     buttonWidth = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_WIDTH);
     buttonHeight = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_HEIGHT);
     buttonGap = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_GAP);
+    separatorGap = ScaleCaptureUiValue(dpi, CAPTURE_SEPARATOR_GAP);
     panelBottomMargin = ScaleCaptureUiValue(
         dpi, CAPTURE_PANEL_BOTTOM_MARGIN);
     panelTopPadding = ScaleCaptureUiValue(dpi, 10);
     horizontalPadding =
         (panelWidth - (buttonWidth * CAPTURE_TOOL_COUNT) -
-         (buttonGap * (CAPTURE_TOOL_COUNT - 1))) / 2;
+         (buttonGap * (CAPTURE_TOOL_COUNT - 1)) - separatorGap) / 2;
 
     panelLeft = monitorRect->left - g_captureVirtualX +
                 ((monitorRect->right - monitorRect->left) -
@@ -2255,6 +2268,8 @@ static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
             panelTop + panelHeight);
     buttonLeft = panelLeft + horizontalPadding;
     for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
+        /* Cancel sits apart from the action tools, past a visual divider. */
+        if (tool == CAPTURE_TOOL_CANCEL) buttonLeft += separatorGap;
         SetRect(&panel->buttonRects[tool],
                 buttonLeft, panelTop + panelTopPadding,
                 buttonLeft + buttonWidth,
@@ -2436,7 +2451,9 @@ enum {
     CAPTURE_GDIP_DASH_CAP_ROUND = 2,
     CAPTURE_GDIP_DASH_STYLE_DASH = 1,
     CAPTURE_GDIP_STRING_ALIGN_CENTER = 1,
-    CAPTURE_GDIP_STRING_NO_WRAP = 0x1000
+    CAPTURE_GDIP_STRING_NO_WRAP = 0x1000,
+    CAPTURE_GDIP_GRADIENT_VERTICAL = 1,
+    CAPTURE_GDIP_WRAP_TILE_FLIP_XY = 3
 };
 
 static float ScaleCaptureUiFloat(UINT dpi, float value)
@@ -2526,6 +2543,91 @@ static void StrokeCaptureRoundedRect(GpGraphics *graphics, const RECT *rect,
     GdipDeletePath(path);
 }
 
+static void FillCaptureRoundedRectGradient(GpGraphics *graphics,
+                                           const RECT *rect,
+                                           DWORD topColor, DWORD bottomColor,
+                                           float radius)
+{
+    GpPath *path;
+    GpLineGradient *brush = NULL;
+    CaptureGpRectF brushRect;
+
+    if (!graphics) return;
+    path = CreateCaptureRoundedRectPath(rect, radius);
+    if (!path) return;
+    /* Oversize the brush by a pixel so the gradient cannot wrap at the
+       antialiased path edge. */
+    brushRect.X = (float)rect->left - 1.0f;
+    brushRect.Y = (float)rect->top - 1.0f;
+    brushRect.Width = (float)(rect->right - rect->left) + 2.0f;
+    brushRect.Height = (float)(rect->bottom - rect->top) + 2.0f;
+    if (GdipCreateLineBrushFromRect(&brushRect, topColor, bottomColor,
+                                    CAPTURE_GDIP_GRADIENT_VERTICAL,
+                                    CAPTURE_GDIP_WRAP_TILE_FLIP_XY,
+                                    &brush) == 0 && brush) {
+        GdipFillPath(graphics, (GpBrush *)brush, path);
+        GdipDeleteBrush((GpBrush *)brush);
+    } else {
+        GpSolidFill *fallback = NULL;
+        if (GdipCreateSolidFill(bottomColor, &fallback) == 0 && fallback) {
+            GdipFillPath(graphics, (GpBrush *)fallback, path);
+            GdipDeleteBrush((GpBrush *)fallback);
+        }
+    }
+    GdipDeletePath(path);
+}
+
+/* Layered low-alpha fills approximate a blurred drop shadow; the overlapping
+   rings accumulate toward the shape so the falloff reads as soft. */
+static void DrawCaptureSoftShadow(GpGraphics *graphics, const RECT *rect,
+                                  float radius, UINT dpi, int layerCount,
+                                  float spreadStep, int dropDistance,
+                                  BYTE layerAlpha)
+{
+    float step = ScaleCaptureUiFloat(dpi, spreadStep);
+    int offsetY = ScaleCaptureUiValue(dpi, dropDistance);
+
+    if (step < 1.0f) step = 1.0f;
+    for (int layer = layerCount; layer >= 1; layer--) {
+        RECT layerRect = *rect;
+        int grow = (int)(step * (float)layer + 0.5f);
+        InflateRect(&layerRect, grow, grow);
+        OffsetRect(&layerRect, 0, offsetY);
+        FillCaptureRoundedRect(graphics, &layerRect, RGB(0, 0, 0), layerAlpha,
+                               radius + (float)grow);
+    }
+}
+
+/* Light stroke that hugs the top corners and edge, giving the panel the
+   glass-catching-light rim used by contemporary overlay chrome. */
+static void StrokeCaptureTopHighlight(GpGraphics *graphics, const RECT *rect,
+                                      float radius, DWORD color, float width)
+{
+    GpPath *path = NULL;
+    GpPen *pen = NULL;
+    float inset = width / 2.0f + 0.5f;
+    float left = (float)rect->left + inset;
+    float top = (float)rect->top + inset;
+    float right = (float)rect->right - inset;
+    float diameter = radius * 2.0f;
+
+    if (!graphics || diameter < 1.0f || right - left <= diameter) return;
+    if (GdipCreatePath(CAPTURE_GDIP_FILL_ALTERNATE, &path) != 0 || !path) {
+        return;
+    }
+    GdipAddPathArc(path, left, top, diameter, diameter, 180.0f, 90.0f);
+    GdipAddPathArc(path, right - diameter, top, diameter, diameter,
+                   270.0f, 90.0f);
+    if (GdipCreatePen1(color, width, CAPTURE_GDIP_UNIT_PIXEL, &pen) == 0 &&
+        pen) {
+        GdipSetPenStartCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        GdipSetPenEndCap(pen, CAPTURE_GDIP_LINE_CAP_ROUND);
+        GdipDrawPath(graphics, pen, path);
+        GdipDeletePen(pen);
+    }
+    GdipDeletePath(path);
+}
+
 static GpFont *CreateCaptureFont(float pixelSize)
 {
     GpFontFamily *family = NULL;
@@ -2592,7 +2694,7 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
     float middle = ScaleCaptureUiFloat(dpi, 4.0f);
     float shortStep = ScaleCaptureUiFloat(dpi, 6.0f);
     float iconHeight = ScaleCaptureUiFloat(dpi, 18.0f);
-    float penWidth = ScaleCaptureUiFloat(dpi, 1.35f);
+    float penWidth = ScaleCaptureUiFloat(dpi, 1.6f);
     GpPen *pen = NULL;
 
     if (penWidth < 1.0f) penWidth = 1.0f;
@@ -2646,11 +2748,12 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
             GdipDeletePath(frontPath);
         }
     } else {
-        float cross = ScaleCaptureUiFloat(dpi, 8.0f);
-        GdipDrawLine(graphics, pen, centerX - cross, top,
-                     centerX + cross, top + iconHeight);
-        GdipDrawLine(graphics, pen, centerX + cross, top,
-                     centerX - cross, top + iconHeight);
+        float cross = ScaleCaptureUiFloat(dpi, 7.0f);
+        float centerY = top + iconHeight / 2.0f;
+        GdipDrawLine(graphics, pen, centerX - cross, centerY - cross,
+                     centerX + cross, centerY + cross);
+        GdipDrawLine(graphics, pen, centerX + cross, centerY - cross,
+                     centerX - cross, centerY + cross);
     }
     GdipDeletePen(pen);
 }
@@ -2661,59 +2764,91 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
         L"Clip", L"Copy", L"Cancel"
     };
     CapturePanel *panel = &g_capturePanels[panelIndex];
-    RECT shadowRect = panel->panelRect;
-    float shadowOffset = ScaleCaptureUiFloat(panel->dpi, 5.0f);
-    float panelRadius = ScaleCaptureUiFloat(panel->dpi, 11.0f);
-    float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 7.0f);
-    float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.55f);
+    float panelRadius = ScaleCaptureUiFloat(panel->dpi, 14.0f);
+    float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 8.0f);
+    float hairline = ScaleCaptureUiFloat(panel->dpi, 1.0f);
     GpFont *font;
     GpStringFormat *format;
 
-    if (borderWidth < 0.75f) borderWidth = 0.75f;
-    OffsetRect(&shadowRect, 0, (int)(shadowOffset + 0.5f));
-    FillCaptureRoundedRect(graphics, &shadowRect, RGB(0, 0, 0), 110,
-                           panelRadius);
-    FillCaptureRoundedRect(graphics, &panel->panelRect, RGB(25, 30, 38), 225,
-                           panelRadius);
+    if (hairline < 1.0f) hairline = 1.0f;
+    DrawCaptureSoftShadow(graphics, &panel->panelRect, panelRadius,
+                          panel->dpi, 7, 1.9f, 3, 9);
+    FillCaptureRoundedRectGradient(graphics, &panel->panelRect,
+                                   CaptureArgb(246, RGB(43, 49, 60)),
+                                   CaptureArgb(246, RGB(24, 28, 35)),
+                                   panelRadius);
     StrokeCaptureRoundedRect(graphics, &panel->panelRect,
-                             RGB(118, 132, 151), 205,
-                             borderWidth, panelRadius);
+                             RGB(255, 255, 255), 38, hairline, panelRadius);
+    StrokeCaptureTopHighlight(graphics, &panel->panelRect, panelRadius,
+                              CaptureArgb(56, RGB(255, 255, 255)), hairline);
+
+    /* Divider that sets the destructive Cancel apart from the action tools. */
+    {
+        const RECT *copyRect = &panel->buttonRects[CAPTURE_TOOL_COPY];
+        const RECT *cancelRect = &panel->buttonRects[CAPTURE_TOOL_CANCEL];
+        float separatorX =
+            ((float)copyRect->right + (float)cancelRect->left) / 2.0f;
+        float inset = ScaleCaptureUiFloat(panel->dpi, 9.0f);
+        GpPen *separatorPen = NULL;
+        if (GdipCreatePen1(CaptureArgb(36, RGB(255, 255, 255)), hairline,
+                           CAPTURE_GDIP_UNIT_PIXEL, &separatorPen) == 0 &&
+            separatorPen) {
+            GdipSetPenStartCap(separatorPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+            GdipSetPenEndCap(separatorPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+            GdipDrawLine(graphics, separatorPen,
+                         separatorX, (float)copyRect->top + inset,
+                         separatorX, (float)copyRect->bottom - inset);
+            GdipDeletePen(separatorPen);
+        }
+    }
 
     font = CreateCaptureFont(ScaleCaptureUiFloat(panel->dpi, 12.0f));
     format = CreateCaptureCenteredTextFormat();
     for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
         RECT buttonRect = panel->buttonRects[tool];
         RECT labelRect = buttonRect;
+        BOOL isCancel = tool == CAPTURE_TOOL_CANCEL;
         BOOL selected = tool == g_captureSelectedTool;
         BOOL hovered = panelIndex == g_captureHoveredPanel &&
                        tool == g_captureHoveredTool;
         BOOL pressed = panelIndex == g_capturePressedPanel &&
                        tool == g_capturePressedTool;
-        COLORREF accent = tool == CAPTURE_TOOL_CANCEL
-            ? RGB(255, 128, 128) : RGB(116, 220, 255);
-        COLORREF foreground = (selected || hovered || pressed)
-            ? RGB(255, 255, 255) : RGB(210, 218, 228);
+        BOOL active = selected || hovered || pressed;
+        COLORREF accent = isCancel
+            ? RGB(255, 138, 138) : RGB(126, 208, 255);
+        COLORREF labelColor = selected
+            ? RGB(255, 255, 255)
+            : (active ? RGB(238, 244, 250) : RGB(187, 197, 210));
 
-        if (pressed) {
-            COLORREF pressedColor = tool == CAPTURE_TOOL_CANCEL
-                ? RGB(118, 35, 42) : RGB(28, 103, 132);
-            FillCaptureRoundedRect(graphics, &buttonRect, pressedColor, 220,
-                                   buttonRadius);
-        } else if (selected) {
+        if (selected) {
+            /* Accent-tinted pill with a soft ring instead of a heavy fill. */
             FillCaptureRoundedRect(graphics, &buttonRect,
-                                   RGB(35, 126, 158), 185, buttonRadius);
+                                   isCancel ? RGB(232, 82, 82)
+                                            : RGB(64, 156, 210),
+                                   pressed ? 84 : 58, buttonRadius);
+            StrokeCaptureRoundedRect(graphics, &buttonRect, accent,
+                                     pressed ? 165 : 130, hairline,
+                                     buttonRadius);
+            if (hovered && !pressed) {
+                FillCaptureRoundedRect(graphics, &buttonRect,
+                                       RGB(255, 255, 255), 14, buttonRadius);
+            }
+        } else if (pressed) {
+            FillCaptureRoundedRect(graphics, &buttonRect,
+                                   isCancel ? RGB(226, 74, 74)
+                                            : RGB(255, 255, 255),
+                                   isCancel ? 64 : 15, buttonRadius);
         } else if (hovered) {
-            COLORREF hoverColor = tool == CAPTURE_TOOL_CANCEL
-                ? RGB(142, 48, 55) : RGB(74, 87, 104);
-            FillCaptureRoundedRect(graphics, &buttonRect, hoverColor, 175,
-                                   buttonRadius);
+            FillCaptureRoundedRect(graphics, &buttonRect,
+                                   isCancel ? RGB(238, 90, 90)
+                                            : RGB(255, 255, 255),
+                                   isCancel ? 46 : 24, buttonRadius);
         }
-        DrawCaptureToolIcon(
-            graphics, tool, &buttonRect,
-            selected || hovered || pressed ? accent : foreground, panel->dpi);
+        DrawCaptureToolIcon(graphics, tool, &buttonRect,
+                            active ? accent : RGB(206, 215, 227), panel->dpi);
         labelRect.top = buttonRect.top + ScaleCaptureUiValue(panel->dpi, 31);
         DrawCaptureCenteredText(graphics, labels[tool], &labelRect,
-                                foreground, font, format);
+                                labelColor, font, format);
     }
     if (format) GdipDeleteStringFormat(format);
     if (font) GdipDeleteFont(font);
@@ -2721,10 +2856,12 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
 
 static RECT GetCapturePanelPaintRect(int panelIndex)
 {
+    /* Wide enough to include the layered drop shadow drawn around the
+       panel (7 layers x 1.9px spread, dropped 3px). */
     RECT area = g_capturePanels[panelIndex].panelRect;
     InflateRect(&area,
-                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 6),
-                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 8));
+                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 16),
+                ScaleCaptureUiValue(g_capturePanels[panelIndex].dpi, 20));
     return area;
 }
 
@@ -2743,9 +2880,9 @@ static UINT GetCaptureSelectionLabelRect(const RECT *selection,
 {
     POINT anchor = {selection->left, selection->top};
     UINT dpi = GetCaptureDpiAtPoint(anchor);
-    int labelWidth = ScaleCaptureUiValue(dpi, 112);
-    int labelHeight = ScaleCaptureUiValue(dpi, 24);
-    int gap = ScaleCaptureUiValue(dpi, 6);
+    int labelWidth = ScaleCaptureUiValue(dpi, 118);
+    int labelHeight = ScaleCaptureUiValue(dpi, 26);
+    int gap = ScaleCaptureUiValue(dpi, 8);
 
     labelRect->left = selection->left;
     labelRect->top = selection->top >= labelHeight + gap * 2
@@ -2816,15 +2953,44 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
     swprintf(dimensions, sizeof(dimensions) / sizeof(dimensions[0]),
              L"%d × %d", selection->right - selection->left,
              selection->bottom - selection->top);
-    FillCaptureRoundedRect(graphics, &labelRect, RGB(20, 25, 32), 225,
-                           ScaleCaptureUiFloat(dpi, 6.0f));
-    StrokeCaptureRoundedRect(graphics, &labelRect, RGB(128, 145, 165), 180,
-                             ScaleCaptureUiFloat(dpi, 0.5f),
-                             ScaleCaptureUiFloat(dpi, 6.0f));
     font = CreateCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
     format = CreateCaptureCenteredTextFormat();
-    DrawCaptureCenteredText(graphics, dimensions, &labelRect,
-                            RGB(240, 248, 255), font, format);
+
+    /* Shrink the pill to hug the text; the rect from
+       GetCaptureSelectionLabelRect stays the invalidation superset. */
+    if (font && format) {
+        CaptureGpRectF layout = {0.0f, 0.0f, 512.0f, 64.0f};
+        CaptureGpRectF bounds = {0.0f, 0.0f, 0.0f, 0.0f};
+        int fitted = 0;
+        int lines = 0;
+        if (GdipMeasureString(graphics, dimensions, -1, font, &layout,
+                              format, &bounds, &fitted, &lines) == 0 &&
+            bounds.Width > 0.0f) {
+            int snugWidth = (int)(bounds.Width + 0.5f) +
+                            ScaleCaptureUiValue(dpi, 22);
+            int minimumWidth = ScaleCaptureUiValue(dpi, 54);
+            if (snugWidth < minimumWidth) snugWidth = minimumWidth;
+            if (snugWidth < labelRect.right - labelRect.left) {
+                labelRect.right = labelRect.left + snugWidth;
+            }
+        }
+    }
+
+    {
+        float pillRadius = (float)(labelRect.bottom - labelRect.top) / 2.0f;
+        float hairline = ScaleCaptureUiFloat(dpi, 1.0f);
+        if (hairline < 1.0f) hairline = 1.0f;
+        DrawCaptureSoftShadow(graphics, &labelRect, pillRadius, dpi,
+                              3, 1.3f, 2, 10);
+        FillCaptureRoundedRectGradient(graphics, &labelRect,
+                                       CaptureArgb(242, RGB(40, 46, 57)),
+                                       CaptureArgb(242, RGB(21, 25, 32)),
+                                       pillRadius);
+        StrokeCaptureRoundedRect(graphics, &labelRect, RGB(255, 255, 255), 44,
+                                 hairline, pillRadius);
+        DrawCaptureCenteredText(graphics, dimensions, &labelRect,
+                                RGB(245, 249, 255), font, format);
+    }
     if (format) GdipDeleteStringFormat(format);
     if (font) GdipDeleteFont(font);
 }
@@ -2956,8 +3122,9 @@ static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
     InflateRect(&area, ScaleCaptureUiValue(dpi, 4),
                  ScaleCaptureUiValue(dpi, 4));
     UnionRect(&area, &area, &labelRect);
-    InflateRect(&area, ScaleCaptureUiValue(dpi, 2),
-                 ScaleCaptureUiValue(dpi, 2));
+    /* Margin covers the dimension pill's layered drop shadow. */
+    InflateRect(&area, ScaleCaptureUiValue(dpi, 8),
+                 ScaleCaptureUiValue(dpi, 8));
     if (*hasDirty) {
         UnionRect(dirtyRect, dirtyRect, &area);
     } else {
