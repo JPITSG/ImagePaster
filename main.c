@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.26"
-#define APP_VERSION_W     L"1.0.26"
+#define APP_VERSION_A     "1.0.27"
+#define APP_VERSION_W     L"1.0.27"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -419,6 +419,8 @@ enum {
 };
 static int g_captureResizingIndex = -1;  /* box being resized, or -1 */
 static int g_captureResizingEdge = CAPTURE_EDGE_NONE;
+/* Panel hidden because the drag cursor is currently over it, or -1. */
+static int g_captureVanishedPanel = -1;
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
 static RECT *g_captureSelections = NULL;
@@ -2873,22 +2875,22 @@ static BOOL GetDisplayedCaptureSelection(size_t index, RECT *selection)
         return TRUE;
     }
     if (g_captureDragging && index == g_captureSelectionCount) {
+        /* Shown even when degenerate (0 × 0) so the dimension pill and the
+           Copy Selection label stay truthful for the whole drag. */
         *selection = NormalizeCaptureRect(
             g_captureDragStart, g_captureDragCurrent);
-        return IsCaptureSelectionValid(selection);
+        return TRUE;
     }
     return FALSE;
 }
 
-/* TRUE while any stored selection or a valid in-progress drag exists; the
-   Copy tool then acts on the selection instead of the full desktop. */
+/* TRUE while any stored selection or an in-progress drag (of any size)
+   exists; the Copy tool then acts on the selection instead of the full
+   desktop. A drag released at an invalid size adds nothing, after which
+   this reverts to FALSE. */
 static BOOL CaptureHasSelection(void)
 {
-    RECT dragRect;
-    if (g_captureSelectionCount > 0) return TRUE;
-    if (!g_captureDragging) return FALSE;
-    dragRect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
-    return IsCaptureSelectionValid(&dragRect);
+    return g_captureSelectionCount > 0 || g_captureDragging;
 }
 
 static BOOL GetCaptureSelectionBounds(RECT *bounds)
@@ -3311,6 +3313,10 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     int opacity = g_captureDragging ? 50 : 100;
     GpFont *font;
     GpStringFormat *format;
+
+    /* The panel under the drag cursor disappears completely so it never
+       obstructs the box being drawn. */
+    if (g_captureDragging && panelIndex == g_captureVanishedPanel) return;
 
     labels[CAPTURE_TOOL_CLIP] = L"Clip";
     labels[CAPTURE_TOOL_COPY] = CaptureHasSelection()
@@ -3738,12 +3744,17 @@ static int HitTestCaptureToolbar(POINT point, int *panelIndex)
     return -1;
 }
 
-static BOOL IsPointInCapturePanel(POINT point)
+static int FindCapturePanelAtPoint(POINT point)
 {
     for (int panel = 0; panel < g_capturePanelCount; panel++) {
-        if (PtInRect(&g_capturePanels[panel].panelRect, point)) return TRUE;
+        if (PtInRect(&g_capturePanels[panel].panelRect, point)) return panel;
     }
-    return FALSE;
+    return -1;
+}
+
+static BOOL IsPointInCapturePanel(POINT point)
+{
+    return FindCapturePanelAtPoint(point) >= 0;
 }
 
 static void InvalidateCapturePanel(HWND hwnd, int panelIndex)
@@ -3883,10 +3894,8 @@ static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
     RECT pillRect;
     UINT dpi;
 
-    if (selection->right - selection->left < 2 ||
-        selection->bottom - selection->top < 2) {
-        return;
-    }
+    /* Degenerate rects still contribute: a 0 × 0 in-progress drag shows a
+       dimension pill whose area must repaint. */
     area = *selection;
     dpi = GetCaptureSelectionLabelRect(selection, &labelRect);
     GetCaptureSelectionRemoveRect(selection, &pillRect);
@@ -3923,31 +3932,24 @@ static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
     RECT newRect;
     RECT dirtyRect = {0};
     BOOL hasDirty = FALSE;
-    BOOL added = FALSE;
-    BOOL valid;
 
     g_captureDragCurrent = endPoint;
     newRect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
     g_captureDragging = FALSE;
-    valid = IsCaptureSelectionValid(&newRect);
-    if (valid) {
-        added = AppendCaptureSelection(&newRect);
-        if (!added) {
-            LogMessage("ERROR: Could not retain another screen capture selection");
-            MessageBeep(MB_ICONWARNING);
-        }
+    if (IsCaptureSelectionValid(&newRect) &&
+        !AppendCaptureSelection(&newRect)) {
+        LogMessage("ERROR: Could not retain another screen capture selection");
+        MessageBeep(MB_ICONWARNING);
     }
 
-    /* Repaint whenever the rectangle moved OR a selection was committed:
-       the remove pill only exists once the drag commits, so the area must
-       redraw even when the final rect equals the last previewed one. */
-    if (!EqualRect(&oldRect, &newRect) || valid) {
-        UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
-        UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
-        if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
-    }
+    /* Always repaint the drag area: a committed selection gains its remove
+       pill, and an invalid release must erase the 0 × 0 dimension pill. */
+    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
+    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
+    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
     RefreshCaptureCopyLabels(hwnd);
-    /* Toolbars return to full opacity now that drawing has ended. */
+    /* Toolbars return to full opacity (and any vanished one reappears). */
+    g_captureVanishedPanel = -1;
     InvalidateAllCapturePanels(hwnd);
 }
 
@@ -4399,12 +4401,19 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 RECT newRect;
                 RECT dirtyRect = {0};
                 BOOL hasDirty = FALSE;
+                int vanishedPanel = FindCapturePanelAtPoint(point);
                 g_captureDragCurrent = point;
                 newRect = NormalizeCaptureRect(g_captureDragStart,
                                                g_captureDragCurrent);
                 UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
                 UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
                 if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+                if (vanishedPanel != g_captureVanishedPanel) {
+                    int oldVanished = g_captureVanishedPanel;
+                    g_captureVanishedPanel = vanishedPanel;
+                    InvalidateCapturePanel(hwnd, oldVanished);
+                    InvalidateCapturePanel(hwnd, vanishedPanel);
+                }
                 RefreshCaptureCopyLabels(hwnd);
             }
         }
@@ -4520,6 +4529,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         g_captureMovingIndex = -1;
         g_captureResizingIndex = -1;
         g_captureResizingEdge = CAPTURE_EDGE_NONE;
+        g_captureVanishedPanel = -1;
         ReleaseCaptureDrawingCache();
         ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
@@ -4575,6 +4585,7 @@ static BOOL BeginScreenCapture(void)
     g_captureMovingIndex = -1;
     g_captureResizingIndex = -1;
     g_captureResizingEdge = CAPTURE_EDGE_NONE;
+    g_captureVanishedPanel = -1;
     ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
