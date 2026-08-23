@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.23"
-#define APP_VERSION_W     L"1.0.23"
+#define APP_VERSION_A     "1.0.24"
+#define APP_VERSION_W     L"1.0.24"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -402,6 +402,8 @@ static int g_capturePressedTool = -1;
 static BOOL g_captureDragging = FALSE;
 static BOOL g_captureCopyShowsSelection = FALSE;
 static int g_captureHoveredRemoval = -1; /* stored-selection index or -1 */
+static int g_captureMovingIndex = -1;    /* box being dragged around, or -1 */
+static POINT g_captureMoveGrabOffset = {0}; /* cursor minus box top-left */
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
 static RECT *g_captureSelections = NULL;
@@ -3717,6 +3719,17 @@ static int HitTestCaptureRemovePills(POINT point)
     return -1;
 }
 
+/* Newest box wins when selections overlap. */
+static int HitTestCaptureSelections(POINT point)
+{
+    for (size_t i = g_captureSelectionCount; i > 0; i--) {
+        if (PtInRect(&g_captureSelections[i - 1], point)) {
+            return (int)(i - 1);
+        }
+    }
+    return -1;
+}
+
 static void InvalidateCaptureRemovePill(HWND hwnd, int index)
 {
     RECT pillRect;
@@ -4121,6 +4134,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             POINT point = GetCaptureCursorPoint(hwnd);
             int panelIndex = -1;
             int removeIndex = -1;
+            int moveIndex = -1;
             int tool = HitTestCaptureToolbar(point, &panelIndex);
             if (tool >= 0) {
                 g_capturePressedPanel = panelIndex;
@@ -4129,6 +4143,16 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 InvalidateCapturePanel(hwnd, panelIndex);
             } else if ((removeIndex = HitTestCaptureRemovePills(point)) >= 0) {
                 RemoveCaptureSelectionAt(hwnd, (size_t)removeIndex);
+            } else if ((wParam & MK_SHIFT) == 0 &&
+                       (moveIndex = HitTestCaptureSelections(point)) >= 0) {
+                /* Plain click inside a box picks it up; Shift+drag still
+                   draws a new additive box across existing ones. */
+                g_captureMovingIndex = moveIndex;
+                g_captureMoveGrabOffset.x =
+                    point.x - g_captureSelections[moveIndex].left;
+                g_captureMoveGrabOffset.y =
+                    point.y - g_captureSelections[moveIndex].top;
+                SetCapture(hwnd);
             } else if (!IsPointInCapturePanel(point) &&
                        g_captureSelectedTool == CAPTURE_TOOL_CLIP) {
                 BOOL additive = (wParam & MK_SHIFT) != 0;
@@ -4160,13 +4184,43 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                     InvalidateCapturePanel(hwnd, panelIndex);
                 }
             }
-            if (!g_captureDragging) {
+            if (!g_captureDragging && g_captureMovingIndex < 0) {
                 int hoveredRemoval = HitTestCaptureRemovePills(point);
                 if (hoveredRemoval != g_captureHoveredRemoval) {
                     int oldRemoval = g_captureHoveredRemoval;
                     g_captureHoveredRemoval = hoveredRemoval;
                     InvalidateCaptureRemovePill(hwnd, oldRemoval);
                     InvalidateCaptureRemovePill(hwnd, hoveredRemoval);
+                }
+            }
+            if (g_captureMovingIndex >= 0 &&
+                (size_t)g_captureMovingIndex < g_captureSelectionCount) {
+                RECT *box = &g_captureSelections[g_captureMovingIndex];
+                int boxWidth = box->right - box->left;
+                int boxHeight = box->bottom - box->top;
+                int newLeft = point.x - g_captureMoveGrabOffset.x;
+                int newTop = point.y - g_captureMoveGrabOffset.y;
+                if (newLeft < 0) newLeft = 0;
+                if (newTop < 0) newTop = 0;
+                if (newLeft + boxWidth > g_captureWidth) {
+                    newLeft = g_captureWidth - boxWidth;
+                }
+                if (newTop + boxHeight > g_captureHeight) {
+                    newTop = g_captureHeight - boxHeight;
+                }
+                if (newLeft != box->left || newTop != box->top) {
+                    RECT oldBox = *box;
+                    RECT dirtyRect = {0};
+                    BOOL hasDirty = FALSE;
+                    SetRect(box, newLeft, newTop,
+                            newLeft + boxWidth, newTop + boxHeight);
+                    /* Both dirty rects include the corner pills at their
+                       inside or outside placement for that box position. */
+                    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty,
+                                                   &oldBox);
+                    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty,
+                                                   box);
+                    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
                 }
             }
             if (g_captureDragging) {
@@ -4211,6 +4265,11 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             }
             return 0;
         }
+        if (g_captureMovingIndex >= 0) {
+            g_captureMovingIndex = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            return 0;
+        }
         if (g_captureDragging) {
             POINT point = GetCaptureCursorPoint(hwnd);
             FinishCaptureSelectionDrag(hwnd, point);
@@ -4225,6 +4284,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             g_capturePressedTool = -1;
             InvalidateCapturePanel(hwnd, oldPanel);
         }
+        g_captureMovingIndex = -1;
         if (g_captureDragging) {
             POINT point = GetCaptureCursorPoint(hwnd);
             FinishCaptureSelectionDrag(hwnd, point);
@@ -4234,13 +4294,19 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             POINT point = GetCaptureCursorPoint(hwnd);
-            int tool = HitTestCaptureToolbar(point, NULL);
             LPCWSTR cursorName;
-            if (tool >= 0 || HitTestCaptureRemovePills(point) >= 0) {
+            if (g_captureDragging) {
+                cursorName = IDC_CROSS;
+            } else if (g_captureMovingIndex >= 0 ||
+                       HitTestCaptureToolbar(point, NULL) >= 0 ||
+                       HitTestCaptureRemovePills(point) >= 0) {
+                cursorName = IDC_HAND;
+            } else if (IsPointInCapturePanel(point)) {
+                cursorName = IDC_ARROW;
+            } else if (HitTestCaptureSelections(point) >= 0) {
                 cursorName = IDC_HAND;
             } else {
-                cursorName = IsPointInCapturePanel(point) ? IDC_ARROW
-                                                          : IDC_CROSS;
+                cursorName = IDC_CROSS;
             }
             SetCursor(LoadCursor(NULL, cursorName));
             return TRUE;
@@ -4272,6 +4338,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         g_captureHoveredPanel = -1;
         g_captureHoveredTool = -1;
         g_captureHoveredRemoval = -1;
+        g_captureMovingIndex = -1;
         ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
         return 0;
@@ -4322,6 +4389,7 @@ static BOOL BeginScreenCapture(void)
     g_captureDragging = FALSE;
     g_captureCopyShowsSelection = FALSE;
     g_captureHoveredRemoval = -1;
+    g_captureMovingIndex = -1;
     ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
