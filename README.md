@@ -1,4 +1,4 @@
-# ImagePaster 1.0.9
+# ImagePaster 1.0.10
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -20,7 +20,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Optional, application-neutral compatibility paste mode using Shift+Insert
 - Optional interactive Print Screen capture across the full multi-monitor desktop
 - Dimmed capture overlay with cross-monitor selection and a glass-style toolbar on every display
-- Shift-additive multi-region capture with pixel-accurate spacing and white gaps
+- Shift-additive multi-region capture with pixel-accurate spacing and configurable white, black, or heavily blurred gaps
 - Double-buffered, anti-aliased capture rendering for smooth selection feedback
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
@@ -69,10 +69,11 @@ the normal Print Screen action with a multi-monitor capture workflow:
    new selection set.
 3. Copy places the selection on the Windows clipboard. If multiple regions are
    selected, their leftmost, topmost, rightmost, and bottommost edges define the
-   output bounds. Selected pixels keep their exact relative positions and all
-   unselected space inside those bounds is white. If no selection exists, Copy
-   captures the complete virtual desktop. The overlay then closes and the image
-   enters the normal ImagePaster cache and history pipeline.
+   output bounds. Selected pixels keep their exact relative positions. The
+   configurable **Multi-region Gap Fill** makes all unselected space inside those
+   bounds white, black, or a heavy blur of the real underlying desktop. If no
+   selection exists, Copy captures the complete virtual desktop. The overlay then
+   closes and the image enters the normal ImagePaster cache and history pipeline.
 4. Pressing `Print Screen` again while the overlay is open immediately copies the
    complete virtual desktop. Pressing `Esc` or choosing Cancel closes the overlay
    without changing the clipboard.
@@ -117,6 +118,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | Image History Limit | `ImageHistoryLimit` | REG_DWORD | `1` |
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
 | Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
+| Multi-region Gap Fill | `CaptureGapFill` | REG_DWORD | White |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
@@ -134,6 +136,10 @@ The history limit counts the current image: `1` keeps only the current image,
 `2` keeps it plus one historical image, and so on through `1000`. Selecting
 **Unlimited** stores `0` in the registry and retains every image until the
 application exits.
+
+**Multi-region Gap Fill** affects only the unselected pixels inside the combined
+bounds of two or more capture boxes. Its registry values are `0` for White, `1`
+for Black, and `2` for Heavy blur.
 
 The footer displays the application version as `v<application version>`.
 

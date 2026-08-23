@@ -11,6 +11,7 @@ import {
   dismissUpdateConfirmation,
   onUpdateResult,
   onUpdateProgress,
+  type CaptureGapFill,
   type ConfigData,
   type PasteMethod,
 } from "./lib/bridge";
@@ -69,6 +70,9 @@ export default function ConfigView({
   );
   const [screenCaptureEnabled, setScreenCaptureEnabled] = useState(
     config.screenCaptureEnabled,
+  );
+  const [captureGapFill, setCaptureGapFill] = useState<CaptureGapFill>(
+    config.captureGapFill,
   );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true,
@@ -216,6 +220,7 @@ export default function ConfigView({
       imageHistoryLimit: historyLimit,
       compatibilityPaste,
       screenCaptureEnabled,
+      captureGapFill,
       autoCheckForUpdates,
     });
   };
@@ -285,6 +290,26 @@ export default function ConfigView({
             Print Screen again copies the full desktop; Esc cancels.
           </p>
         </div>
+      </div>
+
+      <div className="ml-6 space-y-1.5">
+        <Label htmlFor="captureGapFill">Multi-region Gap Fill</Label>
+        <select
+          id="captureGapFill"
+          className={selectClass}
+          value={captureGapFill}
+          onChange={(event) =>
+            setCaptureGapFill(event.target.value as CaptureGapFill)
+          }
+        >
+          <option value="white">White (default)</option>
+          <option value="black">Black</option>
+          <option value="blur">Heavy blur</option>
+        </select>
+        <p className="text-[11px] leading-snug text-neutral-500">
+          Controls unselected pixels inside the combined outer bounds when two
+          or more boxes are copied. Heavy blur uses the real underlying screen.
+        </p>
       </div>
 
       <div className="border-t border-neutral-200 pt-4 space-y-3">

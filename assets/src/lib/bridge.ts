@@ -1,4 +1,5 @@
 export type PasteMethod = "base64" | "http";
+export type CaptureGapFill = "white" | "black" | "blur";
 
 export interface ConfigData {
   titleMatch: string;
@@ -10,6 +11,7 @@ export interface ConfigData {
   imageHistoryLimit: number;
   compatibilityPaste: boolean;
   screenCaptureEnabled: boolean;
+  captureGapFill: CaptureGapFill;
   autoCheckForUpdates: boolean;
   availableIps: string[];
   bindIpAvailable: boolean;
@@ -142,6 +144,7 @@ export function saveSettings(config: ConfigData) {
     imageHistoryLimit: config.imageHistoryLimit,
     compatibilityPaste: config.compatibilityPaste ? 1 : 0,
     screenCaptureEnabled: config.screenCaptureEnabled ? 1 : 0,
+    captureGapFill: config.captureGapFill,
     autoCheckForUpdates: config.autoCheckForUpdates ? 1 : 0,
   });
 }

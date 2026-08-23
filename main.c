@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.9"
-#define APP_VERSION_W     L"1.0.9"
+#define APP_VERSION_A     "1.0.10"
+#define APP_VERSION_W     L"1.0.10"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -212,6 +212,7 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define REG_VALUE_COMPATIBILITY_PASTE "CompatibilityPaste"
 #define REG_VALUE_LEGACY_COMPATIBILITY_PASTE "ShiftInsertPaste"
 #define REG_VALUE_SCREEN_CAPTURE "ScreenCaptureEnabled"
+#define REG_VALUE_CAPTURE_GAP_FILL "CaptureGapFill"
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 
 #define LOG_RING_CAPACITY  500
@@ -239,6 +240,9 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define CAPTURE_TOOL_COPY    1
 #define CAPTURE_TOOL_CANCEL  2
 #define CAPTURE_TOOL_COUNT   3
+#define CAPTURE_GAP_FILL_WHITE 0
+#define CAPTURE_GAP_FILL_BLACK 1
+#define CAPTURE_GAP_FILL_BLUR  2
 #define CAPTURE_PANEL_WIDTH  250
 #define CAPTURE_PANEL_HEIGHT 74
 #define CAPTURE_BUTTON_WIDTH 70
@@ -289,6 +293,7 @@ static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
 static int  g_configImageHistoryLimit = DEFAULT_IMAGE_HISTORY_LIMIT;
 static BOOL g_configCompatibilityPaste = TRUE;
 static BOOL g_configScreenCaptureEnabled = FALSE;
+static int  g_configCaptureGapFill = CAPTURE_GAP_FILL_WHITE;
 static BOOL g_configAutoCheckForUpdates = TRUE;
 static BOOL g_pasteDeferred = FALSE;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
@@ -322,6 +327,12 @@ typedef struct {
     RECT buttonRects[CAPTURE_TOOL_COUNT];
     UINT dpi;
 } CapturePanel;
+
+typedef struct {
+    int first;
+    int second;
+    unsigned int fraction;
+} CaptureBlurSample;
 
 static HWND g_captureOverlayHwnd = NULL;
 static HBITMAP g_captureOriginalBitmap = NULL;
@@ -1941,6 +1952,13 @@ static BOOL LoadConfigFromRegistry(void)
     }
 
     size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_CAPTURE_GAP_FILL, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= CAPTURE_GAP_FILL_BLUR) {
+        g_configCaptureGapFill = (int)value;
+    }
+
+    size = sizeof(value);
     if (RegQueryValueExA(hKey, REG_VALUE_AUTO_UPDATE, NULL, &type,
                          (LPBYTE)&value, &size) == ERROR_SUCCESS &&
         type == REG_DWORD && value <= 1) {
@@ -1990,6 +2008,9 @@ static void SaveConfigToRegistry(void)
         value = (DWORD)g_configScreenCaptureEnabled;
         RegSetValueExA(hKey, REG_VALUE_SCREEN_CAPTURE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configCaptureGapFill;
+        RegSetValueExA(hKey, REG_VALUE_CAPTURE_GAP_FILL, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
         value = (DWORD)g_configAutoCheckForUpdates;
         RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
@@ -2002,10 +2023,13 @@ static void SaveConfigToRegistry(void)
         snprintf(historyText, sizeof(historyText), "%d",
                  g_configImageHistoryLimit);
     }
-    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
+    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, gap=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
                g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V",
                g_configScreenCaptureEnabled ? "enabled" : "disabled",
+               g_configCaptureGapFill == CAPTURE_GAP_FILL_BLACK ? "black" :
+               g_configCaptureGapFill == CAPTURE_GAP_FILL_BLUR ? "blur" :
+                                                                  "white",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
                historyText, g_configTitleMatch);
 }
@@ -2963,6 +2987,182 @@ static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
     }
 }
 
+static CaptureBlurSample GetCaptureBlurSample(int coordinate, int blockSize,
+                                              int sampleCount)
+{
+    CaptureBlurSample sample = {0, 0, 0};
+    LONGLONG fixedPosition;
+
+    if (sampleCount <= 1) return sample;
+    fixedPosition = ((2LL * coordinate + 1) * 256) /
+                    (2LL * blockSize) - 128;
+    if (fixedPosition <= 0) return sample;
+
+    sample.first = (int)(fixedPosition / 256);
+    if (sample.first >= sampleCount - 1) {
+        sample.first = sampleCount - 1;
+        sample.second = sample.first;
+        return sample;
+    }
+    sample.second = sample.first + 1;
+    sample.fraction = (unsigned int)(fixedPosition % 256);
+    return sample;
+}
+
+static BOOL FillHeavilyBlurredCaptureBackground(
+    BYTE *destinationPixels, size_t rowBytes, const RECT *sourceRect)
+{
+    int width = sourceRect->right - sourceRect->left;
+    int height = sourceRect->bottom - sourceRect->top;
+    int minimumDimension = width < height ? width : height;
+    int blockSize = minimumDimension / 24;
+    int reducedWidth;
+    int reducedHeight;
+    size_t reducedCount;
+    DWORD *reduced = NULL;
+    DWORD *smoothed = NULL;
+    CaptureBlurSample *horizontalSamples = NULL;
+    BOOL success = FALSE;
+
+    if (!destinationPixels || !g_captureOriginalPixels ||
+        width <= 0 || height <= 0) {
+        return FALSE;
+    }
+    if (blockSize < 32) blockSize = 32;
+    if (blockSize > 96) blockSize = 96;
+    reducedWidth = (width - 1) / blockSize + 1;
+    reducedHeight = (height - 1) / blockSize + 1;
+    if ((size_t)reducedWidth > (size_t)-1 / (size_t)reducedHeight) {
+        return FALSE;
+    }
+    reducedCount = (size_t)reducedWidth * (size_t)reducedHeight;
+    if (reducedCount > (size_t)-1 / sizeof(DWORD) ||
+        (size_t)width > (size_t)-1 / sizeof(CaptureBlurSample)) {
+        return FALSE;
+    }
+
+    reduced = (DWORD *)malloc(reducedCount * sizeof(DWORD));
+    smoothed = (DWORD *)malloc(reducedCount * sizeof(DWORD));
+    horizontalSamples = (CaptureBlurSample *)malloc(
+        (size_t)width * sizeof(CaptureBlurSample));
+    if (!reduced || !smoothed || !horizontalSamples) goto cleanup;
+
+    for (int reducedY = 0; reducedY < reducedHeight; reducedY++) {
+        int localTop = reducedY * blockSize;
+        int localBottom = localTop + blockSize;
+        if (localBottom > height) localBottom = height;
+        for (int reducedX = 0; reducedX < reducedWidth; reducedX++) {
+            int localLeft = reducedX * blockSize;
+            int localRight = localLeft + blockSize;
+            ULONGLONG blue = 0;
+            ULONGLONG green = 0;
+            ULONGLONG red = 0;
+            ULONGLONG samples = 0;
+            if (localRight > width) localRight = width;
+
+            for (int localY = localTop; localY < localBottom; localY++) {
+                const DWORD *source = g_captureOriginalPixels +
+                    ((size_t)(sourceRect->top + localY) *
+                     (size_t)g_captureWidth) +
+                    (size_t)(sourceRect->left + localLeft);
+                for (int localX = localLeft; localX < localRight; localX++) {
+                    DWORD pixel = *source++;
+                    blue += pixel & 0xffu;
+                    green += (pixel >> 8) & 0xffu;
+                    red += (pixel >> 16) & 0xffu;
+                    samples++;
+                }
+            }
+            reduced[(size_t)reducedY * (size_t)reducedWidth +
+                    (size_t)reducedX] =
+                (DWORD)((blue + samples / 2) / samples) |
+                ((DWORD)((green + samples / 2) / samples) << 8) |
+                ((DWORD)((red + samples / 2) / samples) << 16);
+        }
+    }
+
+    /* Smooth the reduced image before interpolation. Combined with aggressive
+       downsampling this removes readable detail without creating blocky gaps. */
+    for (int reducedY = 0; reducedY < reducedHeight; reducedY++) {
+        for (int reducedX = 0; reducedX < reducedWidth; reducedX++) {
+            unsigned int blue = 0;
+            unsigned int green = 0;
+            unsigned int red = 0;
+            unsigned int samples = 0;
+            int top = reducedY > 0 ? reducedY - 1 : 0;
+            int bottom = reducedY + 1 < reducedHeight
+                ? reducedY + 1 : reducedHeight - 1;
+            int left = reducedX > 0 ? reducedX - 1 : 0;
+            int right = reducedX + 1 < reducedWidth
+                ? reducedX + 1 : reducedWidth - 1;
+            for (int y = top; y <= bottom; y++) {
+                for (int x = left; x <= right; x++) {
+                    DWORD pixel = reduced[
+                        (size_t)y * (size_t)reducedWidth + (size_t)x];
+                    blue += pixel & 0xffu;
+                    green += (pixel >> 8) & 0xffu;
+                    red += (pixel >> 16) & 0xffu;
+                    samples++;
+                }
+            }
+            smoothed[(size_t)reducedY * (size_t)reducedWidth +
+                     (size_t)reducedX] =
+                (DWORD)((blue + samples / 2) / samples) |
+                ((DWORD)((green + samples / 2) / samples) << 8) |
+                ((DWORD)((red + samples / 2) / samples) << 16);
+        }
+    }
+
+    for (int x = 0; x < width; x++) {
+        horizontalSamples[x] = GetCaptureBlurSample(
+            x, blockSize, reducedWidth);
+    }
+    for (int y = 0; y < height; y++) {
+        CaptureBlurSample vertical = GetCaptureBlurSample(
+            y, blockSize, reducedHeight);
+        DWORD *destination = (DWORD *)(destinationPixels +
+            (size_t)(height - 1 - y) * rowBytes);
+        for (int x = 0; x < width; x++) {
+            CaptureBlurSample horizontal = horizontalSamples[x];
+            DWORD topLeft = smoothed[
+                (size_t)vertical.first * (size_t)reducedWidth +
+                (size_t)horizontal.first];
+            DWORD topRight = smoothed[
+                (size_t)vertical.first * (size_t)reducedWidth +
+                (size_t)horizontal.second];
+            DWORD bottomLeft = smoothed[
+                (size_t)vertical.second * (size_t)reducedWidth +
+                (size_t)horizontal.first];
+            DWORD bottomRight = smoothed[
+                (size_t)vertical.second * (size_t)reducedWidth +
+                (size_t)horizontal.second];
+            DWORD result = 0;
+            unsigned int inverseX = 256 - horizontal.fraction;
+            unsigned int inverseY = 256 - vertical.fraction;
+
+            for (unsigned int shift = 0; shift <= 16; shift += 8) {
+                unsigned int top =
+                    ((topLeft >> shift) & 0xffu) * inverseX +
+                    ((topRight >> shift) & 0xffu) * horizontal.fraction;
+                unsigned int bottom =
+                    ((bottomLeft >> shift) & 0xffu) * inverseX +
+                    ((bottomRight >> shift) & 0xffu) * horizontal.fraction;
+                unsigned int channel =
+                    (top * inverseY + bottom * vertical.fraction + 32768u) >> 16;
+                result |= (DWORD)channel << shift;
+            }
+            destination[x] = result;
+        }
+    }
+    success = TRUE;
+
+cleanup:
+    free(horizontalSamples);
+    free(smoothed);
+    free(reduced);
+    return success;
+}
+
 static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect,
                                          BOOL selectedRegionsOnly)
 {
@@ -2975,6 +3175,8 @@ static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect,
     BYTE *dibData;
     BITMAPINFOHEADER *header;
     BYTE *destinationPixels;
+    BOOL combineSelections =
+        selectedRegionsOnly && g_captureSelectionCount > 1;
 
     if (!g_captureOriginalPixels || width <= 0 || height <= 0 ||
         (size_t)width > (size_t)-1 / 4u) return NULL;
@@ -3004,19 +3206,30 @@ static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect,
     header->biSizeImage = (DWORD)pixelBytes;
     destinationPixels = dibData + sizeof(*header);
 
-    if (selectedRegionsOnly) {
-        DWORD *pixels = (DWORD *)destinationPixels;
-        size_t pixelCount = pixelBytes / sizeof(DWORD);
-        for (size_t index = 0; index < pixelCount; index++) {
-            pixels[index] = 0x00ffffffu;
+    if (combineSelections) {
+        if (g_configCaptureGapFill == CAPTURE_GAP_FILL_BLUR) {
+            if (!FillHeavilyBlurredCaptureBackground(
+                    destinationPixels, rowBytes, sourceRect)) {
+                GlobalUnlock(dibMemory);
+                GlobalFree(dibMemory);
+                return NULL;
+            }
+        } else if (g_configCaptureGapFill == CAPTURE_GAP_FILL_BLACK) {
+            ZeroMemory(destinationPixels, pixelBytes);
+        } else {
+            DWORD *pixels = (DWORD *)destinationPixels;
+            size_t pixelCount = pixelBytes / sizeof(DWORD);
+            for (size_t index = 0; index < pixelCount; index++) {
+                pixels[index] = 0x00ffffffu;
+            }
         }
     }
 
     {
-        size_t copyCount = selectedRegionsOnly ? g_captureSelectionCount : 1;
+        size_t copyCount = combineSelections ? g_captureSelectionCount : 1;
         for (size_t index = 0; index < copyCount; index++) {
             RECT copyRect;
-            if (selectedRegionsOnly) {
+            if (combineSelections) {
                 if (!IntersectRect(&copyRect, &g_captureSelections[index],
                                    sourceRect)) {
                     continue;
@@ -3475,7 +3688,7 @@ static void UpdateTooltip(void)
         wcscpy(g_nid.szTip, L"Image pasting is inactive");
     } else {
         WCHAR wMatch[2048] = {0};
-        WCHAR tip[128] = L"Image pasting active for: \"";
+        WCHAR tip[128] = L"Image pasting active for \"";
         size_t remaining;
         MultiByteToWideChar(CP_UTF8, 0, g_configTitleMatch, -1,
                             wMatch, sizeof(wMatch) / sizeof(wMatch[0]));
@@ -5038,6 +5251,9 @@ static void webview_push_init_config(void)
     wchar_t ipsJson[4096];
     char ips[MAX_DETECTED_IPS][INET_ADDRSTRLEN];
     int ipCount = EnumerateDetectedIpv4Addresses(ips, MAX_DETECTED_IPS);
+    const wchar_t *captureGapFill =
+        g_configCaptureGapFill == CAPTURE_GAP_FILL_BLACK ? L"black" :
+        g_configCaptureGapFill == CAPTURE_GAP_FILL_BLUR ? L"blur" : L"white";
     size_t pos = 0;
     json_escape_string(g_configTitleMatch, wTitleMatch, 4096);
     json_escape_string(g_configHttpMessageTemplate, wHttpMessageTemplate,
@@ -5068,6 +5284,7 @@ static void webview_push_init_config(void)
         L"\"imageHistoryLimit\":%d,"
         L"\"compatibilityPaste\":%s,"
         L"\"screenCaptureEnabled\":%s,"
+        L"\"captureGapFill\":\"%s\","
         L"\"autoCheckForUpdates\":%s,"
         L"\"availableIps\":%s,"
         L"\"bindIpAvailable\":%s,"
@@ -5080,6 +5297,7 @@ static void webview_push_init_config(void)
         g_configImageHistoryLimit,
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
+        captureGapFill,
         g_configAutoCheckForUpdates ? L"true" : L"false", ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
         wHttpStatus, APP_VERSION_W, wUpdateCompletedVersion);
@@ -5284,6 +5502,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char titleMatch[2048] = {0};
         char pasteMethod[32] = {0};
         char httpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES] = {0};
+        char captureGapFill[16] = {0};
         char bindIp[INET_ADDRSTRLEN] = {0};
         int httpPort = 0;
         int jpegQuality = -1;
@@ -5305,6 +5524,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_int(msg, "imageHistoryLimit", &imageHistoryLimit);
         json_get_int(msg, "compatibilityPaste", &compatibilityPaste);
         json_get_int(msg, "screenCaptureEnabled", &screenCaptureEnabled);
+        json_get_string(msg, "captureGapFill", captureGapFill,
+                        sizeof(captureGapFill));
         json_get_int(msg, "autoCheckForUpdates", &autoCheckForUpdates);
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
@@ -5352,6 +5573,13 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             free(msg);
             return S_OK;
         }
+        if (strcmp(captureGapFill, "white") != 0 &&
+            strcmp(captureGapFill, "black") != 0 &&
+            strcmp(captureGapFill, "blur") != 0) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid multi-region gap fill.'})");
+            free(msg);
+            return S_OK;
+        }
         if (autoCheckForUpdates < 0 || autoCheckForUpdates > 1) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid automatic update setting.'})");
             free(msg);
@@ -5384,6 +5612,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
         g_configCompatibilityPaste = compatibilityPaste != 0;
         g_configScreenCaptureEnabled = screenCaptureEnabled != 0;
+        g_configCaptureGapFill = strcmp(captureGapFill, "black") == 0
+            ? CAPTURE_GAP_FILL_BLACK
+            : strcmp(captureGapFill, "blur") == 0
+                ? CAPTURE_GAP_FILL_BLUR
+                : CAPTURE_GAP_FILL_WHITE;
         if (!g_configScreenCaptureEnabled && g_captureOverlayHwnd) {
             CancelScreenCapture("feature was disabled");
         }
