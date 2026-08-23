@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.21"
-#define APP_VERSION_W     L"1.0.21"
+#define APP_VERSION_A     "1.0.22"
+#define APP_VERSION_W     L"1.0.22"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -3403,18 +3403,22 @@ static UINT GetCaptureSelectionLabelRect(const RECT *selection,
     return dpi;
 }
 
-/* Round remove pill straddling the middle of a selection's right edge. */
+/* Round remove pill at a selection's top-right corner, mirroring the
+   dimension pill: above the box flush with the right edge, or inside the
+   box with equal top/right margins when there is no room above. */
 static UINT GetCaptureSelectionRemoveRect(const RECT *selection,
                                           RECT *pillRect)
 {
     POINT anchor = {selection->right, selection->top};
     UINT dpi = GetCaptureDpiAtPoint(anchor);
     int diameter = ScaleCaptureUiValue(dpi, 26);
-    int centerY = (selection->top + selection->bottom) / 2;
+    int gap = ScaleCaptureUiValue(dpi, 8);
+    BOOL inside = selection->top < diameter + gap * 2;
 
-    pillRect->left = selection->right - diameter / 2;
-    pillRect->top = centerY - diameter / 2;
-    pillRect->right = pillRect->left + diameter;
+    pillRect->right = inside ? selection->right - gap : selection->right;
+    pillRect->top = inside ? selection->top + gap
+                           : selection->top - diameter - gap;
+    pillRect->left = pillRect->right - diameter;
     pillRect->bottom = pillRect->top + diameter;
     if (pillRect->right > g_captureWidth) {
         OffsetRect(pillRect, g_captureWidth - pillRect->right, 0);
