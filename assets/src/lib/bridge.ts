@@ -13,6 +13,8 @@ export interface ConfigData {
   screenCaptureEnabled: boolean;
   captureGapFill: CaptureGapFill;
   autoCheckForUpdates: boolean;
+  updateCheckPending: boolean;
+  updatePromptPending: boolean;
   availableIps: string[];
   bindIpAvailable: boolean;
   serverStatus: string;
@@ -43,6 +45,7 @@ export interface UpdateResult {
   message: string;
   currentVersion: string;
   remoteVersion: string;
+  automatic: boolean;
 }
 
 export interface UpdateProgress {
@@ -149,8 +152,15 @@ export function saveSettings(config: ConfigData) {
   });
 }
 
-export function checkForUpdate() {
-  postMessage({ action: "checkUpdate" });
+export function configReady(checkAutomatically = false) {
+  postMessage({
+    action: "configReady",
+    checkAutomatically: checkAutomatically ? 1 : 0,
+  });
+}
+
+export function checkForUpdate(automatic = false) {
+  postMessage({ action: "checkUpdate", automatic: automatic ? 1 : 0 });
 }
 
 export function cancelUpdateCheck() {
@@ -163,6 +173,10 @@ export function installUpdate() {
 
 export function dismissUpdate() {
   postMessage({ action: "dismissUpdate" });
+}
+
+export function ignoreUpdateVersion(version: string) {
+  postMessage({ action: "ignoreUpdateVersion", version });
 }
 
 export function dismissUpdateConfirmation() {

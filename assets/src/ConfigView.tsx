@@ -6,8 +6,10 @@ import {
   onSaveResult,
   checkForUpdate,
   cancelUpdateCheck,
+  configReady,
   installUpdate,
   dismissUpdate,
+  ignoreUpdateVersion,
   dismissUpdateConfirmation,
   onUpdateResult,
   onUpdateProgress,
@@ -78,7 +80,9 @@ export default function ConfigView({
     config.autoCheckForUpdates ?? true,
   );
   const [error, setError] = useState("");
-  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateChecking, setUpdateChecking] = useState(
+    config.updateCheckPending ?? false,
+  );
   const [updateCancelling, setUpdateCancelling] = useState(false);
   const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
   const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
@@ -89,10 +93,10 @@ export default function ConfigView({
           message: `ImagePaster has been updated to version ${updateCompletedVersion}.`,
           currentVersion: "",
           remoteVersion: "",
+          automatic: false,
         }
       : null,
   );
-  const updateRequestMode = useRef<"automatic" | "manual" | null>(null);
   const automaticUpdateStarted = useRef(false);
 
   const selectedBindIp = useMemo(
@@ -108,16 +112,17 @@ export default function ConfigView({
 
   useEffect(() => {
     const removeResultListener = onUpdateResult((result) => {
-      const wasAutomatic = updateRequestMode.current === "automatic";
-      updateRequestMode.current = null;
       setUpdateChecking(false);
       setUpdateCancelling(false);
       setUpdateSpeedKbps(null);
       if (result.status === "cancelled") {
-        setUpdateAlert(null);
-      } else if (wasAutomatic && result.status !== "newer") {
-        dismissUpdate();
-        setUpdateAlert(null);
+        setUpdateAlert((current) =>
+          result.automatic && current?.status === "completed" ? current : null,
+        );
+      } else if (result.automatic && result.status !== "newer") {
+        setUpdateAlert((current) =>
+          current?.status === "completed" ? current : null,
+        );
       } else {
         setUpdateAlert(result);
       }
@@ -126,22 +131,28 @@ export default function ConfigView({
       setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
     });
 
-    if (
+    const shouldCheckAutomatically =
       config.autoCheckForUpdates &&
       !updateCompletedVersion &&
-      !automaticUpdateStarted.current
-    ) {
+      !config.updateCheckPending &&
+      !config.updatePromptPending &&
+      !automaticUpdateStarted.current;
+    if (shouldCheckAutomatically) {
       automaticUpdateStarted.current = true;
-      updateRequestMode.current = "automatic";
       setUpdateChecking(true);
-      checkForUpdate();
     }
+    configReady(shouldCheckAutomatically);
 
     return () => {
       removeResultListener();
       removeProgressListener();
     };
-  }, [config.autoCheckForUpdates, updateCompletedVersion]);
+  }, [
+    config.autoCheckForUpdates,
+    config.updateCheckPending,
+    config.updatePromptPending,
+    updateCompletedVersion,
+  ]);
 
   function handleUpdate() {
     if (updateChecking) {
@@ -153,8 +164,7 @@ export default function ConfigView({
     setUpdateChecking(true);
     setUpdateCancelling(false);
     setUpdateSpeedKbps(null);
-    updateRequestMode.current = "manual";
-    checkForUpdate();
+    checkForUpdate(false);
   }
 
   function handleInstallUpdate() {
@@ -170,6 +180,12 @@ export default function ConfigView({
     } else {
       dismissUpdate();
     }
+    setUpdateAlert(null);
+  }
+
+  function handleIgnoreUpdateVersion() {
+    if (!updateAlert?.remoteVersion) return;
+    ignoreUpdateVersion(updateAlert.remoteVersion);
     setUpdateAlert(null);
   }
 
@@ -452,8 +468,8 @@ export default function ConfigView({
             Automatically check for updates
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            Checks whenever this dialog opens and prompts only when a newer
-            version is available.
+            Checks at startup, whenever this dialog opens, and every 60 minutes.
+            Prompts only when a newer version is available.
           </p>
         </div>
       </div>
@@ -540,6 +556,16 @@ export default function ConfigView({
               </dl>
             )}
             <div className="flex justify-end gap-2">
+              {updateAlert.status === "newer" && updateAlert.automatic && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={updateChecking}
+                  onClick={handleIgnoreUpdateVersion}
+                >
+                  Ignore this version
+                </Button>
+              )}
               {(updateAlert.status === "newer" ||
                 updateAlert.status === "same") && (
                 <Button

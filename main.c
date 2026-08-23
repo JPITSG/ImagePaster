@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.10"
-#define APP_VERSION_W     L"1.0.10"
+#define APP_VERSION_A     "1.0.11"
+#define APP_VERSION_W     L"1.0.11"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -190,10 +190,12 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define ID_TIMER_HTTP_RECONCILE         1007
 #define ID_TIMER_CLIPBOARD_RETRY        1008
 #define ID_TIMER_DEFERRED_PASTE         1009
+#define ID_TIMER_AUTO_UPDATE             1010
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
 #define HTTP_RECONCILE_INTERVAL_MS      3000
 #define CLIPBOARD_RETRY_DELAY_MS        150
 #define DEFERRED_PASTE_DELAY_MS          10
+#define AUTO_UPDATE_INTERVAL_MS          (60u * 60u * 1000u)
 
 #define UPDATE_URL L"https://github.com/JPITSG/ImagePaster/raw/refs/heads/main/release/ImagePaster.exe"
 #define UPDATE_MAX_BYTES (100ULL * 1024ULL * 1024ULL)
@@ -214,6 +216,7 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 #define REG_VALUE_SCREEN_CAPTURE "ScreenCaptureEnabled"
 #define REG_VALUE_CAPTURE_GAP_FILL "CaptureGapFill"
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
+#define REG_VALUE_IGNORED_UPDATE_VERSION "IgnoredUpdateVersion"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
@@ -295,6 +298,7 @@ static BOOL g_configCompatibilityPaste = TRUE;
 static BOOL g_configScreenCaptureEnabled = FALSE;
 static int  g_configCaptureGapFill = CAPTURE_GAP_FILL_WHITE;
 static BOOL g_configAutoCheckForUpdates = TRUE;
+static char g_ignoredUpdateVersion[32] = "";
 static BOOL g_pasteDeferred = FALSE;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
 static int   g_keywordCount = 0;
@@ -581,8 +585,10 @@ static ICoreWebView2Controller *g_webviewController = NULL;
 static ICoreWebView2 *g_webviewView = NULL;
 static char g_pendingView[16] = "";
 static BOOL g_webviewWindowShown = FALSE;
+static BOOL g_configViewReady = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
 static volatile LONG g_updateCheckPending = FALSE;
+static volatile LONG g_updateCheckAutomatic = FALSE;
 static BOOL g_updateInstallReady = FALSE;
 static volatile LONG g_updateRequestSequence = 0;
 static HANDLE g_updateCancelEvent = NULL;
@@ -606,6 +612,7 @@ typedef enum {
 
 typedef struct {
     HWND targetWindow;
+    BOOL automatic;
     UpdateCheckKind kind;
     ULONGLONG cacheBuster;
     ExecutableVersion runningVersion;
@@ -616,6 +623,7 @@ typedef struct {
 } UpdateCheckTask;
 
 static UpdateCheckTask* volatile g_updatePostedResult = NULL;
+static UpdateCheckTask* g_updateNoticeTask = NULL;
 static UpdateCheckTask* g_updateReadyTask = NULL;
 
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
@@ -640,7 +648,7 @@ static void DestroyImageCache(void);
 static BOOL BeginScreenCapture(void);
 static BOOL CompleteScreenCapture(BOOL forceFullDesktop);
 static void CancelScreenCapture(const char *reason);
-static void StartUpdateCheck(void);
+static void StartUpdateCheck(BOOL automatic);
 static void CancelUpdateCheck(void);
 static void InstallPreparedUpdate(void);
 static void DiscardPreparedUpdate(void);
@@ -1965,6 +1973,14 @@ static BOOL LoadConfigFromRegistry(void)
         g_configAutoCheckForUpdates = value != 0;
     }
 
+    size = sizeof(g_ignoredUpdateVersion);
+    if (RegQueryValueExA(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, NULL, &type,
+                         (LPBYTE)g_ignoredUpdateVersion, &size) != ERROR_SUCCESS ||
+        type != REG_SZ || size == 0) {
+        g_ignoredUpdateVersion[0] = '\0';
+    }
+    g_ignoredUpdateVersion[sizeof(g_ignoredUpdateVersion) - 1] = '\0';
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -2015,6 +2031,9 @@ static void SaveConfigToRegistry(void)
         RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
     }
+    RegSetValueExA(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
+                   (const BYTE *)g_ignoredUpdateVersion,
+                   (DWORD)(strlen(g_ignoredUpdateVersion) + 1));
 
     RegCloseKey(hKey);
     if (g_configImageHistoryLimit == 0) {
@@ -3863,7 +3882,7 @@ static BOOL CancelUpdateTaskIfRequested(UpdateCheckTask* task) {
 
 static void PublishUpdateProgress(UpdateCheckTask* task, DWORD speedKbps) {
     if (!task || CancelUpdateTaskIfRequested(task) ||
-        task->targetWindow != g_webviewHwnd || !IsWindow(task->targetWindow)) {
+        !IsWindow(task->targetWindow)) {
         return;
     }
 
@@ -4268,8 +4287,8 @@ static void DiscardUpdateTask(UpdateCheckTask* task) {
 static void PublishUpdateTask(UpdateCheckTask* task) {
     CancelUpdateTaskIfRequested(task);
     InterlockedExchange(&g_updateCheckPending, FALSE);
-    if (!task || task->targetWindow != g_webviewHwnd ||
-        !IsWindow(task->targetWindow)) {
+    InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+    if (!task || !IsWindow(task->targetWindow)) {
         DiscardUpdateTask(task);
         return;
     }
@@ -4958,7 +4977,8 @@ static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen)
 static void CfgSendUpdateResultWithVersions(LPCWSTR status, LPCWSTR title,
                                             LPCWSTR message,
                                             LPCWSTR currentVersion,
-                                            LPCWSTR remoteVersion) {
+                                            LPCWSTR remoteVersion,
+                                            BOOL automatic) {
     if (!g_webviewView || !status || !title || !message ||
         !currentVersion || !remoteVersion) return;
     wchar_t escapedStatus[64], escapedTitle[256], escapedMessage[1024];
@@ -4978,14 +4998,15 @@ static void CfgSendUpdateResultWithVersions(LPCWSTR status, LPCWSTR title,
     int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
         L"window.onUpdateResult({\"status\":\"%s\",\"title\":\"%s\","
         L"\"message\":\"%s\",\"currentVersion\":\"%s\","
-        L"\"remoteVersion\":\"%s\"})",
+        L"\"remoteVersion\":\"%s\",\"automatic\":%s})",
         escapedStatus, escapedTitle, escapedMessage,
-        escapedCurrentVersion, escapedRemoteVersion);
+        escapedCurrentVersion, escapedRemoteVersion,
+        automatic ? L"true" : L"false");
     if (written > 0) webview_execute_script(script);
 }
 
 static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) {
-    CfgSendUpdateResultWithVersions(status, title, message, L"", L"");
+    CfgSendUpdateResultWithVersions(status, title, message, L"", L"", FALSE);
 }
 
 static void CfgSendUpdateProgress(DWORD speedKbps) {
@@ -4996,16 +5017,36 @@ static void CfgSendUpdateProgress(DWORD speedKbps) {
     if (written > 0) webview_execute_script(script);
 }
 
-static void StartUpdateCheck(void) {
-    if (!g_webviewHwnd) return;
-    if (InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
-        CfgSendUpdateResult(L"error", L"Update check in progress",
-                            L"Another update check is still finishing. Try again shortly.");
+static void DiscardPendingUpdateNotice(void) {
+    UpdateCheckTask* task = g_updateNoticeTask;
+    g_updateNoticeTask = NULL;
+    DiscardUpdateTask(task);
+}
+
+static void StartUpdateCheck(BOOL automatic) {
+    if (!g_hWndMain) return;
+    if (automatic && (g_updateNoticeTask || g_updateReadyTask)) return;
+    if (InterlockedCompareExchangePointer(
+            (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL) {
+        if (!automatic) {
+            CfgSendUpdateResult(L"error", L"Update check in progress",
+                L"Another update check is still finishing. Try again shortly.");
+        }
         return;
     }
+    if (InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
+        if (!automatic) {
+            CfgSendUpdateResult(L"error", L"Update check in progress",
+                L"Another update check is still finishing. Try again shortly.");
+        }
+        return;
+    }
+    InterlockedExchange(&g_updateCheckAutomatic, automatic ? TRUE : FALSE);
 
-    // A click always starts from scratch. Do not reuse a previously staged
-    // candidate or its version result after the user asks to check again.
+    // Every accepted request starts from scratch. Automatic requests are
+    // skipped above while a result is awaiting user action, avoiding an
+    // hourly re-download of the same prepared executable.
+    DiscardPendingUpdateNotice();
     DiscardPreparedUpdate();
 
     if (!g_updateCancelEvent) {
@@ -5013,11 +5054,13 @@ static void StartUpdateCheck(void) {
         if (!g_updateCancelEvent) {
             DWORD errorCode = GetLastError();
             InterlockedExchange(&g_updateCheckPending, FALSE);
+            InterlockedExchange(&g_updateCheckAutomatic, FALSE);
             wchar_t message[256];
             swprintf_s(message, sizeof(message) / sizeof(wchar_t),
                 L"Could not initialize update cancellation (Windows error %lu).",
                 (unsigned long)errorCode);
-            CfgSendUpdateResult(L"error", L"Update failed", message);
+            CfgSendUpdateResultWithVersions(L"error", L"Update failed", message,
+                                            L"", L"", automatic);
             return;
         }
     }
@@ -5028,11 +5071,14 @@ static void StartUpdateCheck(void) {
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
     if (!task) {
         InterlockedExchange(&g_updateCheckPending, FALSE);
-        CfgSendUpdateResult(L"error", L"Update failed",
-                            L"There was not enough memory to check for updates.");
+        InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+        CfgSendUpdateResultWithVersions(L"error", L"Update failed",
+            L"There was not enough memory to check for updates.",
+            L"", L"", automatic);
         return;
     }
-    task->targetWindow = g_webviewHwnd;
+    task->targetWindow = g_hWndMain;
+    task->automatic = automatic;
     LONG sequence = InterlockedIncrement(&g_updateRequestSequence);
     task->cacheBuster =
         ((GetTickCount64() ^ GetCurrentProcessId()) << 32) | (DWORD)sequence;
@@ -5043,14 +5089,181 @@ static void StartUpdateCheck(void) {
         DWORD errorCode = GetLastError();
         free(task);
         InterlockedExchange(&g_updateCheckPending, FALSE);
+        InterlockedExchange(&g_updateCheckAutomatic, FALSE);
         wchar_t message[256];
         swprintf_s(message, sizeof(message) / sizeof(wchar_t),
                    L"Could not start the update check (Windows error %lu).",
                    (unsigned long)errorCode);
-        CfgSendUpdateResult(L"error", L"Update failed", message);
+        CfgSendUpdateResultWithVersions(L"error", L"Update failed", message,
+                                        L"", L"", automatic);
         return;
     }
     CloseHandle(thread);
+}
+
+static BOOL IsConfigurationViewOpen(void) {
+    return g_webviewHwnd && IsWindow(g_webviewHwnd) &&
+           strcmp(g_pendingView, "config") == 0;
+}
+
+static BOOL IsIgnoredUpdateVersion(const ExecutableVersion* version) {
+    char formatted[32];
+    if (!version || !g_ignoredUpdateVersion[0]) return FALSE;
+    snprintf(formatted, sizeof(formatted), "%u.%u.%u.%u",
+             (unsigned int)version->major,
+             (unsigned int)version->minor,
+             (unsigned int)version->patch,
+             (unsigned int)version->build);
+    return strcmp(formatted, g_ignoredUpdateVersion) == 0;
+}
+
+static void SaveIgnoredUpdateVersion(const char* version) {
+    HKEY key;
+    DWORD disposition;
+    if (!version) return;
+    strncpy(g_ignoredUpdateVersion, version,
+            sizeof(g_ignoredUpdateVersion) - 1);
+    g_ignoredUpdateVersion[sizeof(g_ignoredUpdateVersion) - 1] = '\0';
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &key,
+                        &disposition) == ERROR_SUCCESS) {
+        RegSetValueExA(key, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
+                       (const BYTE*)g_ignoredUpdateVersion,
+                       (DWORD)(strlen(g_ignoredUpdateVersion) + 1));
+        RegCloseKey(key);
+    }
+}
+
+static void PresentPendingUpdateNotice(void) {
+    if (!g_configViewReady || !g_webviewView || !g_updateNoticeTask) return;
+
+    UpdateCheckTask* task = g_updateNoticeTask;
+    g_updateNoticeTask = NULL;
+    LPCWSTR status = NULL;
+    LPCWSTR title = NULL;
+    LPCWSTR message = NULL;
+    wchar_t currentVersion[32] = L"";
+    wchar_t remoteVersion[32] = L"";
+    BOOL installable = FALSE;
+
+    if (task->kind == UPDATE_CHECK_CANCELLED) {
+        status = L"cancelled";
+        title = L"";
+        message = L"";
+    } else if (task->kind == UPDATE_CHECK_ERROR) {
+        status = L"error";
+        title = L"Update failed";
+        message = task->message;
+    } else {
+        FormatExecutableVersion(&task->runningVersion, currentVersion,
+                                sizeof(currentVersion) / sizeof(wchar_t));
+        FormatExecutableVersion(&task->availableVersion, remoteVersion,
+                                sizeof(remoteVersion) / sizeof(wchar_t));
+        if (task->kind == UPDATE_CHECK_NEWER) {
+            status = L"newer";
+            title = L"Update available";
+            message = L"A newer version is ready to install.";
+            installable = TRUE;
+        } else if (task->kind == UPDATE_CHECK_SAME) {
+            status = L"same";
+            title = L"You're up to date";
+            message = L"The remote build matches your current version. "
+                      L"You can force a reinstall if needed.";
+            installable = !task->automatic;
+        } else if (task->kind == UPDATE_CHECK_OLDER) {
+            status = L"older";
+            title = L"No update available";
+            message = L"The remote build is older than your current version.";
+        }
+    }
+
+    if (!status) {
+        DiscardUpdateTask(task);
+        return;
+    }
+    if (installable) {
+        DiscardPreparedUpdate();
+        g_updateReadyTask = task;
+    }
+    CfgSendUpdateResultWithVersions(status, title, message,
+                                    currentVersion, remoteVersion,
+                                    task->automatic);
+    if (!installable) DiscardUpdateTask(task);
+}
+
+static void QueueUpdateNotice(UpdateCheckTask* task) {
+    DiscardPendingUpdateNotice();
+    g_updateNoticeTask = task;
+    PresentPendingUpdateNotice();
+}
+
+static void HandleCompletedUpdateCheck(UpdateCheckTask* task) {
+    if (!task) return;
+    InterlockedExchange(&g_updateProgressPosted, FALSE);
+    InterlockedExchange(&g_updateSpeedKbps, 0);
+
+    if (task->kind == UPDATE_CHECK_CANCELLED) {
+        UpdateDebugPrint(L"[INFO] Update check cancelled\n");
+    } else if (task->kind == UPDATE_CHECK_ERROR) {
+        UpdateDebugPrint(L"[WARNING] Update check failed: %s\n", task->message);
+    }
+
+    if (task->automatic && !g_configAutoCheckForUpdates) {
+        DiscardUpdateTask(task);
+        return;
+    }
+
+    if (task->automatic && task->kind == UPDATE_CHECK_NEWER &&
+        IsIgnoredUpdateVersion(&task->availableVersion)) {
+        UpdateDebugPrint(L"[INFO] Automatic update prompt suppressed for ignored version\n");
+        task->kind = UPDATE_CHECK_CANCELLED;
+        if (IsConfigurationViewOpen()) {
+            QueueUpdateNotice(task);
+        } else {
+            DiscardUpdateTask(task);
+        }
+        return;
+    }
+
+    if (task->automatic && task->kind == UPDATE_CHECK_NEWER) {
+        if (g_webviewHwnd && !IsConfigurationViewOpen()) {
+            SendMessageW(g_webviewHwnd, WM_CLOSE, 0, 0);
+        }
+        QueueUpdateNotice(task);
+        ShowWebViewDialog("config", 560, 520);
+        if (!IsConfigurationViewOpen()) DiscardPendingUpdateNotice();
+        return;
+    }
+
+    if (IsConfigurationViewOpen()) {
+        QueueUpdateNotice(task);
+    } else {
+        DiscardUpdateTask(task);
+    }
+}
+
+static void IgnorePreparedUpdateVersion(const char* requestedVersion) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    char preparedVersion[32];
+    if (!task || !task->automatic || task->kind != UPDATE_CHECK_NEWER ||
+        !requestedVersion) {
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The update version could not be ignored. Check for updates again.");
+        return;
+    }
+    snprintf(preparedVersion, sizeof(preparedVersion), "%u.%u.%u.%u",
+             (unsigned int)task->availableVersion.major,
+             (unsigned int)task->availableVersion.minor,
+             (unsigned int)task->availableVersion.patch,
+             (unsigned int)task->availableVersion.build);
+    if (strcmp(preparedVersion, requestedVersion) != 0) {
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The update version changed. Check for updates again.");
+        return;
+    }
+    SaveIgnoredUpdateVersion(preparedVersion);
+    UpdateDebugPrint(L"[INFO] Automatic update version added to the ignore list\n");
+    DiscardPreparedUpdate();
 }
 
 static void CancelUpdateCheck(void) {
@@ -5286,6 +5499,8 @@ static void webview_push_init_config(void)
         L"\"screenCaptureEnabled\":%s,"
         L"\"captureGapFill\":\"%s\","
         L"\"autoCheckForUpdates\":%s,"
+        L"\"updateCheckPending\":%s,"
+        L"\"updatePromptPending\":%s,"
         L"\"availableIps\":%s,"
         L"\"bindIpAvailable\":%s,"
         L"\"serverStatus\":\"%s\","
@@ -5298,7 +5513,14 @@ static void webview_push_init_config(void)
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
-        g_configAutoCheckForUpdates ? L"true" : L"false", ipsJson,
+        g_configAutoCheckForUpdates ? L"true" : L"false",
+        (InterlockedCompareExchange(&g_updateCheckPending,
+                                    FALSE, FALSE) == TRUE ||
+         InterlockedCompareExchangePointer(
+             (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL)
+            ? L"true" : L"false",
+        g_updateNoticeTask ? L"true" : L"false",
+        ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
         wHttpStatus, APP_VERSION_W, wUpdateCompletedVersion);
     webview_execute_script(script);
@@ -5488,14 +5710,37 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         } else if (strcmp(g_pendingView, "log") == 0) {
             webview_push_init_log();
         }
+    } else if (strcmp(action, "configReady") == 0) {
+        if (IsConfigurationViewOpen()) {
+            int checkAutomatically = 0;
+            BOOL updateWorkAlreadyActive =
+                InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE ||
+                InterlockedCompareExchangePointer(
+                    (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL ||
+                g_updateNoticeTask || g_updateReadyTask;
+            json_get_int(msg, "checkAutomatically", &checkAutomatically);
+            g_configViewReady = TRUE;
+            PresentPendingUpdateNotice();
+            if (checkAutomatically != 0 && g_configAutoCheckForUpdates &&
+                !g_updateConfirmationPending && !updateWorkAlreadyActive) {
+                StartUpdateCheck(TRUE);
+            }
+        }
     } else if (strcmp(action, "checkUpdate") == 0) {
-        StartUpdateCheck();
+        int automatic = 0;
+        json_get_int(msg, "automatic", &automatic);
+        StartUpdateCheck(automatic != 0);
     } else if (strcmp(action, "cancelUpdateCheck") == 0) {
         CancelUpdateCheck();
     } else if (strcmp(action, "installUpdate") == 0) {
         InstallPreparedUpdate();
     } else if (strcmp(action, "dismissUpdate") == 0) {
         DiscardPreparedUpdate();
+    } else if (strcmp(action, "ignoreUpdateVersion") == 0) {
+        char version[32] = {0};
+        json_get_string(msg, "version", version, sizeof(version));
+        IgnorePreparedUpdateVersion(version);
     } else if (strcmp(action, "dismissUpdateConfirmation") == 0) {
         g_updateConfirmationPending = FALSE;
     } else if (strcmp(action, "saveSettings") == 0) {
@@ -5709,61 +5954,9 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_APP_UPDATE_RESULT: {
-            InterlockedExchange(&g_updateProgressPosted, FALSE);
-            InterlockedExchange(&g_updateSpeedKbps, 0);
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL);
-            if (!task) return 0;
-
-            if (task->kind == UPDATE_CHECK_CANCELLED) {
-                UpdateDebugPrint(L"[INFO] Update check cancelled\n");
-                CfgSendUpdateResult(L"cancelled", L"", L"");
-                DiscardUpdateTask(task);
-                return 0;
-            }
-
-            if (task->kind == UPDATE_CHECK_ERROR) {
-                UpdateDebugPrint(L"[WARNING] Update check failed: %s\n", task->message);
-                CfgSendUpdateResult(L"error", L"Update failed", task->message);
-                DiscardUpdateTask(task);
-                return 0;
-            }
-
-            wchar_t currentVersion[32], remoteVersion[32];
-            FormatExecutableVersion(&task->runningVersion, currentVersion,
-                                    sizeof(currentVersion) / sizeof(wchar_t));
-            FormatExecutableVersion(&task->availableVersion, remoteVersion,
-                                    sizeof(remoteVersion) / sizeof(wchar_t));
-
-            LPCWSTR status = NULL;
-            LPCWSTR title = NULL;
-            LPCWSTR message = NULL;
-            if (task->kind == UPDATE_CHECK_NEWER) {
-                status = L"newer";
-                title = L"Update available";
-                message = L"A newer version is ready to install.";
-            } else if (task->kind == UPDATE_CHECK_SAME) {
-                status = L"same";
-                title = L"You're up to date";
-                message = L"The remote build matches your current version. "
-                          L"You can force a reinstall if needed.";
-            } else if (task->kind == UPDATE_CHECK_OLDER) {
-                status = L"older";
-                title = L"No update available";
-                message = L"The remote build is older than your current version.";
-            } else {
-                DiscardUpdateTask(task);
-                return 0;
-            }
-
-            if (task->kind == UPDATE_CHECK_NEWER ||
-                task->kind == UPDATE_CHECK_SAME) {
-                DiscardPreparedUpdate();
-                g_updateReadyTask = task;
-            }
-            CfgSendUpdateResultWithVersions(status, title, message,
-                                            currentVersion, remoteVersion);
-            if (task->kind == UPDATE_CHECK_OLDER) DiscardUpdateTask(task);
+            HandleCompletedUpdateCheck(task);
             return 0;
         }
 
@@ -5813,12 +6006,18 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
-            if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
-            DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
-                (PVOID volatile*)&g_updatePostedResult, NULL));
+            if (InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE &&
+                InterlockedCompareExchange(&g_updateCheckAutomatic,
+                                           FALSE, FALSE) == FALSE &&
+                g_updateCancelEvent) {
+                SetEvent(g_updateCancelEvent);
+            }
+            DiscardPendingUpdateNotice();
             DiscardPreparedUpdate();
             g_webviewHwnd = NULL;
             g_webviewWindowShown = FALSE;
+            g_configViewReady = FALSE;
             KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             if (g_updateInstallReady && g_hWndMain) {
                 PostMessageW(g_hWndMain, WM_COMMAND, ID_TRAY_EXIT, 0);
@@ -5830,6 +6029,8 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 static void ShowWebViewDialog(const char* view, int width, int height) {
     if (g_webviewHwnd != NULL) {
+        if (IsIconic(g_webviewHwnd)) ShowWindow(g_webviewHwnd, SW_RESTORE);
+        else ShowWindow(g_webviewHwnd, SW_SHOW);
         SetForegroundWindow(g_webviewHwnd);
         return;
     }
@@ -5885,6 +6086,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
         return;
     }
     g_webviewWindowShown = FALSE;
+    g_configViewReady = FALSE;
     SetTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK, WEBVIEW_SHOW_FALLBACK_DELAY_MS, NULL);
 
     WCHAR userDataFolder[MAX_PATH];
@@ -5948,6 +6150,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             KillTimer(hWnd, ID_TIMER_HTTP_RECONCILE);
             KillTimer(hWnd, ID_TIMER_CLIPBOARD_RETRY);
             KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
+            KillTimer(hWnd, ID_TIMER_AUTO_UPDATE);
+            if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
+            DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
+                (PVOID volatile*)&g_updatePostedResult, NULL));
+            DiscardPendingUpdateNotice();
+            DiscardPreparedUpdate();
             if (fnRemoveClipboardFormatListener) fnRemoveClipboardFormatListener(hWnd);
             StopHttpServer();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -5985,6 +6193,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SCREEN_CAPTURE_CANCEL:
         CancelScreenCapture(wParam
             ? "display configuration changed" : "requested by user");
+        return 0;
+
+    case WM_APP_UPDATE_PROGRESS:
+        InterlockedExchange(&g_updateProgressPosted, FALSE);
+        if (InterlockedCompareExchange(&g_updateCheckPending,
+                                       FALSE, FALSE) == TRUE &&
+            g_configViewReady) {
+            DWORD speedKbps = (DWORD)InterlockedCompareExchange(
+                &g_updateSpeedKbps, 0, 0);
+            CfgSendUpdateProgress(speedKbps);
+        }
+        return 0;
+
+    case WM_APP_UPDATE_RESULT:
+        {
+            UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
+                (PVOID volatile*)&g_updatePostedResult, NULL);
+            HandleCompletedUpdateCheck(task);
+        }
         return 0;
 
     case WM_DO_PASTE:
@@ -6037,6 +6264,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == ID_TIMER_DEFERRED_PASTE) {
             KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
             PostMessage(hWnd, WM_DO_PASTE, 0, 0);
+            return 0;
+        }
+        if (wParam == ID_TIMER_AUTO_UPDATE) {
+            if (g_configAutoCheckForUpdates) StartUpdateCheck(TRUE);
             return 0;
         }
         break;
@@ -6201,6 +6432,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         LogMessage("Application update completed: %s", APP_VERSION_A);
         ShowWebViewDialog("config", 560, 520);
     }
+
+    SetTimer(g_hWndMain, ID_TIMER_AUTO_UPDATE,
+             AUTO_UPDATE_INTERVAL_MS, NULL);
+    if (g_configAutoCheckForUpdates) StartUpdateCheck(TRUE);
 
     /* Message loop */
     while (GetMessageW(&msg, NULL, 0, 0)) {

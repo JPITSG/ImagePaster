@@ -1,4 +1,4 @@
-# ImagePaster 1.0.10
+# ImagePaster 1.0.11
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -120,6 +120,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
 | Multi-region Gap Fill | `CaptureGapFill` | REG_DWORD | White |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
+| Ignored Update Version | `IgnoredUpdateVersion` | REG_SZ | Empty |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
 
@@ -143,12 +144,15 @@ for Black, and `2` for Heavy blur.
 
 The footer displays the application version as `v<application version>`.
 
-When **Automatically check for updates** is enabled, opening the Configuration
-dialog makes a fresh request for the repository's
-[`release/ImagePaster.exe`](release/ImagePaster.exe). A newer build opens the
-update dialog; matching or older builds and failed automatic checks are
-silently discarded. The **Update** button performs the same check manually and
-displays every result.
+When **Automatically check for updates** is enabled, ImagePaster checks at
+startup, whenever the Configuration dialog opens, and once every 60 minutes
+using a single low-frequency Windows timer. A newer build opens the
+Configuration dialog and its update prompt; matching or older builds and failed
+automatic checks are silently discarded. An automatically opened prompt offers
+**Ignore this version**, which suppresses that version during later automatic
+checks, including after restart. The manual **Update** button still displays
+every result and can install an ignored version. Checks use the repository's
+[`release/ImagePaster.exe`](release/ImagePaster.exe).
 
 The update check downloads the executable to the user's temporary directory
 and compares its embedded Windows file version with the running executable's
