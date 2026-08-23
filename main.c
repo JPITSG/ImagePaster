@@ -182,8 +182,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.13"
-#define APP_VERSION_W     L"1.0.13"
+#define APP_VERSION_A     "1.0.14"
+#define APP_VERSION_W     L"1.0.14"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -2767,10 +2767,12 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     float panelRadius = ScaleCaptureUiFloat(panel->dpi, 14.0f);
     float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 8.0f);
     float hairline = ScaleCaptureUiFloat(panel->dpi, 1.0f);
+    float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.65f);
     GpFont *font;
     GpStringFormat *format;
 
     if (hairline < 1.0f) hairline = 1.0f;
+    if (borderWidth < 0.6f) borderWidth = 0.6f;
     DrawCaptureSoftShadow(graphics, &panel->panelRect, panelRadius,
                           panel->dpi, 7, 1.9f, 3, 9);
     FillCaptureRoundedRectGradient(graphics, &panel->panelRect,
@@ -2778,9 +2780,10 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
                                    CaptureArgb(246, RGB(24, 28, 35)),
                                    panelRadius);
     StrokeCaptureRoundedRect(graphics, &panel->panelRect,
-                             RGB(255, 255, 255), 38, hairline, panelRadius);
+                             RGB(255, 255, 255), 38, borderWidth, panelRadius);
     StrokeCaptureTopHighlight(graphics, &panel->panelRect, panelRadius,
-                              CaptureArgb(56, RGB(255, 255, 255)), hairline);
+                              CaptureArgb(56, RGB(255, 255, 255)),
+                              borderWidth);
 
     /* Divider that sets the destructive Cancel apart from the action tools. */
     {
@@ -2978,8 +2981,8 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
 
     {
         float pillRadius = (float)(labelRect.bottom - labelRect.top) / 2.0f;
-        float hairline = ScaleCaptureUiFloat(dpi, 1.0f);
-        if (hairline < 1.0f) hairline = 1.0f;
+        float hairline = ScaleCaptureUiFloat(dpi, 0.65f);
+        if (hairline < 0.6f) hairline = 0.6f;
         DrawCaptureSoftShadow(graphics, &labelRect, pillRadius, dpi,
                               3, 1.3f, 2, 10);
         FillCaptureRoundedRectGradient(graphics, &labelRect,
