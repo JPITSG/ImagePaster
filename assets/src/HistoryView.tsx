@@ -38,15 +38,25 @@ function HistoryRow({ entry }: { entry: HistoryEntry }) {
         type="button"
         title="Open in default browser"
         onClick={() => openHistoryUrl(entry.token)}
-        className="flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
+        className="relative flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
       >
         {entry.thumb ? (
-          <img
-            src={entry.thumb}
-            alt={`${entry.width} × ${entry.height} preview`}
-            className="max-h-full max-w-full object-contain"
-            draggable={false}
-          />
+          <>
+            {/* Blurred cover copy fills the letterbox area behind the image */}
+            <img
+              src={entry.thumb}
+              alt=""
+              aria-hidden
+              className="absolute inset-0 h-full w-full scale-110 object-cover blur-md brightness-90"
+              draggable={false}
+            />
+            <img
+              src={entry.thumb}
+              alt={`${entry.width} × ${entry.height} preview`}
+              className="relative max-h-full max-w-full object-contain"
+              draggable={false}
+            />
+          </>
         ) : (
           <span className="text-[10px] text-neutral-400">No preview</span>
         )}
