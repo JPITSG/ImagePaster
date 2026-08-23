@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.6"
-#define APP_VERSION_W     L"1.0.6"
+#define APP_VERSION_A     "1.0.7"
+#define APP_VERSION_W     L"1.0.7"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -2419,10 +2419,10 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
     float middle = ScaleCaptureUiFloat(dpi, 4.0f);
     float shortStep = ScaleCaptureUiFloat(dpi, 6.0f);
     float iconHeight = ScaleCaptureUiFloat(dpi, 18.0f);
-    float penWidth = ScaleCaptureUiFloat(dpi, 1.8f);
+    float penWidth = ScaleCaptureUiFloat(dpi, 1.35f);
     GpPen *pen = NULL;
 
-    if (penWidth < 1.4f) penWidth = 1.4f;
+    if (penWidth < 1.0f) penWidth = 1.0f;
     if (GdipCreatePen1(CaptureArgb(255, color), penWidth,
                        CAPTURE_GDIP_UNIT_PIXEL, &pen) != 0 || !pen) {
         return;
@@ -2492,11 +2492,11 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     float shadowOffset = ScaleCaptureUiFloat(panel->dpi, 5.0f);
     float panelRadius = ScaleCaptureUiFloat(panel->dpi, 11.0f);
     float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 7.0f);
-    float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.8f);
+    float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.55f);
     GpFont *font;
     GpStringFormat *format;
 
-    if (borderWidth < 1.0f) borderWidth = 1.0f;
+    if (borderWidth < 0.75f) borderWidth = 0.75f;
     OffsetRect(&shadowRect, 0, (int)(shadowOffset + 0.5f));
     FillCaptureRoundedRect(graphics, &shadowRect, RGB(0, 0, 0), 110,
                            panelRadius);
@@ -2612,16 +2612,16 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
     WCHAR dimensions[64];
     RECT labelRect;
     UINT dpi = GetCaptureSelectionLabelRect(selection, &labelRect);
-    float outlineWidth = ScaleCaptureUiFloat(dpi, 1.4f);
+    float outlineWidth = ScaleCaptureUiFloat(dpi, 1.0f);
     float shadowWidth;
     GpPen *shadowPen = NULL;
     GpPen *outlinePen = NULL;
     GpFont *font;
     GpStringFormat *format;
 
-    if (outlineWidth < 1.25f) outlineWidth = 1.25f;
-    shadowWidth = outlineWidth + ScaleCaptureUiFloat(dpi, 2.0f);
-    if (GdipCreatePen1(CaptureArgb(150, RGB(0, 0, 0)), shadowWidth,
+    if (outlineWidth < 0.85f) outlineWidth = 0.85f;
+    shadowWidth = outlineWidth + ScaleCaptureUiFloat(dpi, 1.0f);
+    if (GdipCreatePen1(CaptureArgb(125, RGB(0, 0, 0)), shadowWidth,
                        CAPTURE_GDIP_UNIT_PIXEL, &shadowPen) == 0 && shadowPen) {
         GdipSetPenStartCap(shadowPen, CAPTURE_GDIP_LINE_CAP_ROUND);
         GdipSetPenEndCap(shadowPen, CAPTURE_GDIP_LINE_CAP_ROUND);
@@ -2646,7 +2646,7 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
     FillCaptureRoundedRect(graphics, &labelRect, RGB(20, 25, 32), 225,
                            ScaleCaptureUiFloat(dpi, 6.0f));
     StrokeCaptureRoundedRect(graphics, &labelRect, RGB(128, 145, 165), 180,
-                             ScaleCaptureUiFloat(dpi, 0.8f),
+                             ScaleCaptureUiFloat(dpi, 0.5f),
                              ScaleCaptureUiFloat(dpi, 6.0f));
     font = CreateCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
     format = CreateCaptureCenteredTextFormat();
@@ -3236,7 +3236,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
                 }
 
-                LogMessage("--- Ctrl+V detected ---");
+                LogMessage("Ctrl+V detected");
 
                 /* Check if a matching window is focused */
                 BOOL matchFound = FALSE;
@@ -3307,12 +3307,14 @@ static void UpdateTooltip(void)
     if (g_configTitleMatch[0] == '\0' || g_keywordCount == 0) {
         wcscpy(g_nid.szTip, L"Image pasting is inactive");
     } else {
-        WCHAR wMatch[128];
-        MultiByteToWideChar(CP_UTF8, 0, g_configTitleMatch, -1, wMatch, 128);
-        /* szTip is 128 wchars max; prefix is ~27 chars, leave room */
-        WCHAR tip[128];
-        swprintf(tip, 128, L"Image pasting active for %s", wMatch);
-        tip[127] = L'\0';
+        WCHAR wMatch[2048] = {0};
+        WCHAR tip[128] = L"Image pasting active for: \"";
+        size_t remaining;
+        MultiByteToWideChar(CP_UTF8, 0, g_configTitleMatch, -1,
+                            wMatch, sizeof(wMatch) / sizeof(wMatch[0]));
+        remaining = (sizeof(tip) / sizeof(tip[0])) - wcslen(tip) - 2;
+        wcsncat(tip, wMatch, remaining);
+        wcscat(tip, L"\"");
         wcscpy(g_nid.szTip, tip);
     }
     g_nid.uFlags = NIF_TIP;
