@@ -8,7 +8,7 @@
  * Features:
  *   - Shared in-memory clipboard image cache with configurable JPEG history
  *   - Configurable base64 or HTTP URL paste mode
- *   - Optional multi-monitor Print Screen capture and selection overlay
+ *   - Optional multi-monitor Print Screen capture with multi-region selection
  *   - Configurable title matching and HTTP bind settings (registry-persisted)
  *   - WebView2-based configuration and activity log modals
  *   - System tray icon with context menu
@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.8"
-#define APP_VERSION_W     L"1.0.8"
+#define APP_VERSION_A     "1.0.9"
+#define APP_VERSION_W     L"1.0.9"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -339,10 +339,11 @@ static int g_captureHoveredTool = -1;
 static int g_capturePressedPanel = -1;
 static int g_capturePressedTool = -1;
 static BOOL g_captureDragging = FALSE;
-static BOOL g_captureHasSelection = FALSE;
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
-static RECT g_captureSelection = {0};
+static RECT *g_captureSelections = NULL;
+static size_t g_captureSelectionCount = 0;
+static size_t g_captureSelectionCapacity = 0;
 static HANDLE g_capturePreviousDpiContext = NULL;
 static BOOL g_printScreenKeyDown = FALSE;
 static BOOL g_escapeKeyDown = FALSE;
@@ -2261,18 +2262,80 @@ static RECT NormalizeCaptureRect(POINT start, POINT end)
     return rect;
 }
 
-static BOOL GetActiveCaptureSelection(RECT *selection)
+static BOOL IsCaptureSelectionValid(const RECT *selection)
 {
-    RECT rect;
-    if (g_captureDragging) {
-        rect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
-    } else if (g_captureHasSelection) {
-        rect = g_captureSelection;
-    } else {
-        return FALSE;
+    return selection &&
+           selection->right - selection->left >= 2 &&
+           selection->bottom - selection->top >= 2;
+}
+
+static BOOL AppendCaptureSelection(const RECT *selection)
+{
+    RECT *resized;
+    size_t newCapacity;
+
+    if (!IsCaptureSelectionValid(selection)) return FALSE;
+    if (g_captureSelectionCount == g_captureSelectionCapacity) {
+        newCapacity = g_captureSelectionCapacity
+            ? g_captureSelectionCapacity * 2 : 8;
+        if (newCapacity < g_captureSelectionCapacity ||
+            newCapacity > (size_t)-1 / sizeof(RECT)) {
+            return FALSE;
+        }
+        resized = (RECT *)realloc(
+            g_captureSelections, newCapacity * sizeof(RECT));
+        if (!resized) return FALSE;
+        g_captureSelections = resized;
+        g_captureSelectionCapacity = newCapacity;
     }
-    if (rect.right - rect.left < 2 || rect.bottom - rect.top < 2) return FALSE;
-    *selection = rect;
+    g_captureSelections[g_captureSelectionCount++] = *selection;
+    return TRUE;
+}
+
+static void ClearCaptureSelections(void)
+{
+    g_captureSelectionCount = 0;
+}
+
+static void ReleaseCaptureSelections(void)
+{
+    free(g_captureSelections);
+    g_captureSelections = NULL;
+    g_captureSelectionCount = 0;
+    g_captureSelectionCapacity = 0;
+}
+
+static size_t GetDisplayedCaptureSelectionCount(void)
+{
+    return g_captureSelectionCount + (g_captureDragging ? 1u : 0u);
+}
+
+static BOOL GetDisplayedCaptureSelection(size_t index, RECT *selection)
+{
+    if (!selection) return FALSE;
+    if (index < g_captureSelectionCount) {
+        *selection = g_captureSelections[index];
+        return TRUE;
+    }
+    if (g_captureDragging && index == g_captureSelectionCount) {
+        *selection = NormalizeCaptureRect(
+            g_captureDragStart, g_captureDragCurrent);
+        return IsCaptureSelectionValid(selection);
+    }
+    return FALSE;
+}
+
+static BOOL GetCaptureSelectionBounds(RECT *bounds)
+{
+    if (!bounds || g_captureSelectionCount == 0) return FALSE;
+    *bounds = g_captureSelections[0];
+    for (size_t index = 1; index < g_captureSelectionCount; index++) {
+        const RECT *selection = &g_captureSelections[index];
+        if (selection->left < bounds->left) bounds->left = selection->left;
+        if (selection->top < bounds->top) bounds->top = selection->top;
+        if (selection->right > bounds->right) bounds->right = selection->right;
+        if (selection->bottom > bounds->bottom) bounds->bottom = selection->bottom;
+    }
     return TRUE;
 }
 
@@ -2733,6 +2796,7 @@ static void PaintScreenCaptureOverlay(HWND hwnd)
     HGDIOBJ oldFrameBitmap = NULL;
     GpGraphics *graphics = NULL;
     RECT selection;
+    size_t displayedSelectionCount = GetDisplayedCaptureSelectionCount();
     int paintWidth = paint.rcPaint.right - paint.rcPaint.left;
     int paintHeight = paint.rcPaint.bottom - paint.rcPaint.top;
 
@@ -2758,11 +2822,13 @@ static void PaintScreenCaptureOverlay(HWND hwnd)
            paintWidth, paintHeight, sourceDc,
            paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
     AlphaFillRect(frameDc, &paint.rcPaint, RGB(0, 0, 0), 102);
-    if (GetActiveCaptureSelection(&selection)) {
-        BitBlt(frameDc, selection.left, selection.top,
-               selection.right - selection.left,
-               selection.bottom - selection.top,
-               sourceDc, selection.left, selection.top, SRCCOPY);
+    for (size_t index = 0; index < displayedSelectionCount; index++) {
+        if (GetDisplayedCaptureSelection(index, &selection)) {
+            BitBlt(frameDc, selection.left, selection.top,
+                   selection.right - selection.left,
+                   selection.bottom - selection.top,
+                   sourceDc, selection.left, selection.top, SRCCOPY);
+        }
     }
 
     if (GdipCreateFromHDC(frameDc, &graphics) == 0 && graphics) {
@@ -2773,8 +2839,10 @@ static void PaintScreenCaptureOverlay(HWND hwnd)
             graphics, CAPTURE_GDIP_PIXEL_OFFSET_HIGH_QUALITY);
         GdipSetTextRenderingHint(
             graphics, CAPTURE_GDIP_TEXT_ANTIALIAS_GRID_FIT);
-        if (GetActiveCaptureSelection(&selection)) {
-            DrawCaptureSelection(graphics, &selection);
+        for (size_t index = 0; index < displayedSelectionCount; index++) {
+            if (GetDisplayedCaptureSelection(index, &selection)) {
+                DrawCaptureSelection(graphics, &selection);
+            }
         }
         for (int panel = 0; panel < g_capturePanelCount; panel++) {
             RECT intersection;
@@ -2855,7 +2923,48 @@ static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
     }
 }
 
-static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect)
+static void InvalidateStoredCaptureSelections(HWND hwnd)
+{
+    for (size_t index = 0; index < g_captureSelectionCount; index++) {
+        RECT dirtyRect = {0};
+        BOOL hasDirty = FALSE;
+        UnionCaptureSelectionDirtyRect(
+            &dirtyRect, &hasDirty, &g_captureSelections[index]);
+        if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+    }
+}
+
+static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
+{
+    RECT oldRect = NormalizeCaptureRect(
+        g_captureDragStart, g_captureDragCurrent);
+    RECT newRect;
+    RECT dirtyRect = {0};
+    BOOL hasDirty = FALSE;
+    BOOL added = FALSE;
+    BOOL valid;
+
+    g_captureDragCurrent = endPoint;
+    newRect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
+    g_captureDragging = FALSE;
+    valid = IsCaptureSelectionValid(&newRect);
+    if (valid) {
+        added = AppendCaptureSelection(&newRect);
+        if (!added) {
+            LogMessage("ERROR: Could not retain another screen capture selection");
+            MessageBeep(MB_ICONWARNING);
+        }
+    }
+
+    if (!EqualRect(&oldRect, &newRect) || (valid && !added)) {
+        UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
+        UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
+        if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+    }
+}
+
+static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect,
+                                         BOOL selectedRegionsOnly)
 {
     int width = sourceRect->right - sourceRect->left;
     int height = sourceRect->bottom - sourceRect->top;
@@ -2895,13 +3004,42 @@ static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect)
     header->biSizeImage = (DWORD)pixelBytes;
     destinationPixels = dibData + sizeof(*header);
 
-    for (int row = 0; row < height; row++) {
-        const DWORD *source = g_captureOriginalPixels +
-            ((size_t)(sourceRect->top + row) * (size_t)g_captureWidth) +
-            (size_t)sourceRect->left;
-        BYTE *destination = destinationPixels +
-            ((size_t)(height - 1 - row) * rowBytes);
-        memcpy(destination, source, rowBytes);
+    if (selectedRegionsOnly) {
+        DWORD *pixels = (DWORD *)destinationPixels;
+        size_t pixelCount = pixelBytes / sizeof(DWORD);
+        for (size_t index = 0; index < pixelCount; index++) {
+            pixels[index] = 0x00ffffffu;
+        }
+    }
+
+    {
+        size_t copyCount = selectedRegionsOnly ? g_captureSelectionCount : 1;
+        for (size_t index = 0; index < copyCount; index++) {
+            RECT copyRect;
+            if (selectedRegionsOnly) {
+                if (!IntersectRect(&copyRect, &g_captureSelections[index],
+                                   sourceRect)) {
+                    continue;
+                }
+            } else {
+                copyRect = *sourceRect;
+            }
+
+            size_t copyBytes =
+                (size_t)(copyRect.right - copyRect.left) * sizeof(DWORD);
+            for (int sourceY = copyRect.top;
+                 sourceY < copyRect.bottom; sourceY++) {
+                const DWORD *source = g_captureOriginalPixels +
+                    ((size_t)sourceY * (size_t)g_captureWidth) +
+                    (size_t)copyRect.left;
+                size_t destinationY =
+                    (size_t)(sourceY - sourceRect->top);
+                BYTE *destination = destinationPixels +
+                    ((size_t)(height - 1) - destinationY) * rowBytes +
+                    (size_t)(copyRect.left - sourceRect->left) * sizeof(DWORD);
+                memcpy(destination, source, copyBytes);
+            }
+        }
     }
     GlobalUnlock(dibMemory);
     return dibMemory;
@@ -2914,6 +3052,7 @@ static void CloseScreenCaptureOverlay(void)
         ShowWindow(overlay, SW_HIDE);
         DestroyWindow(overlay);
     } else {
+        ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
     }
 }
@@ -2921,8 +3060,6 @@ static void CloseScreenCaptureOverlay(void)
 static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                                              WPARAM wParam, LPARAM lParam)
 {
-    (void)wParam;
-    (void)lParam;
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -2943,20 +3080,15 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 InvalidateCapturePanel(hwnd, panelIndex);
             } else if (!IsPointInCapturePanel(point) &&
                        g_captureSelectedTool == CAPTURE_TOOL_CLIP) {
-                RECT oldSelection = g_captureSelection;
-                BOOL hadSelection = g_captureHasSelection;
-                g_captureHasSelection = FALSE;
+                BOOL additive = (wParam & MK_SHIFT) != 0;
+                if (!additive) {
+                    InvalidateStoredCaptureSelections(hwnd);
+                    ClearCaptureSelections();
+                }
                 g_captureDragging = TRUE;
                 g_captureDragStart = point;
                 g_captureDragCurrent = point;
                 SetCapture(hwnd);
-                if (hadSelection) {
-                    RECT dirtyRect = {0};
-                    BOOL hasDirty = FALSE;
-                    UnionCaptureSelectionDirtyRect(
-                        &dirtyRect, &hasDirty, &oldSelection);
-                    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
-                }
             }
         }
         return 0;
@@ -3005,17 +3137,9 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             InvalidateCapturePanel(hwnd, pressedPanel);
             if (releasePanel == pressedPanel && releaseTool == pressedTool) {
                 if (pressedTool == CAPTURE_TOOL_CLIP) {
-                    RECT oldSelection = g_captureSelection;
-                    BOOL hadSelection = g_captureHasSelection;
                     g_captureSelectedTool = CAPTURE_TOOL_CLIP;
-                    g_captureHasSelection = FALSE;
-                    if (hadSelection) {
-                        RECT dirtyRect = {0};
-                        BOOL hasDirty = FALSE;
-                        UnionCaptureSelectionDirtyRect(
-                            &dirtyRect, &hasDirty, &oldSelection);
-                        if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
-                    }
+                    InvalidateStoredCaptureSelections(hwnd);
+                    ClearCaptureSelections();
                 } else if (pressedTool == CAPTURE_TOOL_COPY) {
                     PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, FALSE, 0);
                 } else if (pressedTool == CAPTURE_TOOL_CANCEL) {
@@ -3025,25 +3149,9 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             return 0;
         }
         if (g_captureDragging) {
-            RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
-                                                g_captureDragCurrent);
-            RECT dirtyRect = {0};
-            BOOL hasDirty = FALSE;
-            g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
-            g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
-                                                      g_captureDragCurrent);
-            g_captureHasSelection =
-                g_captureSelection.right - g_captureSelection.left >= 2 &&
-                g_captureSelection.bottom - g_captureSelection.top >= 2;
-            g_captureDragging = FALSE;
+            POINT point = GetCaptureCursorPoint(hwnd);
+            FinishCaptureSelectionDrag(hwnd, point);
             if (GetCapture() == hwnd) ReleaseCapture();
-            if (!EqualRect(&oldRect, &g_captureSelection)) {
-                UnionCaptureSelectionDirtyRect(
-                    &dirtyRect, &hasDirty, &oldRect);
-                UnionCaptureSelectionDirtyRect(
-                    &dirtyRect, &hasDirty, &g_captureSelection);
-                if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
-            }
         }
         return 0;
 
@@ -3055,24 +3163,8 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             InvalidateCapturePanel(hwnd, oldPanel);
         }
         if (g_captureDragging) {
-            RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
-                                                g_captureDragCurrent);
-            RECT dirtyRect = {0};
-            BOOL hasDirty = FALSE;
-            g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
-            g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
-                                                      g_captureDragCurrent);
-            g_captureHasSelection =
-                g_captureSelection.right - g_captureSelection.left >= 2 &&
-                g_captureSelection.bottom - g_captureSelection.top >= 2;
-            g_captureDragging = FALSE;
-            if (!EqualRect(&oldRect, &g_captureSelection)) {
-                UnionCaptureSelectionDirtyRect(
-                    &dirtyRect, &hasDirty, &oldRect);
-                UnionCaptureSelectionDirtyRect(
-                    &dirtyRect, &hasDirty, &g_captureSelection);
-                if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
-            }
+            POINT point = GetCaptureCursorPoint(hwnd);
+            FinishCaptureSelectionDrag(hwnd, point);
         }
         return 0;
 
@@ -3105,14 +3197,14 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         return 0;
 
     case WM_DESTROY:
-        if (GetCapture() == hwnd) ReleaseCapture();
-        if (g_captureOverlayHwnd == hwnd) g_captureOverlayHwnd = NULL;
         g_captureDragging = FALSE;
-        g_captureHasSelection = FALSE;
-        g_captureHoveredPanel = -1;
-        g_captureHoveredTool = -1;
         g_capturePressedPanel = -1;
         g_capturePressedTool = -1;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (g_captureOverlayHwnd == hwnd) g_captureOverlayHwnd = NULL;
+        g_captureHoveredPanel = -1;
+        g_captureHoveredTool = -1;
+        ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
         return 0;
     }
@@ -3160,7 +3252,7 @@ static BOOL BeginScreenCapture(void)
     g_capturePressedPanel = -1;
     g_capturePressedTool = -1;
     g_captureDragging = FALSE;
-    g_captureHasSelection = FALSE;
+    ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         L"ImagePasterCaptureOverlay", L"ImagePaster Screen Capture",
@@ -3196,16 +3288,18 @@ static BOOL CompleteScreenCapture(BOOL forceFullDesktop)
     int width;
     int height;
     BOOL usedSelection = FALSE;
+    size_t selectionCount = 0;
 
     if (!g_captureOverlayHwnd || !g_captureOriginalPixels) return FALSE;
-    if (!forceFullDesktop && GetActiveCaptureSelection(&sourceRect)) {
+    if (!forceFullDesktop && GetCaptureSelectionBounds(&sourceRect)) {
         usedSelection = TRUE;
+        selectionCount = g_captureSelectionCount;
     } else {
         SetRect(&sourceRect, 0, 0, g_captureWidth, g_captureHeight);
     }
     width = sourceRect.right - sourceRect.left;
     height = sourceRect.bottom - sourceRect.top;
-    dibMemory = CreateCaptureClipboardDib(&sourceRect);
+    dibMemory = CreateCaptureClipboardDib(&sourceRect, usedSelection);
     if (!dibMemory) {
         LogMessage("ERROR: Could not allocate the screen capture clipboard image");
         MessageBeep(MB_ICONWARNING);
@@ -3231,8 +3325,14 @@ static BOOL CompleteScreenCapture(BOOL forceFullDesktop)
     CloseClipboard();
 
     CloseScreenCaptureOverlay();
-    LogMessage("Screen capture copied: %dx%d (%s)", width, height,
-               usedSelection ? "selection" : "full desktop");
+    if (usedSelection) {
+        LogMessage("Screen capture copied: %dx%d (%llu selection%s)",
+                   width, height, (unsigned long long)selectionCount,
+                   selectionCount == 1 ? "" : "s");
+    } else {
+        LogMessage("Screen capture copied: %dx%d (full desktop)",
+                   width, height);
+    }
     g_lastClipboardSequence = 0;
     RefreshClipboardImageCache();
     return TRUE;

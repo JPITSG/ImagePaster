@@ -1,4 +1,4 @@
-# ImagePaster 1.0.8
+# ImagePaster 1.0.9
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -20,6 +20,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Optional, application-neutral compatibility paste mode using Shift+Insert
 - Optional interactive Print Screen capture across the full multi-monitor desktop
 - Dimmed capture overlay with cross-monitor selection and a glass-style toolbar on every display
+- Shift-additive multi-region capture with pixel-accurate spacing and white gaps
 - Double-buffered, anti-aliased capture rendering for smooth selection feedback
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
@@ -63,9 +64,14 @@ the normal Print Screen action with a multi-monitor capture workflow:
    every monitor.
 2. The Clip tool is selected initially. Drag anywhere across the virtual desktop,
    including across monitor boundaries, to reveal a bright selection with a
-   dashed outline and live dimensions.
-3. Copy places the selection on the Windows clipboard. If no selection exists,
-   it copies the complete virtual desktop. The overlay then closes and the image
+   dashed outline and live dimensions. Hold `Shift` while dragging additional
+   regions to retain the existing selections; dragging without `Shift` starts a
+   new selection set.
+3. Copy places the selection on the Windows clipboard. If multiple regions are
+   selected, their leftmost, topmost, rightmost, and bottommost edges define the
+   output bounds. Selected pixels keep their exact relative positions and all
+   unselected space inside those bounds is white. If no selection exists, Copy
+   captures the complete virtual desktop. The overlay then closes and the image
    enters the normal ImagePaster cache and history pipeline.
 4. Pressing `Print Screen` again while the overlay is open immediately copies the
    complete virtual desktop. Pressing `Esc` or choosing Cancel closes the overlay

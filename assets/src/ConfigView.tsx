@@ -281,8 +281,8 @@ export default function ConfigView({
             Enable interactive Print Screen capture
           </Label>
           <p className="text-[11px] leading-snug text-neutral-500">
-            Opens a multi-monitor selection overlay. Print Screen again copies
-            the full desktop; Esc cancels.
+            Opens a multi-monitor selection overlay. Shift-drag adds regions;
+            Print Screen again copies the full desktop; Esc cancels.
           </p>
         </div>
       </div>
