@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.27"
-#define APP_VERSION_W     L"1.0.27"
+#define APP_VERSION_A     "1.0.28"
+#define APP_VERSION_W     L"1.0.28"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -3189,6 +3189,24 @@ static GpStringFormat *GetCaptureTextFormat(void)
     return g_captureTextFormatCache;
 }
 
+/* Screen-DC graphics used to measure label text outside WM_PAINT, so
+   layout decisions (and hit-testing) can depend on the rendered width. */
+static GpGraphics *g_captureMeasureGraphics = NULL;
+static HDC g_captureMeasureDc = NULL;
+
+static GpGraphics *GetCaptureMeasureGraphics(void)
+{
+    if (!g_captureMeasureGraphics) {
+        g_captureMeasureDc = GetDC(NULL);
+        if (g_captureMeasureDc &&
+            GdipCreateFromHDC(g_captureMeasureDc,
+                              &g_captureMeasureGraphics) != 0) {
+            g_captureMeasureGraphics = NULL;
+        }
+    }
+    return g_captureMeasureGraphics;
+}
+
 static void ReleaseCaptureDrawingCache(void)
 {
     for (int i = 0; i < g_captureFontCacheCount; i++) {
@@ -3198,6 +3216,14 @@ static void ReleaseCaptureDrawingCache(void)
     if (g_captureTextFormatCache) {
         GdipDeleteStringFormat(g_captureTextFormatCache);
         g_captureTextFormatCache = NULL;
+    }
+    if (g_captureMeasureGraphics) {
+        GdipDeleteGraphics(g_captureMeasureGraphics);
+        g_captureMeasureGraphics = NULL;
+    }
+    if (g_captureMeasureDc) {
+        ReleaseDC(NULL, g_captureMeasureDc);
+        g_captureMeasureDc = NULL;
     }
 }
 
@@ -3444,6 +3470,14 @@ static UINT GetCaptureDpiAtPoint(POINT point)
     return g_capturePanelCount > 0 ? g_capturePanels[0].dpi : 96;
 }
 
+static void FormatCaptureDimensions(const RECT *selection, WCHAR *buffer,
+                                    size_t bufferChars)
+{
+    swprintf(buffer, bufferChars, L"%d × %d",
+             selection->right - selection->left,
+             selection->bottom - selection->top);
+}
+
 static UINT GetCaptureSelectionLabelRect(const RECT *selection,
                                          RECT *labelRect)
 {
@@ -3453,6 +3487,31 @@ static UINT GetCaptureSelectionLabelRect(const RECT *selection,
     int labelHeight = ScaleCaptureUiValue(dpi, 26);
     int gap = ScaleCaptureUiValue(dpi, 8);
     BOOL inside = selection->top < labelHeight + gap * 2;
+
+    /* The pill hugs its text; measured here (not at paint time) so the
+       remove pill's floor position and hit-testing stay in sync with the
+       rendered width. Falls back to the maximum width if measuring fails. */
+    {
+        GpGraphics *measure = GetCaptureMeasureGraphics();
+        GpFont *font = GetCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
+        GpStringFormat *format = GetCaptureTextFormat();
+        WCHAR dimensions[64];
+        CaptureGpRectF layout = {0.0f, 0.0f, 512.0f, 64.0f};
+        CaptureGpRectF bounds = {0.0f, 0.0f, 0.0f, 0.0f};
+        int fitted = 0;
+        int lines = 0;
+        FormatCaptureDimensions(selection, dimensions, 64);
+        if (measure && font && format &&
+            GdipMeasureString(measure, dimensions, -1, font, &layout,
+                              format, &bounds, &fitted, &lines) == 0 &&
+            bounds.Width > 0.0f) {
+            int snugWidth = (int)(bounds.Width + 0.5f) +
+                            ScaleCaptureUiValue(dpi, 22);
+            int minimumWidth = ScaleCaptureUiValue(dpi, 54);
+            if (snugWidth < minimumWidth) snugWidth = minimumWidth;
+            if (snugWidth < labelWidth) labelWidth = snugWidth;
+        }
+    }
 
     /* Inside the box (near the top of the desktop) the pill keeps the same
        margin on the left as on the top; above the box it aligns flush with
@@ -3484,12 +3543,19 @@ static UINT GetCaptureSelectionRemoveRect(const RECT *selection,
     int diameter = ScaleCaptureUiValue(dpi, 26);
     int gap = ScaleCaptureUiValue(dpi, 8);
     BOOL inside = selection->top < diameter + gap * 2;
+    RECT labelRect;
 
     pillRect->right = inside ? selection->right - gap : selection->right;
     pillRect->top = inside ? selection->top + gap
                            : selection->top - diameter - gap;
     pillRect->left = pillRect->right - diameter;
     pillRect->bottom = pillRect->top + diameter;
+    /* A narrow box must not push the pill over the dimension label; the
+       worst case is [w × h][gap][✕] using the standard pill gap. */
+    GetCaptureSelectionLabelRect(selection, &labelRect);
+    if (pillRect->left < labelRect.right + gap) {
+        OffsetRect(pillRect, labelRect.right + gap - pillRect->left, 0);
+    }
     if (pillRect->right > g_captureWidth) {
         OffsetRect(pillRect, g_captureWidth - pillRect->right, 0);
     }
@@ -3553,31 +3619,12 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection,
         GdipDeletePen(outlinePen);
     }
 
-    swprintf(dimensions, sizeof(dimensions) / sizeof(dimensions[0]),
-             L"%d × %d", selection->right - selection->left,
-             selection->bottom - selection->top);
+    /* labelRect is already snug: GetCaptureSelectionLabelRect measures the
+       text so geometry and hit-testing agree with what is rendered. */
+    FormatCaptureDimensions(selection, dimensions,
+                            sizeof(dimensions) / sizeof(dimensions[0]));
     font = GetCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
     format = GetCaptureTextFormat();
-
-    /* Shrink the pill to hug the text; the rect from
-       GetCaptureSelectionLabelRect stays the invalidation superset. */
-    if (font && format) {
-        CaptureGpRectF layout = {0.0f, 0.0f, 512.0f, 64.0f};
-        CaptureGpRectF bounds = {0.0f, 0.0f, 0.0f, 0.0f};
-        int fitted = 0;
-        int lines = 0;
-        if (GdipMeasureString(graphics, dimensions, -1, font, &layout,
-                              format, &bounds, &fitted, &lines) == 0 &&
-            bounds.Width > 0.0f) {
-            int snugWidth = (int)(bounds.Width + 0.5f) +
-                            ScaleCaptureUiValue(dpi, 22);
-            int minimumWidth = ScaleCaptureUiValue(dpi, 54);
-            if (snugWidth < minimumWidth) snugWidth = minimumWidth;
-            if (snugWidth < labelRect.right - labelRect.left) {
-                labelRect.right = labelRect.left + snugWidth;
-            }
-        }
-    }
 
     {
         float pillRadius = (float)(labelRect.bottom - labelRect.top) / 2.0f;
