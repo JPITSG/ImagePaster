@@ -2,11 +2,13 @@
  * ImagePaster - main.c
  *
  * System tray utility that intercepts Ctrl+V when a matching window is focused
- * and the clipboard contains an image. Converts the image to a raw base64-encoded
- * PNG string and pastes that instead.
+ * and the clipboard contains an image. It can paste either a raw base64-encoded
+ * PNG string or a short URL served by the built-in HTTP image server.
  *
  * Features:
- *   - Configurable title matching (comma-separated keywords, registry-persisted)
+ *   - Shared in-memory clipboard image cache (PNG/base64 and configurable JPEG)
+ *   - Configurable base64 or HTTP URL paste mode
+ *   - Configurable title matching and HTTP bind settings (registry-persisted)
  *   - WebView2-based configuration and activity log modals
  *   - System tray icon with context menu
  *   - In-memory log ring buffer pushed live to the Activity Log view
@@ -20,7 +22,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <wincrypt.h>
 #include <commctrl.h>
 #include <objbase.h>
 #include <shellapi.h>
@@ -60,6 +66,18 @@ typedef struct {
     const BYTE *SigPattern;
     const BYTE *SigMask;
 } ImageCodecInfo;
+
+typedef struct {
+    GUID Guid;
+    ULONG NumberOfValues;
+    ULONG Type;
+    VOID *Value;
+} EncoderParameter;
+
+typedef struct {
+    UINT Count;
+    EncoderParameter Parameter[1];
+} EncoderParameters;
 #pragma pack(pop)
 
 /* GDI+ flat API imports */
@@ -76,20 +94,41 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
+#define APP_VERSION_A     "1.0.0"
+#define APP_VERSION_W     L"1.0.0"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
+#define WM_HTTP_EVENT      (WM_APP + 2)
 #define ID_TRAY_LOG       1001
 #define ID_TRAY_CONFIGURE 1002
 #define ID_TRAY_EXIT      1003
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
+#define ID_TIMER_HTTP_RECONCILE         1007
+#define ID_TIMER_CLIPBOARD_RETRY        1008
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
+#define HTTP_RECONCILE_INTERVAL_MS      3000
+#define CLIPBOARD_RETRY_DELAY_MS        150
 
 #define REG_KEY_PATH       "SOFTWARE\\JPIT\\ImagePaster"
 #define REG_VALUE_TITLE    "TitleMatch"
+#define REG_VALUE_METHOD   "PasteMethod"
+#define REG_VALUE_BIND_IP  "BindIp"
+#define REG_VALUE_PORT     "HttpPort"
+#define REG_VALUE_QUALITY  "JpegQuality"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
+#define MAX_DETECTED_IPS    64
+#define IMAGE_TOKEN_BYTES   32
+#define IMAGE_TOKEN_HEX_LEN (IMAGE_TOKEN_BYTES * 2)
+#define DEFAULT_HTTP_PORT   10444
+#define DEFAULT_JPEG_QUALITY 80
+#define PASTE_METHOD_BASE64 0
+#define PASTE_METHOD_HTTP   1
+#define HTTP_EVENT_SERVED   200
+#define HTTP_EVENT_GONE     410
+#define HTTP_EVENT_NOT_FOUND 404
 
 /* ── Log ring buffer ───────────────────────────────────────────────────── */
 
@@ -114,11 +153,50 @@ static NOTIFYICONDATAW g_nid;
 static HMENU     g_hMenu;
 
 static volatile BOOL g_bSkipNextPaste = FALSE;
+static BOOL g_writingClipboardText = FALSE;
+static DWORD g_ownClipboardSequence = 0;
+static DWORD g_lastClipboardSequence = 0;
+typedef BOOL (WINAPI *PFN_AddClipboardFormatListener)(HWND);
+typedef BOOL (WINAPI *PFN_RemoveClipboardFormatListener)(HWND);
+static PFN_AddClipboardFormatListener fnAddClipboardFormatListener = NULL;
+static PFN_RemoveClipboardFormatListener fnRemoveClipboardFormatListener = NULL;
 
-/* Title-match configuration */
+/* Persisted configuration */
 static char g_configTitleMatch[2048] = "xshell";
+static int  g_configPasteMethod = PASTE_METHOD_BASE64;
+static char g_configBindIp[INET_ADDRSTRLEN] = "127.0.0.1";
+static int  g_configHttpPort = DEFAULT_HTTP_PORT;
+static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
 static int   g_keywordCount = 0;
+
+/* Clipboard image cache shared with the HTTP worker thread. */
+typedef struct {
+    BYTE *jpegData;
+    DWORD jpegSize;
+    char *base64Data;
+    DWORD base64Len;
+    char token[IMAGE_TOKEN_HEX_LEN + 1];
+    UINT width;
+    UINT height;
+} CachedImage;
+
+static CachedImage g_cachedImage = {0};
+static SRWLOCK g_imageLock = SRWLOCK_INIT;
+static char (*g_goneTokens)[IMAGE_TOKEN_HEX_LEN + 1] = NULL;
+static size_t g_goneTokenCount = 0;
+static size_t g_goneTokenCapacity = 0;
+
+/* HTTP listener state. */
+static BOOL g_winsockReady = FALSE;
+static SOCKET g_httpListenSocket = INVALID_SOCKET;
+static SOCKET g_httpClientSocket = INVALID_SOCKET;
+static HANDLE g_httpThread = NULL;
+static volatile LONG g_httpStopRequested = 0;
+static CRITICAL_SECTION g_httpSocketLock;
+static BOOL g_httpSocketLockReady = FALSE;
+static char g_httpStatus[256] = "Not started";
+static int g_httpState = 0; /* 0 stopped, 1 listening, 2 waiting, 3 error */
 
 /* ── WebView2 COM interface definitions (minimal vtable approach) ─────── */
 
@@ -346,6 +424,10 @@ static void ParseKeywords(void);
 static BOOL LoadConfigFromRegistry(void);
 static void SaveConfigToRegistry(void);
 static void ShowWebViewDialog(const char* view, int width, int height);
+static void ReconcileHttpServer(void);
+static void StopHttpServer(void);
+static BOOL RefreshClipboardImageCache(void);
+static void ClearCachedImage(const char *reason);
 
 /* ── Base64 encoder ─────────────────────────────────────────────────────── */
 
@@ -391,8 +473,9 @@ static void LogMessage(const char *fmt, ...)
 
     va_list args;
     va_start(args, fmt);
-    wvsprintfA(buf, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    buf[sizeof(buf) - 1] = '\0';
 
     GetLocalTime(&st);
 
@@ -435,23 +518,26 @@ static void LogMessage(const char *fmt, ...)
     }
 }
 
-/* ── PNG encoder CLSID lookup ───────────────────────────────────────────── */
+/* ── Clipboard image encoding and shared cache ─────────────────────────── */
 
-static BOOL GetPngEncoderClsid(CLSID *pClsid)
+static const GUID g_encoderQualityGuid =
+    {0x1d5be4b5, 0xfa4a, 0x452d, {0x9c, 0xdd, 0x5d, 0xb3, 0x51, 0x05, 0xe7, 0xeb}};
+
+static BOOL GetEncoderClsid(const WCHAR *mimeType, CLSID *pClsid)
 {
     UINT num = 0, size = 0;
     ImageCodecInfo *codecs = NULL;
 
-    GdipGetImageEncodersSize(&num, &size);
-    if (size == 0) return FALSE;
-
+    if (GdipGetImageEncodersSize(&num, &size) != 0 || size == 0) return FALSE;
     codecs = (ImageCodecInfo *)malloc(size);
     if (!codecs) return FALSE;
-
-    GdipGetImageEncoders(num, size, codecs);
+    if (GdipGetImageEncoders(num, size, codecs) != 0) {
+        free(codecs);
+        return FALSE;
+    }
 
     for (UINT i = 0; i < num; i++) {
-        if (codecs[i].MimeType && wcscmp(codecs[i].MimeType, L"image/png") == 0) {
+        if (codecs[i].MimeType && wcscmp(codecs[i].MimeType, mimeType) == 0) {
             *pClsid = codecs[i].Clsid;
             free(codecs);
             return TRUE;
@@ -462,167 +548,684 @@ static BOOL GetPngEncoderClsid(CLSID *pClsid)
     return FALSE;
 }
 
-/* ── Image-to-Base64 pipeline ───────────────────────────────────────────── */
-
-static BOOL ConvertClipboardImageToBase64(void)
+static BOOL EncodeImageToMemory(GpImage *image, const WCHAR *mimeType, int quality,
+                                BYTE **outData, DWORD *outSize)
 {
+    CLSID encoderClsid;
+    IStream *stream = NULL;
+    EncoderParameters params;
+    EncoderParameters *paramsPtr = NULL;
+    ULONG qualityValue = (ULONG)quality;
+    STATSTG stat;
+    LARGE_INTEGER zero;
+    ULONG bytesRead = 0;
+    BYTE *data = NULL;
+
+    *outData = NULL;
+    *outSize = 0;
+
+    if (!GetEncoderClsid(mimeType, &encoderClsid)) return FALSE;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) return FALSE;
+
+    if (wcscmp(mimeType, L"image/jpeg") == 0) {
+        ZeroMemory(&params, sizeof(params));
+        params.Count = 1;
+        params.Parameter[0].Guid = g_encoderQualityGuid;
+        params.Parameter[0].NumberOfValues = 1;
+        params.Parameter[0].Type = 4; /* EncoderParameterValueTypeLong */
+        params.Parameter[0].Value = &qualityValue;
+        paramsPtr = &params;
+    }
+
+    if (GdipSaveImageToStream(image, stream, &encoderClsid, paramsPtr) != 0) {
+        IStream_Release(stream);
+        return FALSE;
+    }
+
+    ZeroMemory(&stat, sizeof(stat));
+    if (IStream_Stat(stream, &stat, STATFLAG_NONAME) != S_OK ||
+        stat.cbSize.QuadPart == 0 || stat.cbSize.QuadPart > 0xffffffffULL) {
+        IStream_Release(stream);
+        return FALSE;
+    }
+
+    data = (BYTE *)malloc((size_t)stat.cbSize.QuadPart);
+    if (!data) {
+        IStream_Release(stream);
+        return FALSE;
+    }
+
+    zero.QuadPart = 0;
+    if (IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL) != S_OK ||
+        IStream_Read(stream, data, (ULONG)stat.cbSize.QuadPart, &bytesRead) != S_OK ||
+        bytesRead != (ULONG)stat.cbSize.QuadPart) {
+        free(data);
+        IStream_Release(stream);
+        return FALSE;
+    }
+
+    IStream_Release(stream);
+    *outData = data;
+    *outSize = bytesRead;
+    return TRUE;
+}
+
+static BOOL GenerateImageToken(char token[IMAGE_TOKEN_HEX_LEN + 1])
+{
+    BYTE randomBytes[IMAGE_TOKEN_BYTES];
+    HCRYPTPROV provider = 0;
+    BOOL randomOk = FALSE;
+    static const char hex[] = "0123456789abcdef";
+
+    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_FULL,
+                             CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+        randomOk = CryptGenRandom(provider, sizeof(randomBytes), randomBytes);
+        CryptReleaseContext(provider, 0);
+    }
+
+    if (!randomOk) {
+        GUID ids[2];
+        if (CoCreateGuid(&ids[0]) != S_OK || CoCreateGuid(&ids[1]) != S_OK) {
+            return FALSE;
+        }
+        memcpy(randomBytes, ids, sizeof(randomBytes));
+    }
+
+    for (int i = 0; i < IMAGE_TOKEN_BYTES; i++) {
+        token[i * 2] = hex[randomBytes[i] >> 4];
+        token[i * 2 + 1] = hex[randomBytes[i] & 0x0f];
+    }
+    token[IMAGE_TOKEN_HEX_LEN] = '\0';
+    return TRUE;
+}
+
+/* Caller must hold g_imageLock exclusively. */
+static void RememberGoneTokenLocked(const char *token)
+{
+    if (!token || !token[0]) return;
+    if (g_goneTokenCount == g_goneTokenCapacity) {
+        size_t newCapacity = g_goneTokenCapacity ? g_goneTokenCapacity * 2 : 64;
+        void *expanded = realloc(g_goneTokens,
+                                 newCapacity * sizeof(*g_goneTokens));
+        if (!expanded) return;
+        g_goneTokens = expanded;
+        g_goneTokenCapacity = newCapacity;
+    }
+    strncpy(g_goneTokens[g_goneTokenCount], token, IMAGE_TOKEN_HEX_LEN + 1);
+    g_goneTokenCount++;
+}
+
+static void ReplaceCachedImage(BYTE *jpegData, DWORD jpegSize,
+                               char *base64Data, DWORD base64Len,
+                               const char *token, UINT width, UINT height)
+{
+    AcquireSRWLockExclusive(&g_imageLock);
+    RememberGoneTokenLocked(g_cachedImage.token);
+    free(g_cachedImage.jpegData);
+    free(g_cachedImage.base64Data);
+    ZeroMemory(&g_cachedImage, sizeof(g_cachedImage));
+    g_cachedImage.jpegData = jpegData;
+    g_cachedImage.jpegSize = jpegSize;
+    g_cachedImage.base64Data = base64Data;
+    g_cachedImage.base64Len = base64Len;
+    strncpy(g_cachedImage.token, token, sizeof(g_cachedImage.token) - 1);
+    g_cachedImage.width = width;
+    g_cachedImage.height = height;
+    ReleaseSRWLockExclusive(&g_imageLock);
+}
+
+static void ClearCachedImage(const char *reason)
+{
+    BOOL hadImage;
+
+    AcquireSRWLockExclusive(&g_imageLock);
+    hadImage = g_cachedImage.token[0] != '\0';
+    RememberGoneTokenLocked(g_cachedImage.token);
+    free(g_cachedImage.jpegData);
+    free(g_cachedImage.base64Data);
+    ZeroMemory(&g_cachedImage, sizeof(g_cachedImage));
+    ReleaseSRWLockExclusive(&g_imageLock);
+
+    if (hadImage) LogMessage("Clipboard image cache cleared: %s", reason);
+}
+
+static BOOL HasCachedImage(void)
+{
+    BOOL available;
+    AcquireSRWLockShared(&g_imageLock);
+    available = g_cachedImage.token[0] != '\0' &&
+                g_cachedImage.jpegData != NULL && g_cachedImage.base64Data != NULL;
+    ReleaseSRWLockShared(&g_imageLock);
+    return available;
+}
+
+static BOOL RefreshClipboardImageCache(void)
+{
+    DWORD sequence = GetClipboardSequenceNumber();
     HANDLE hDib = NULL;
     BITMAPINFOHEADER *pBih = NULL;
     BYTE *pBits = NULL;
-    GpBitmap *pBitmap = NULL;
-    IStream *pStream = NULL;
-    CLSID pngClsid;
-    BYTE *pPngData = NULL;
+    GpBitmap *bitmap = NULL;
+    BYTE *pngData = NULL;
+    BYTE *jpegData = NULL;
     DWORD pngSize = 0;
-    char *base64 = NULL;
+    DWORD jpegSize = 0;
+    char *base64Data = NULL;
     DWORD base64Len = 0;
-    HGLOBAL hClipMem = NULL;
+    char token[IMAGE_TOKEN_HEX_LEN + 1];
+    UINT width = 0, height = 0;
     BOOL success = FALSE;
-    UINT imgW = 0, imgH = 0;
 
-    /* Step 1: Get DIB from clipboard */
+    if (!IsClipboardFormatAvailable(CF_DIB)) {
+        g_lastClipboardSequence = sequence;
+        KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
+        ClearCachedImage("clipboard now contains non-image data");
+        return TRUE;
+    }
+
     if (!OpenClipboard(g_hWndMain)) {
-        LogMessage("ERROR: OpenClipboard failed (%lu)", GetLastError());
+        LogMessage("Clipboard image is temporarily unavailable; retrying");
+        SetTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY, CLIPBOARD_RETRY_DELAY_MS, NULL);
         return FALSE;
     }
 
     hDib = GetClipboardData(CF_DIB);
-    if (!hDib) {
-        LogMessage("ERROR: GetClipboardData(CF_DIB) returned NULL");
-        CloseClipboard();
-        return FALSE;
-    }
-
+    if (!hDib || GlobalSize(hDib) < sizeof(BITMAPINFOHEADER)) goto cleanup_clipboard;
     pBih = (BITMAPINFOHEADER *)GlobalLock(hDib);
-    if (!pBih) {
-        LogMessage("ERROR: GlobalLock on DIB failed");
-        CloseClipboard();
-        return FALSE;
-    }
+    if (!pBih || pBih->biSize < sizeof(BITMAPINFOHEADER)) goto cleanup_clipboard;
 
-    /* Calculate pointer to pixel data */
     {
-        DWORD colorTableSize = 0;
+        SIZE_T dibSize = GlobalSize(hDib);
+        SIZE_T colorTableSize = 0;
+        SIZE_T pixelOffset;
         if (pBih->biBitCount <= 8) {
-            DWORD numColors = pBih->biClrUsed ? pBih->biClrUsed : (1u << pBih->biBitCount);
-            colorTableSize = numColors * sizeof(RGBQUAD);
-        } else if (pBih->biCompression == BI_BITFIELDS) {
+            DWORD colorCount = pBih->biClrUsed ? pBih->biClrUsed : (1u << pBih->biBitCount);
+            colorTableSize = (SIZE_T)colorCount * sizeof(RGBQUAD);
+        } else if (pBih->biSize == sizeof(BITMAPINFOHEADER) &&
+                   pBih->biCompression == BI_BITFIELDS) {
             colorTableSize = 3 * sizeof(DWORD);
         }
-        pBits = (BYTE *)pBih + pBih->biSize + colorTableSize;
+        pixelOffset = (SIZE_T)pBih->biSize + colorTableSize;
+        if (pixelOffset >= dibSize) goto cleanup_clipboard;
+        pBits = (BYTE *)pBih + pixelOffset;
     }
 
-    LogMessage("DIB: %ldx%ld, %d bpp, compression=%lu",
-               pBih->biWidth, pBih->biHeight, pBih->biBitCount, pBih->biCompression);
-
-    /* Step 2: Create GDI+ bitmap from DIB */
-    if (GdipCreateBitmapFromGdiDib((const BITMAPINFO *)pBih, pBits, &pBitmap) != 0) {
-        LogMessage("ERROR: GdipCreateBitmapFromGdiDib failed");
-        GlobalUnlock(hDib);
-        CloseClipboard();
-        return FALSE;
+    if (GdipCreateBitmapFromGdiDib((const BITMAPINFO *)pBih, pBits, &bitmap) != 0) {
+        goto cleanup_clipboard;
     }
+    GdipGetImageWidth((GpImage *)bitmap, &width);
+    GdipGetImageHeight((GpImage *)bitmap, &height);
 
-    GdipGetImageWidth((GpImage *)pBitmap, &imgW);
-    GdipGetImageHeight((GpImage *)pBitmap, &imgH);
-    LogMessage("GDI+ bitmap created: %ux%u", imgW, imgH);
-
-    GlobalUnlock(hDib);
+cleanup_clipboard:
+    if (pBih) GlobalUnlock(hDib);
     CloseClipboard();
 
-    /* Step 3: Find PNG encoder */
-    if (!GetPngEncoderClsid(&pngClsid)) {
-        LogMessage("ERROR: PNG encoder CLSID not found");
-        GdipDisposeImage((GpImage *)pBitmap);
+    if (!bitmap) {
+        LogMessage("ERROR: Failed to read clipboard image");
+        SetTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY, CLIPBOARD_RETRY_DELAY_MS, NULL);
         return FALSE;
     }
 
-    /* Step 4: Create IStream and encode to PNG */
-    if (CreateStreamOnHGlobal(NULL, TRUE, &pStream) != S_OK) {
-        LogMessage("ERROR: CreateStreamOnHGlobal failed");
-        GdipDisposeImage((GpImage *)pBitmap);
-        return FALSE;
+    /* Once the replacement image is readable, the previous URL is no longer
+       current even while the new encodings are being prepared. */
+    ClearCachedImage("a newer clipboard image is being prepared");
+
+    if (!EncodeImageToMemory((GpImage *)bitmap, L"image/png", 0, &pngData, &pngSize)) {
+        LogMessage("ERROR: Failed to encode clipboard image as PNG");
+        goto cleanup;
+    }
+    if (!EncodeImageToMemory((GpImage *)bitmap, L"image/jpeg", g_configJpegQuality,
+                             &jpegData, &jpegSize)) {
+        LogMessage("ERROR: Failed to encode clipboard image as JPEG");
+        goto cleanup;
+    }
+    base64Data = Base64Encode(pngData, pngSize, &base64Len);
+    if (!base64Data || !GenerateImageToken(token)) {
+        LogMessage("ERROR: Failed to prepare clipboard image cache");
+        goto cleanup;
     }
 
-    if (GdipSaveImageToStream((GpImage *)pBitmap, pStream, &pngClsid, NULL) != 0) {
-        LogMessage("ERROR: GdipSaveImageToStream failed");
-        IStream_Release(pStream);
-        GdipDisposeImage((GpImage *)pBitmap);
-        return FALSE;
+    /* Do not publish stale data if the clipboard changed during compression. */
+    if (GetClipboardSequenceNumber() != sequence) {
+        LogMessage("Clipboard changed during image encoding; retrying latest contents");
+        SetTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY, CLIPBOARD_RETRY_DELAY_MS, NULL);
+        goto cleanup;
     }
 
-    GdipDisposeImage((GpImage *)pBitmap);
-    pBitmap = NULL;
-
-    /* Step 5: Read PNG bytes from stream */
-    {
-        STATSTG stat;
-        LARGE_INTEGER liZero;
-        ULONG bytesRead;
-
-        IStream_Stat(pStream, &stat, STATFLAG_NONAME);
-        pngSize = (DWORD)stat.cbSize.QuadPart;
-
-        pPngData = (BYTE *)malloc(pngSize);
-        if (!pPngData) {
-            LogMessage("ERROR: malloc for PNG data failed (%lu bytes)", pngSize);
-            IStream_Release(pStream);
-            return FALSE;
-        }
-
-        liZero.QuadPart = 0;
-        IStream_Seek(pStream, liZero, STREAM_SEEK_SET, NULL);
-        IStream_Read(pStream, pPngData, pngSize, &bytesRead);
-        IStream_Release(pStream);
-
-        LogMessage("PNG encoded: %lu bytes", pngSize);
-    }
-
-    /* Step 6: Base64 encode */
-    base64 = Base64Encode(pPngData, pngSize, &base64Len);
-    free(pPngData);
-
-    if (!base64) {
-        LogMessage("ERROR: Base64 encoding failed");
-        return FALSE;
-    }
-
-    LogMessage("Base64 encoded: %lu characters", base64Len);
-
-    /* Step 7: Place base64 text on clipboard */
-    hClipMem = GlobalAlloc(GMEM_MOVEABLE, base64Len + 1);
-    if (!hClipMem) {
-        LogMessage("ERROR: GlobalAlloc for clipboard failed");
-        free(base64);
-        return FALSE;
-    }
-
-    {
-        char *pClip = (char *)GlobalLock(hClipMem);
-        memcpy(pClip, base64, base64Len + 1);
-        GlobalUnlock(hClipMem);
-    }
-    free(base64);
-
-    if (!OpenClipboard(g_hWndMain)) {
-        LogMessage("ERROR: OpenClipboard for write failed (%lu)", GetLastError());
-        GlobalFree(hClipMem);
-        return FALSE;
-    }
-
-    EmptyClipboard();
-    if (!SetClipboardData(CF_TEXT, hClipMem)) {
-        LogMessage("ERROR: SetClipboardData failed (%lu)", GetLastError());
-        CloseClipboard();
-        return FALSE;
-    }
-
-    CloseClipboard();
-
-    LogMessage("Clipboard replaced with base64 text (%lu chars)", base64Len);
+    ReplaceCachedImage(jpegData, jpegSize, base64Data, base64Len,
+                       token, width, height);
+    jpegData = NULL;
+    base64Data = NULL;
+    g_lastClipboardSequence = sequence;
+    KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
+    LogMessage("Clipboard image cached: %ux%u, JPEG=%lu bytes, quality=%d%%, id=%.12s...",
+               width, height, jpegSize, g_configJpegQuality, token);
     success = TRUE;
 
+cleanup:
+    free(pngData);
+    free(jpegData);
+    free(base64Data);
+    GdipDisposeImage((GpImage *)bitmap);
     return success;
+}
+
+/* ── IPv4 discovery and micro HTTP server ─────────────────────────────── */
+
+static BOOL AddDetectedIp(char ips[][INET_ADDRSTRLEN], int *count, int maxCount,
+                          const char *candidate)
+{
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(ips[i], candidate) == 0) return TRUE;
+    }
+    if (*count >= maxCount) return FALSE;
+    strncpy(ips[*count], candidate, INET_ADDRSTRLEN - 1);
+    ips[*count][INET_ADDRSTRLEN - 1] = '\0';
+    (*count)++;
+    return TRUE;
+}
+
+static int EnumerateDetectedIpv4Addresses(char ips[][INET_ADDRSTRLEN], int maxCount)
+{
+    ULONG size = 15000;
+    IP_ADAPTER_ADDRESSES *addresses = NULL;
+    ULONG result;
+    int count = 0;
+
+    AddDetectedIp(ips, &count, maxCount, "127.0.0.1");
+    for (int attempt = 0; attempt < 3; attempt++) {
+        addresses = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (!addresses) return count;
+        result = GetAdaptersAddresses(AF_INET,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            NULL, addresses, &size);
+        if (result != ERROR_BUFFER_OVERFLOW) break;
+        free(addresses);
+        addresses = NULL;
+    }
+
+    if (addresses && result == NO_ERROR) {
+        for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter;
+             adapter = adapter->Next) {
+            if (adapter->OperStatus != IfOperStatusUp) continue;
+            for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
+                 unicast; unicast = unicast->Next) {
+                char text[INET_ADDRSTRLEN];
+                SOCKADDR *address = unicast->Address.lpSockaddr;
+                if (!address || address->sa_family != AF_INET) continue;
+                if (InetNtopA(AF_INET,
+                              &((SOCKADDR_IN *)address)->sin_addr,
+                              text, sizeof(text))) {
+                    AddDetectedIp(ips, &count, maxCount, text);
+                }
+            }
+        }
+    }
+    free(addresses);
+    return count;
+}
+
+static BOOL IsConfiguredBindAddressPresent(void)
+{
+    char ips[MAX_DETECTED_IPS][INET_ADDRSTRLEN];
+    int count;
+
+    if (strcmp(g_configBindIp, "0.0.0.0") == 0) return TRUE;
+    count = EnumerateDetectedIpv4Addresses(ips, MAX_DETECTED_IPS);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(ips[i], g_configBindIp) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static void SetHttpStatus(int state, const char *fmt, ...)
+{
+    char status[sizeof(g_httpStatus)];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(status, sizeof(status), fmt, args);
+    va_end(args);
+    status[sizeof(status) - 1] = '\0';
+
+    if (state != g_httpState || strcmp(status, g_httpStatus) != 0) {
+        g_httpState = state;
+        strncpy(g_httpStatus, status, sizeof(g_httpStatus) - 1);
+        g_httpStatus[sizeof(g_httpStatus) - 1] = '\0';
+        LogMessage("HTTP server: %s", g_httpStatus);
+    }
+}
+
+static BOOL SocketSendAll(SOCKET client, const BYTE *data, DWORD size)
+{
+    DWORD sentTotal = 0;
+    while (sentTotal < size) {
+        int chunk = (size - sentTotal > 1024 * 1024)
+            ? 1024 * 1024 : (int)(size - sentTotal);
+        int sent = send(client, (const char *)data + sentTotal, chunk, 0);
+        if (sent == SOCKET_ERROR || sent == 0) return FALSE;
+        sentTotal += (DWORD)sent;
+    }
+    return TRUE;
+}
+
+static int FindImageForToken(const char *token, BYTE **jpegCopy, DWORD *jpegSize)
+{
+    int status = HTTP_EVENT_NOT_FOUND;
+    *jpegCopy = NULL;
+    *jpegSize = 0;
+
+    AcquireSRWLockShared(&g_imageLock);
+    if (g_cachedImage.token[0] && strcmp(g_cachedImage.token, token) == 0) {
+        BYTE *copy = (BYTE *)malloc(g_cachedImage.jpegSize);
+        if (copy) {
+            memcpy(copy, g_cachedImage.jpegData, g_cachedImage.jpegSize);
+            *jpegCopy = copy;
+            *jpegSize = g_cachedImage.jpegSize;
+            status = HTTP_EVENT_SERVED;
+        } else {
+            status = 500;
+        }
+    } else {
+        for (size_t i = 0; i < g_goneTokenCount; i++) {
+            if (strcmp(g_goneTokens[i], token) == 0) {
+                status = HTTP_EVENT_GONE;
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_imageLock);
+    return status;
+}
+
+static BOOL ParseImageTokenFromPath(const char *path,
+                                    char token[IMAGE_TOKEN_HEX_LEN + 1])
+{
+    static const char prefix[] = "/";
+    const char *value;
+    size_t pathLen = strlen(path);
+    size_t expectedLen = strlen(prefix) + IMAGE_TOKEN_HEX_LEN + 4;
+
+    if (pathLen != expectedLen || strncmp(path, prefix, strlen(prefix)) != 0 ||
+        strcmp(path + pathLen - 4, ".jpg") != 0) return FALSE;
+    value = path + strlen(prefix);
+    for (int i = 0; i < IMAGE_TOKEN_HEX_LEN; i++) {
+        char c = value[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return FALSE;
+        token[i] = c;
+    }
+    token[IMAGE_TOKEN_HEX_LEN] = '\0';
+    return TRUE;
+}
+
+static void SendHttpResponse(SOCKET client, int status, BOOL headOnly,
+                             const BYTE *imageData, DWORD imageSize)
+{
+    const char *reason;
+    const char *contentType;
+    const char *messageHeader;
+    const char *body;
+    char headers[1024];
+    DWORD bodySize;
+
+    switch (status) {
+    case HTTP_EVENT_SERVED:
+        reason = "OK";
+        contentType = "image/jpeg";
+        messageHeader = "Current clipboard image";
+        body = NULL;
+        bodySize = imageSize;
+        break;
+    case HTTP_EVENT_GONE:
+        reason = "Gone";
+        contentType = "text/plain; charset=utf-8";
+        messageHeader = "This image is no longer available because the clipboard image changed";
+        body = "This image is no longer available. A newer clipboard image replaced it, or the clipboard no longer contains an image.\n";
+        bodySize = (DWORD)strlen(body);
+        break;
+    case 405:
+        reason = "Method Not Allowed";
+        contentType = "text/plain; charset=utf-8";
+        messageHeader = "Only GET and HEAD are supported";
+        body = "Only GET and HEAD requests are supported.\n";
+        bodySize = (DWORD)strlen(body);
+        break;
+    case 500:
+        reason = "Internal Server Error";
+        contentType = "text/plain; charset=utf-8";
+        messageHeader = "The image could not be prepared";
+        body = "The image exists but could not be prepared for this request.\n";
+        bodySize = (DWORD)strlen(body);
+        break;
+    default:
+        status = HTTP_EVENT_NOT_FOUND;
+        reason = "Not Found";
+        contentType = "text/plain; charset=utf-8";
+        messageHeader = "No image was issued for this URL";
+        body = "No image was issued for this URL. Check that the complete image URL was used.\n";
+        bodySize = (DWORD)strlen(body);
+        break;
+    }
+
+    snprintf(headers, sizeof(headers),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: no-store\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-ImagePaster-Message: %s\r\n"
+        "%s"
+        "Connection: close\r\n\r\n",
+        status, reason, contentType, bodySize, messageHeader,
+        status == 405 ? "Allow: GET, HEAD\r\n" : "");
+    SocketSendAll(client, (const BYTE *)headers, (DWORD)strlen(headers));
+    if (!headOnly) {
+        if (status == HTTP_EVENT_SERVED) {
+            SocketSendAll(client, imageData, imageSize);
+        } else if (body) {
+            SocketSendAll(client, (const BYTE *)body, bodySize);
+        }
+    }
+}
+
+static void HandleHttpClient(SOCKET client)
+{
+    char request[4096];
+    int used = 0;
+    char method[16] = {0};
+    char path[512] = {0};
+    char protocol[16] = {0};
+    char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+    BYTE *jpegCopy = NULL;
+    DWORD jpegSize = 0;
+    int status;
+    BOOL headOnly = FALSE;
+
+    while (used < (int)sizeof(request) - 1) {
+        int received = recv(client, request + used, (int)sizeof(request) - 1 - used, 0);
+        if (received <= 0) return;
+        used += received;
+        request[used] = '\0';
+        if (strstr(request, "\r\n\r\n")) break;
+    }
+
+    if (sscanf(request, "%15s %511s %15s", method, path, protocol) != 3) {
+        SendHttpResponse(client, HTTP_EVENT_NOT_FOUND, FALSE, NULL, 0);
+        return;
+    }
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        SendHttpResponse(client, 405, FALSE, NULL, 0);
+        return;
+    }
+    headOnly = strcmp(method, "HEAD") == 0;
+    if (!ParseImageTokenFromPath(path, token)) {
+        status = HTTP_EVENT_NOT_FOUND;
+    } else {
+        status = FindImageForToken(token, &jpegCopy, &jpegSize);
+    }
+
+    SendHttpResponse(client, status, headOnly, jpegCopy, jpegSize);
+    free(jpegCopy);
+    if (status == HTTP_EVENT_SERVED || status == HTTP_EVENT_GONE ||
+        status == HTTP_EVENT_NOT_FOUND) {
+        PostMessage(g_hWndMain, WM_HTTP_EVENT, (WPARAM)status, 0);
+    }
+}
+
+static DWORD WINAPI HttpServerThreadProc(LPVOID parameter)
+{
+    SOCKET listenSocket = (SOCKET)(UINT_PTR)parameter;
+
+    while (InterlockedCompareExchange(&g_httpStopRequested, 0, 0) == 0) {
+        fd_set readSet;
+        struct timeval timeout;
+        FD_ZERO(&readSet);
+        FD_SET(listenSocket, &readSet);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 500000;
+        int ready = select(0, &readSet, NULL, NULL, &timeout);
+        if (ready == SOCKET_ERROR) break;
+        if (ready == 0) continue;
+
+        SOCKET client = accept(listenSocket, NULL, NULL);
+        if (client == INVALID_SOCKET) {
+            if (InterlockedCompareExchange(&g_httpStopRequested, 0, 0) != 0) break;
+            continue;
+        }
+
+        {
+            DWORD timeoutMs = 2000;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char *)&timeoutMs, sizeof(timeoutMs));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO,
+                       (const char *)&timeoutMs, sizeof(timeoutMs));
+        }
+
+        EnterCriticalSection(&g_httpSocketLock);
+        g_httpClientSocket = client;
+        LeaveCriticalSection(&g_httpSocketLock);
+
+        HandleHttpClient(client);
+
+        EnterCriticalSection(&g_httpSocketLock);
+        if (g_httpClientSocket == client) {
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+            g_httpClientSocket = INVALID_SOCKET;
+        }
+        LeaveCriticalSection(&g_httpSocketLock);
+    }
+    return 0;
+}
+
+static void StopHttpServer(void)
+{
+    InterlockedExchange(&g_httpStopRequested, 1);
+    if (g_httpListenSocket != INVALID_SOCKET) {
+        shutdown(g_httpListenSocket, SD_BOTH);
+        closesocket(g_httpListenSocket);
+        g_httpListenSocket = INVALID_SOCKET;
+    }
+    if (g_httpSocketLockReady) {
+        EnterCriticalSection(&g_httpSocketLock);
+        if (g_httpClientSocket != INVALID_SOCKET) {
+            shutdown(g_httpClientSocket, SD_BOTH);
+            closesocket(g_httpClientSocket);
+            g_httpClientSocket = INVALID_SOCKET;
+        }
+        LeaveCriticalSection(&g_httpSocketLock);
+    }
+    if (g_httpThread) {
+        DWORD waitResult = WaitForSingleObject(g_httpThread, 5000);
+        if (waitResult == WAIT_OBJECT_0) {
+            CloseHandle(g_httpThread);
+            g_httpThread = NULL;
+        } else {
+            SetHttpStatus(3, "HTTP worker is still shutting down");
+        }
+    }
+}
+
+static BOOL StartHttpServer(void)
+{
+    SOCKET listenSocket;
+    SOCKADDR_IN address;
+    BOOL exclusive = TRUE;
+
+    if (!g_winsockReady) {
+        SetHttpStatus(3, "unavailable because Winsock failed to initialize");
+        return FALSE;
+    }
+    if (!IsConfiguredBindAddressPresent()) {
+        SetHttpStatus(2, "waiting for %s to become available", g_configBindIp);
+        return FALSE;
+    }
+
+    listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET) {
+        SetHttpStatus(3, "socket creation failed (%d)", WSAGetLastError());
+        return FALSE;
+    }
+    setsockopt(listenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               (const char *)&exclusive, sizeof(exclusive));
+
+    ZeroMemory(&address, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((u_short)g_configHttpPort);
+    if (InetPtonA(AF_INET, g_configBindIp, &address.sin_addr) != 1) {
+        closesocket(listenSocket);
+        SetHttpStatus(3, "configured bind address is invalid: %s", g_configBindIp);
+        return FALSE;
+    }
+    if (bind(listenSocket, (SOCKADDR *)&address, sizeof(address)) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        closesocket(listenSocket);
+        SetHttpStatus(3, "cannot bind %s:%d (Winsock error %d)",
+                      g_configBindIp, g_configHttpPort, error);
+        return FALSE;
+    }
+    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        closesocket(listenSocket);
+        SetHttpStatus(3, "cannot listen on %s:%d (Winsock error %d)",
+                      g_configBindIp, g_configHttpPort, error);
+        return FALSE;
+    }
+
+    InterlockedExchange(&g_httpStopRequested, 0);
+    g_httpListenSocket = listenSocket;
+    g_httpThread = CreateThread(NULL, 0, HttpServerThreadProc,
+                                (LPVOID)(UINT_PTR)listenSocket, 0, NULL);
+    if (!g_httpThread) {
+        closesocket(listenSocket);
+        g_httpListenSocket = INVALID_SOCKET;
+        SetHttpStatus(3, "could not start the HTTP worker thread");
+        return FALSE;
+    }
+
+    SetHttpStatus(1, "listening on http://%s:%d", g_configBindIp, g_configHttpPort);
+    return TRUE;
+}
+
+static void ReconcileHttpServer(void)
+{
+    BOOL addressPresent = IsConfiguredBindAddressPresent();
+
+    if (g_httpThread && WaitForSingleObject(g_httpThread, 0) == WAIT_OBJECT_0) {
+        CloseHandle(g_httpThread);
+        g_httpThread = NULL;
+        if (g_httpListenSocket != INVALID_SOCKET) {
+            closesocket(g_httpListenSocket);
+            g_httpListenSocket = INVALID_SOCKET;
+        }
+        SetHttpStatus(3, "listener stopped unexpectedly; retrying");
+    }
+
+    if (!addressPresent) {
+        if (g_httpThread || g_httpListenSocket != INVALID_SOCKET) StopHttpServer();
+        SetHttpStatus(2, "waiting for %s to become available", g_configBindIp);
+        return;
+    }
+    if (!g_httpThread) StartHttpServer();
 }
 
 /* ── Paste re-injection ─────────────────────────────────────────────────── */
@@ -654,6 +1257,104 @@ static void SimulateCtrlV(void)
 
     SendInput(4, inputs, sizeof(INPUT));
     LogMessage("Simulated Ctrl+V (re-injection)");
+}
+
+static BOOL PlaceUtf8TextOnClipboard(const char *text)
+{
+    int wideLen;
+    HGLOBAL memory;
+    WCHAR *wideText;
+
+    wideLen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    if (wideLen <= 0) return FALSE;
+    memory = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)wideLen * sizeof(WCHAR));
+    if (!memory) return FALSE;
+    wideText = (WCHAR *)GlobalLock(memory);
+    if (!wideText) {
+        GlobalFree(memory);
+        return FALSE;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wideText, wideLen);
+    GlobalUnlock(memory);
+
+    g_writingClipboardText = TRUE;
+    if (!OpenClipboard(g_hWndMain)) {
+        g_writingClipboardText = FALSE;
+        GlobalFree(memory);
+        LogMessage("ERROR: OpenClipboard for text paste failed (%lu)", GetLastError());
+        return FALSE;
+    }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+        LogMessage("ERROR: SetClipboardData(CF_UNICODETEXT) failed (%lu)", GetLastError());
+        CloseClipboard();
+        g_writingClipboardText = FALSE;
+        GlobalFree(memory);
+        return FALSE;
+    }
+    CloseClipboard();
+
+    /* The cache represents the user's last copied image. Ignore our own text update. */
+    g_ownClipboardSequence = GetClipboardSequenceNumber();
+    g_lastClipboardSequence = g_ownClipboardSequence;
+    g_writingClipboardText = FALSE;
+    return TRUE;
+}
+
+static BOOL PasteCachedImage(void)
+{
+    char *pasteText = NULL;
+    DWORD textLen = 0;
+    char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+    BOOL success = FALSE;
+
+    AcquireSRWLockShared(&g_imageLock);
+    if (g_cachedImage.token[0]) {
+        strncpy(token, g_cachedImage.token, sizeof(token) - 1);
+        if (g_configPasteMethod == PASTE_METHOD_BASE64 && g_cachedImage.base64Data) {
+            textLen = g_cachedImage.base64Len;
+            pasteText = (char *)malloc((size_t)textLen + 1);
+            if (pasteText) memcpy(pasteText, g_cachedImage.base64Data, (size_t)textLen + 1);
+        }
+    }
+    ReleaseSRWLockShared(&g_imageLock);
+
+    if (!token[0]) {
+        LogMessage("Paste cancelled: no current clipboard image is cached");
+        return FALSE;
+    }
+
+    if (g_configPasteMethod == PASTE_METHOD_HTTP) {
+        const char *format =
+            "[ image available at http://%s:%d/%s.jpg - if you feel this image "
+            "will be useful later on be sure to save it to /tmp or a temp location "
+            "for later use ]";
+        char formatted[512];
+        int formattedLen = snprintf(formatted, sizeof(formatted), format,
+                                    g_configBindIp, g_configHttpPort, token);
+        if (formattedLen > 0 && formattedLen < (int)sizeof(formatted)) {
+            pasteText = (char *)malloc((size_t)formattedLen + 1);
+            if (pasteText) {
+                memcpy(pasteText, formatted, (size_t)formattedLen + 1);
+                textLen = (DWORD)formattedLen;
+            }
+        }
+    }
+
+    if (!pasteText) {
+        LogMessage("ERROR: Could not allocate paste text");
+        return FALSE;
+    }
+
+    if (PlaceUtf8TextOnClipboard(pasteText)) {
+        LogMessage("Prepared %s paste (%lu characters, image id %.12s...)",
+                   g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP URL" : "base64",
+                   textLen, token);
+        SimulateCtrlV();
+        success = TRUE;
+    }
+    free(pasteText);
+    return success;
 }
 
 /* ── Keyword parsing ───────────────────────────────────────────────────── */
@@ -695,12 +1396,42 @@ static BOOL LoadConfigFromRegistry(void)
     LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
     if (result != ERROR_SUCCESS) return FALSE;
 
-    DWORD type, size;
+    DWORD type, size, value;
     size = sizeof(g_configTitleMatch);
     if (RegQueryValueExA(hKey, REG_VALUE_TITLE, NULL, &type,
                          (LPBYTE)g_configTitleMatch, &size) != ERROR_SUCCESS
         || type != REG_SZ) {
         strcpy(g_configTitleMatch, "xshell");
+    }
+    g_configTitleMatch[sizeof(g_configTitleMatch) - 1] = '\0';
+
+    size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_METHOD, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= PASTE_METHOD_HTTP) {
+        g_configPasteMethod = (int)value;
+    }
+
+    size = sizeof(g_configBindIp);
+    if (RegQueryValueExA(hKey, REG_VALUE_BIND_IP, NULL, &type,
+                         (LPBYTE)g_configBindIp, &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        strcpy(g_configBindIp, "127.0.0.1");
+    }
+    g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
+
+    size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_PORT, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value >= 1 && value <= 65535) {
+        g_configHttpPort = (int)value;
+    }
+
+    size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_QUALITY, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= 100) {
+        g_configJpegQuality = (int)value;
     }
 
     RegCloseKey(hKey);
@@ -719,9 +1450,26 @@ static void SaveConfigToRegistry(void)
     RegSetValueExA(hKey, REG_VALUE_TITLE, 0, REG_SZ,
                    (const BYTE*)g_configTitleMatch,
                    (DWORD)(strlen(g_configTitleMatch) + 1));
+    RegSetValueExA(hKey, REG_VALUE_BIND_IP, 0, REG_SZ,
+                   (const BYTE*)g_configBindIp,
+                   (DWORD)(strlen(g_configBindIp) + 1));
+    {
+        DWORD value = (DWORD)g_configPasteMethod;
+        RegSetValueExA(hKey, REG_VALUE_METHOD, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configHttpPort;
+        RegSetValueExA(hKey, REG_VALUE_PORT, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configJpegQuality;
+        RegSetValueExA(hKey, REG_VALUE_QUALITY, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
+    }
 
     RegCloseKey(hKey);
-    LogMessage("Configuration saved to registry: TitleMatch=%s", g_configTitleMatch);
+    LogMessage("Configuration saved: method=%s, bind=%s:%d, JPEG=%d%%, titles=%s",
+               g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
+               g_configBindIp, g_configHttpPort, g_configJpegQuality,
+               g_configTitleMatch);
 }
 
 /* ── Low-level keyboard hook ────────────────────────────────────────────── */
@@ -769,21 +1517,22 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 }
                 LogMessage("Title match: %s", matchFound ? "YES" : "NO");
 
-                /* Check if clipboard has an image */
-                BOOL clipHasImage = IsClipboardFormatAvailable(CF_DIB);
-                LogMessage("Clipboard has image: %s", clipHasImage ? "YES" : "NO");
+                /* A user image may be awaiting WM_CLIPBOARDUPDATE processing. Our
+                   own text paste keeps the cached image authoritative. */
+                DWORD sequence = GetClipboardSequenceNumber();
+                BOOL clipboardHasImage = IsClipboardFormatAvailable(CF_DIB);
+                BOOL cacheIsCurrent = sequence == g_lastClipboardSequence && HasCachedImage();
+                BOOL imagePasteAvailable = clipboardHasImage || cacheIsCurrent;
+                LogMessage("Current clipboard image available: %s",
+                           imagePasteAvailable ? "YES" : "NO");
 
-                if (matchFound && clipHasImage) {
-                    LogMessage("Intercepting paste: converting image to base64...");
+                if (matchFound && imagePasteAvailable) {
+                    LogMessage("Intercepting image paste using %s mode",
+                               g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
+                    PostMessage(g_hWndMain, WM_DO_PASTE, 0, 0);
 
-                    if (ConvertClipboardImageToBase64()) {
-                        LogMessage("Conversion successful, deferring re-injection");
-                        PostMessage(g_hWndMain, WM_DO_PASTE, 0, 0);
-                    } else {
-                        LogMessage("Conversion FAILED, blocking paste");
-                    }
-
-                    /* Block original Ctrl+V */
+                    /* Block the original Ctrl+V. Encoding and clipboard writes are
+                       deliberately deferred out of this low-level hook. */
                     return 1;
                 }
             }
@@ -972,12 +1721,42 @@ static void json_escape_string(const char *in, wchar_t *out, size_t outLen)
 static void webview_push_init_config(void)
 {
     wchar_t wTitleMatch[4096];
+    wchar_t wBindIp[128];
+    wchar_t wHttpStatus[512];
+    wchar_t ipsJson[4096];
+    char ips[MAX_DETECTED_IPS][INET_ADDRSTRLEN];
+    int ipCount = EnumerateDetectedIpv4Addresses(ips, MAX_DETECTED_IPS);
+    size_t pos = 0;
     json_escape_string(g_configTitleMatch, wTitleMatch, 4096);
+    json_escape_string(g_configBindIp, wBindIp, 128);
+    json_escape_string(g_httpStatus, wHttpStatus, 512);
 
-    wchar_t script[8192];
-    swprintf(script, 8192,
-        L"window.onInit({\"view\":\"config\",\"config\":{\"titleMatch\":\"%s\"}})",
-        wTitleMatch);
+    pos += swprintf(ipsJson + pos, 4096 - pos, L"[");
+    for (int i = 0; i < ipCount && pos < 4000; i++) {
+        wchar_t wIp[64];
+        MultiByteToWideChar(CP_UTF8, 0, ips[i], -1, wIp, 64);
+        pos += swprintf(ipsJson + pos, 4096 - pos,
+                        i == 0 ? L"\"%s\"" : L",\"%s\"", wIp);
+    }
+    swprintf(ipsJson + pos, 4096 - pos, L"]");
+
+    wchar_t script[16384];
+    swprintf(script, 16384,
+        L"window.onInit({\"view\":\"config\",\"config\":{"
+        L"\"titleMatch\":\"%s\","
+        L"\"pasteMethod\":\"%s\","
+        L"\"bindIp\":\"%s\","
+        L"\"httpPort\":%d,"
+        L"\"jpegQuality\":%d,"
+        L"\"availableIps\":%s,"
+        L"\"bindIpAvailable\":%s,"
+        L"\"serverStatus\":\"%s\","
+        L"\"version\":\"%s\"}})",
+        wTitleMatch,
+        g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
+        wBindIp, g_configHttpPort, g_configJpegQuality, ipsJson,
+        IsConfiguredBindAddressPresent() ? L"true" : L"false",
+        wHttpStatus, APP_VERSION_W);
     webview_execute_script(script);
 }
 
@@ -1167,13 +1946,61 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
     } else if (strcmp(action, "saveSettings") == 0) {
         char titleMatch[2048] = {0};
+        char pasteMethod[32] = {0};
+        char bindIp[INET_ADDRSTRLEN] = {0};
+        int httpPort = 0;
+        int jpegQuality = -1;
+        IN_ADDR parsedAddress;
+
         json_get_string(msg, "titleMatch", titleMatch, sizeof(titleMatch));
+        json_get_string(msg, "pasteMethod", pasteMethod, sizeof(pasteMethod));
+        json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
+        json_get_int(msg, "httpPort", &httpPort);
+        json_get_int(msg, "jpegQuality", &jpegQuality);
+
+        if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid paste method.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (InetPtonA(AF_INET, bindIp, &parsedAddress) != 1) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Enter a valid IPv4 bind address.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (httpPort < 1 || httpPort > 65535) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'HTTP port must be between 1 and 65535.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (jpegQuality < 0 || jpegQuality > 100) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'JPEG quality must be between 0 and 100.'})");
+            free(msg);
+            return S_OK;
+        }
+
+        BOOL networkChanged = strcmp(g_configBindIp, bindIp) != 0 ||
+                              g_configHttpPort != httpPort;
+        BOOL qualityChanged = g_configJpegQuality != jpegQuality;
+        if (networkChanged) StopHttpServer();
+
         strncpy(g_configTitleMatch, titleMatch, sizeof(g_configTitleMatch) - 1);
         g_configTitleMatch[sizeof(g_configTitleMatch) - 1] = '\0';
+        g_configPasteMethod = strcmp(pasteMethod, "http") == 0
+            ? PASTE_METHOD_HTTP : PASTE_METHOD_BASE64;
+        strncpy(g_configBindIp, bindIp, sizeof(g_configBindIp) - 1);
+        g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
+        g_configHttpPort = httpPort;
+        g_configJpegQuality = jpegQuality;
         SaveConfigToRegistry();
         ParseKeywords();
         UpdateTooltip();
-        LogMessage("Configuration updated: TitleMatch=%s", g_configTitleMatch);
+        if (qualityChanged && IsClipboardFormatAvailable(CF_DIB)) {
+            g_lastClipboardSequence = 0;
+            RefreshClipboardImageCache();
+        }
+        ReconcileHttpServer();
+        LogMessage("Configuration updated");
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
@@ -1362,16 +2189,35 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case ID_TRAY_CONFIGURE:
             LogMessage("Opening Configuration dialog");
-            ShowWebViewDialog("config", 480, 300);
+            ShowWebViewDialog("config", 560, 520);
             break;
         case ID_TRAY_EXIT:
             LogMessage("User selected Exit");
             /* Close WebView if open */
             if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
+            KillTimer(hWnd, ID_TIMER_HTTP_RECONCILE);
+            KillTimer(hWnd, ID_TIMER_CLIPBOARD_RETRY);
+            if (fnRemoveClipboardFormatListener) fnRemoveClipboardFormatListener(hWnd);
+            StopHttpServer();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hAppIcon) DestroyIcon(g_hAppIcon);
             if (g_hMenu) DestroyMenu(g_hMenu);
             if (g_hHook) UnhookWindowsHookEx(g_hHook);
+            ClearCachedImage("application is exiting");
+            AcquireSRWLockExclusive(&g_imageLock);
+            free(g_goneTokens);
+            g_goneTokens = NULL;
+            g_goneTokenCount = 0;
+            g_goneTokenCapacity = 0;
+            ReleaseSRWLockExclusive(&g_imageLock);
+            if (g_httpSocketLockReady && !g_httpThread) {
+                DeleteCriticalSection(&g_httpSocketLock);
+                g_httpSocketLockReady = FALSE;
+            }
+            if (g_winsockReady && !g_httpThread) {
+                WSACleanup();
+                g_winsockReady = FALSE;
+            }
             GdiplusShutdown(g_gdipToken);
             CoUninitialize();
             if (g_hMutex) {
@@ -1384,8 +2230,50 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_DO_PASTE:
-        LogMessage("WM_DO_PASTE received, simulating Ctrl+V now");
-        SimulateCtrlV();
+        {
+            DWORD sequence = GetClipboardSequenceNumber();
+            if (sequence != g_lastClipboardSequence) {
+                if (!RefreshClipboardImageCache()) {
+                    LogMessage("Paste cancelled while waiting for the current clipboard image");
+                    return 0;
+                }
+            }
+            PasteCachedImage();
+        }
+        return 0;
+
+    case WM_CLIPBOARDUPDATE:
+        {
+            DWORD sequence = GetClipboardSequenceNumber();
+            if (g_writingClipboardText) return 0;
+            if (sequence == g_lastClipboardSequence) return 0;
+            if (sequence == g_ownClipboardSequence) {
+                g_lastClipboardSequence = sequence;
+                return 0;
+            }
+            RefreshClipboardImageCache();
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == ID_TIMER_HTTP_RECONCILE) {
+            ReconcileHttpServer();
+            return 0;
+        }
+        if (wParam == ID_TIMER_CLIPBOARD_RETRY) {
+            RefreshClipboardImageCache();
+            return 0;
+        }
+        break;
+
+    case WM_HTTP_EVENT:
+        if ((int)wParam == HTTP_EVENT_SERVED) {
+            LogMessage("HTTP image request served (200 OK)");
+        } else if ((int)wParam == HTTP_EVENT_GONE) {
+            LogMessage("HTTP request for superseded image returned 410 Gone");
+        } else if ((int)wParam == HTTP_EVENT_NOT_FOUND) {
+            LogMessage("HTTP request for unknown image returned 404 Not Found");
+        }
         return 0;
 
     case WM_DESTROY:
@@ -1462,9 +2350,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     CreateContextMenu();
     UpdateTooltip();
 
-    LogMessage("ImagePaster started");
+    LogMessage("ImagePaster %s started", APP_VERSION_A);
     LogMessage("GDI+ initialized");
     LogMessage("Title match keywords: %s", g_configTitleMatch);
+    LogMessage("Paste method: %s", g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
+
+    /* Clipboard monitoring keeps both paste modes synchronized with the user's
+       latest clipboard image, independent of which mode is currently selected. */
+    {
+        HMODULE user32Module = GetModuleHandleW(L"user32.dll");
+        if (user32Module) {
+            fnAddClipboardFormatListener = (PFN_AddClipboardFormatListener)
+                GetProcAddress(user32Module, "AddClipboardFormatListener");
+            fnRemoveClipboardFormatListener = (PFN_RemoveClipboardFormatListener)
+                GetProcAddress(user32Module, "RemoveClipboardFormatListener");
+        }
+    }
+    if (!fnAddClipboardFormatListener || !fnAddClipboardFormatListener(g_hWndMain)) {
+        LogMessage("ERROR: Failed to register clipboard listener (%lu)", GetLastError());
+    }
+    RefreshClipboardImageCache();
+
+    /* The image server remains active in both paste modes. */
+    {
+        WSADATA winsockData;
+        if (WSAStartup(MAKEWORD(2, 2), &winsockData) == 0) {
+            g_winsockReady = TRUE;
+            InitializeCriticalSection(&g_httpSocketLock);
+            g_httpSocketLockReady = TRUE;
+        } else {
+            SetHttpStatus(3, "Winsock initialization failed");
+        }
+    }
+    ReconcileHttpServer();
+    SetTimer(g_hWndMain, ID_TIMER_HTTP_RECONCILE,
+             HTTP_RECONCILE_INTERVAL_MS, NULL);
 
     /* Install keyboard hook */
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);

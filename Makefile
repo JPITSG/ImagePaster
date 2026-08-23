@@ -11,7 +11,7 @@ OBJ = main.o resources.o
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32 -lgdiplus
+LIBS = -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32 -lgdiplus -lws2_32 -liphlpapi
 
 .PHONY: all clean assets
 

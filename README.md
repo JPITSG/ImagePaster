@@ -1,11 +1,19 @@
-# ImagePaster
+# ImagePaster 1.0.0
 
-A Windows system tray utility that intercepts `Ctrl+V` and converts clipboard images to base64-encoded PNG text before pasting. Designed for terminal applications like XShell, PuTTY, and SSH clients that don't support native image pasting.
+A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
 ## Features
 
-- Intercepts `Ctrl+V` when a matching window is focused and the clipboard contains an image
-- Converts the image to a base64-encoded PNG string and pastes that instead
+- Intercepts `Ctrl+V` when a matching window is focused and the latest user clipboard item is an image
+- Selectable paste method:
+  - raw base64-encoded PNG text (legacy behavior)
+  - a short instruction containing a temporary HTTP JPEG URL
+- Watches the clipboard continuously and keeps the latest image encoded in memory for both methods
+- Clears the cached image when the user copies non-image content
+- Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
+- Detects active local IPv4 addresses for selection in the configuration dialog
+- Keeps an unavailable saved address and automatically starts listening if that address returns
+- Uses a random 256-bit image identifier; superseded URLs return `410 Gone`
 - Configurable window title matching (comma-separated keywords)
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates (500-entry ring buffer)
@@ -22,12 +30,20 @@ A Windows system tray utility that intercepts `Ctrl+V` and converts clipboard im
 
 1. A low-level keyboard hook monitors for `Ctrl+V` globally
 2. When detected, it checks if the focused window's title contains any configured keyword
-3. If a match is found and the clipboard contains an image (`CF_DIB`):
-   - The image is extracted from the clipboard
-   - Encoded to PNG using GDI+
-   - Base64-encoded
-   - Placed back on the clipboard as plain text
-   - `Ctrl+V` is re-injected so the application receives the base64 string
+3. A clipboard listener keeps an in-memory representation of the latest image as:
+   - base64-encoded PNG for the legacy method
+   - JPEG at the configured quality for HTTP delivery
+4. If a matching window receives `Ctrl+V` while an image is current:
+   - Base64 mode places the encoded PNG text on the clipboard.
+   - HTTP mode places text similar to the following on the clipboard:
+
+     ```text
+     [ image available at http://192.168.1.100:10444/<random-id>.jpg - if you feel this image will be useful later on be sure to save it to /tmp or a temp location for later use ]
+     ```
+
+5. `Ctrl+V` is re-injected so the target application receives the selected representation.
+
+The HTTP server runs in both modes. A URL for the current image returns `200 OK` with `image/jpeg`. A previously issued URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`.
 
 ## Building
 
@@ -58,8 +74,14 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | Setting | Registry Value | Type | Default |
 |---------|---------------|------|---------|
 | Title Match | `TitleMatch` | REG_SZ | `xshell` |
+| Paste Method | `PasteMethod` | REG_DWORD | Base64 |
+| HTTP Bind Address | `BindIp` | REG_SZ | `127.0.0.1` |
+| HTTP Port | `HttpPort` | REG_DWORD | `10444` |
+| JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
+
+The bind-address menu lists IPv4 addresses on active adapters and includes an **Other** option. If a saved address disappears, such as after a laptop changes networks, ImagePaster retains it, stops the unavailable listener safely, and retries periodically. Selecting a non-loopback address may require a Windows Firewall rule, and the remote machine must be able to route to that address.
 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`.
 

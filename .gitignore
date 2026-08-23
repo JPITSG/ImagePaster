@@ -3,3 +3,5 @@
 !release/*.exe
 assets/node_modules/
 assets/dist/
+AGENTS.md
+CLAUDE.md

@@ -1,5 +1,15 @@
+export type PasteMethod = "base64" | "http";
+
 export interface ConfigData {
   titleMatch: string;
+  pasteMethod: PasteMethod;
+  bindIp: string;
+  httpPort: number;
+  jpegQuality: number;
+  availableIps: string[];
+  bindIpAvailable: boolean;
+  serverStatus: string;
+  version: string;
 }
 
 export interface LogEntry {
@@ -15,14 +25,17 @@ export interface InitData {
 
 type InitCallback = (data: InitData) => void;
 type LogUpdateCallback = (entry: LogEntry) => void;
+type SaveResultCallback = (result: { ok: boolean; message?: string }) => void;
 
 let initCallback: InitCallback | null = null;
 let logUpdateCallback: LogUpdateCallback | null = null;
+let saveResultCallback: SaveResultCallback | null = null;
 
 declare global {
   interface Window {
     onInit: (data: InitData) => void;
     onLogUpdate: (entry: LogEntry) => void;
+    onSaveResult: (result: { ok: boolean; message?: string }) => void;
     chrome?: {
       webview?: {
         postMessage: (s: string) => void;
@@ -39,12 +52,20 @@ window.onLogUpdate = (entry: LogEntry) => {
   logUpdateCallback?.(entry);
 };
 
+window.onSaveResult = (result) => {
+  saveResultCallback?.(result);
+};
+
 export function onInit(cb: InitCallback) {
   initCallback = cb;
 }
 
 export function onLogUpdate(cb: LogUpdateCallback) {
   logUpdateCallback = cb;
+}
+
+export function onSaveResult(cb: SaveResultCallback) {
+  saveResultCallback = cb;
 }
 
 function postMessage(msg: Record<string, unknown>) {
@@ -60,7 +81,14 @@ export function getInit() {
 }
 
 export function saveSettings(config: ConfigData) {
-  postMessage({ action: "saveSettings", titleMatch: config.titleMatch });
+  postMessage({
+    action: "saveSettings",
+    titleMatch: config.titleMatch,
+    pasteMethod: config.pasteMethod,
+    bindIp: config.bindIp,
+    httpPort: config.httpPort,
+    jpegQuality: config.jpegQuality,
+  });
 }
 
 export function clearLog() {
