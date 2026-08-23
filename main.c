@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.28"
-#define APP_VERSION_W     L"1.0.28"
+#define APP_VERSION_A     "1.0.29"
+#define APP_VERSION_W     L"1.0.29"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -7462,7 +7462,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         NotifyHistoryViewChanged();
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0;
+        int contentWidth = 0;
         json_get_int(msg, "height", &contentHeight);
+        json_get_int(msg, "width", &contentWidth);
         if (contentHeight > 0 && g_webviewHwnd &&
             !IsZoomed(g_webviewHwnd) && !IsIconic(g_webviewHwnd)) {
             int physicalHeight = MulDiv(
@@ -7473,6 +7475,13 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = physicalHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
+            if (contentWidth > 0) {
+                int chromeW = (windowRect.right - windowRect.left) -
+                              (clientRect.right - clientRect.left);
+                windowW = MulDiv(contentWidth,
+                                 (int)GetWebViewWindowDpi(g_webviewHwnd),
+                                 96) + chromeW;
+            }
             int newX = windowRect.left;
             int newY = windowRect.top;
             HMONITOR monitor = MonitorFromWindow(g_webviewHwnd,
@@ -7483,7 +7492,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
                 int availableHeight = monitorInfo.rcWork.bottom -
                                       monitorInfo.rcWork.top - 24;
+                int availableWidth = monitorInfo.rcWork.right -
+                                     monitorInfo.rcWork.left - 24;
                 if (newWindowH > availableHeight) newWindowH = availableHeight;
+                if (windowW > availableWidth) windowW = availableWidth;
                 if (newY + newWindowH > monitorInfo.rcWork.bottom - 12) {
                     newY = monitorInfo.rcWork.bottom - newWindowH - 12;
                 }

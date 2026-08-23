@@ -4,6 +4,7 @@ import {
   saveSettings,
   closeDialog,
   onSaveResult,
+  reportSize,
   checkForUpdate,
   cancelUpdateCheck,
   configReady,
@@ -93,6 +94,7 @@ export default function ConfigView({
     config.autoCheckForUpdates ?? true,
   );
   const [error, setError] = useState("");
+  const [twoColumn, setTwoColumn] = useState(false);
   const [updateChecking, setUpdateChecking] = useState(
     config.updateCheckPending ?? false,
   );
@@ -121,6 +123,19 @@ export default function ConfigView({
     onSaveResult((result) => {
       if (!result.ok) setError(result.message ?? "Could not save the settings.");
     });
+  }, []);
+
+  // Single column is the default. Only when the measured single-column
+  // height would not fit the monitor (and would scroll) does the dialog
+  // switch to two columns and ask the window to widen. Sections move
+  // between columns as whole units.
+  useEffect(() => {
+    const contentHeight = document.documentElement.scrollHeight;
+    const availableHeight = window.screen.availHeight - 80;
+    if (contentHeight > availableHeight) {
+      setTwoColumn(true);
+      reportSize(Math.min(contentHeight, availableHeight), 900);
+    }
   }, []);
 
   useEffect(() => {
@@ -270,8 +285,10 @@ export default function ConfigView({
     });
   };
 
-  return (
-    <div className="p-5 space-y-4">
+  const pastingSection = (
+    <div className="space-y-4">
+      <div className="text-xs font-medium">Pasting</div>
+
       <div className="space-y-1.5">
         <Label htmlFor="pasteMethod">Paste Method</Label>
         <select
@@ -318,6 +335,12 @@ export default function ConfigView({
           </p>
         </div>
       </div>
+    </div>
+  );
+
+  const captureSection = (
+    <div className="space-y-4">
+      <div className="text-xs font-medium">Screen Capture</div>
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox
@@ -356,15 +379,18 @@ export default function ConfigView({
           or more boxes are copied. Heavy blur uses the real underlying screen.
         </p>
       </div>
+    </div>
+  );
 
-      <div className="border-t border-neutral-200 pt-4 space-y-3">
-        <div>
-          <div className="text-xs font-medium">Image HTTP Server</div>
-          <p className="mt-1 text-[11px] text-neutral-500">
-            The server stays active in both paste modes so the latest clipboard image
-            is always ready.
-          </p>
-        </div>
+  const serverSection = (
+    <div className="space-y-3">
+      <div>
+        <div className="text-xs font-medium">Image HTTP Server</div>
+        <p className="mt-1 text-[11px] text-neutral-500">
+          The server stays active in both paste modes so the latest clipboard image
+          is always ready.
+        </p>
+      </div>
 
         <div className="space-y-1.5">
           <Label htmlFor="httpMessageTemplate">HTTP Paste Message</Label>
@@ -528,7 +554,12 @@ export default function ConfigView({
             {config.serverStatus}
           </dd>
         </dl>
-      </div>
+    </div>
+  );
+
+  const updatesSection = (
+    <div className="space-y-4">
+      <div className="text-xs font-medium">Updates</div>
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox
@@ -547,6 +578,38 @@ export default function ConfigView({
           </p>
         </div>
       </div>
+    </div>
+  );
+
+  return (
+    <div className="p-5 space-y-4">
+      {twoColumn ? (
+        <div className="grid grid-cols-2">
+          <div className="space-y-4 pr-6">
+            {pastingSection}
+            <div className="border-t border-neutral-200 pt-4">
+              {captureSection}
+            </div>
+            <div className="border-t border-neutral-200 pt-4">
+              {updatesSection}
+            </div>
+          </div>
+          <div className="border-l border-neutral-200 pl-6">
+            {serverSection}
+          </div>
+        </div>
+      ) : (
+        <>
+          {pastingSection}
+          <div className="border-t border-neutral-200 pt-4">
+            {captureSection}
+          </div>
+          <div className="border-t border-neutral-200 pt-4">{serverSection}</div>
+          <div className="border-t border-neutral-200 pt-4">
+            {updatesSection}
+          </div>
+        </>
+      )}
 
       {error && (
         <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
@@ -554,7 +617,7 @@ export default function ConfigView({
         </div>
       )}
 
-      <div className="flex items-center justify-between gap-3 pt-1">
+      <div className="flex items-center justify-between gap-3 border-t border-neutral-200 pt-3">
         <span
           className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
           title="Application version"

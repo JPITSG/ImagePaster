@@ -273,3 +273,7 @@ export function closeDialog() {
 export function reportHeight(height: number) {
   postMessage({ action: "resize", height });
 }
+
+export function reportSize(height: number, width: number) {
+  postMessage({ action: "resize", height, width });
+}
