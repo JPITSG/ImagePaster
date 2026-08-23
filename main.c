@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.20"
-#define APP_VERSION_W     L"1.0.20"
+#define APP_VERSION_A     "1.0.21"
+#define APP_VERSION_W     L"1.0.21"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -401,6 +401,7 @@ static int g_capturePressedPanel = -1;
 static int g_capturePressedTool = -1;
 static BOOL g_captureDragging = FALSE;
 static BOOL g_captureCopyShowsSelection = FALSE;
+static int g_captureHoveredRemoval = -1; /* stored-selection index or -1 */
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
 static RECT *g_captureSelections = NULL;
@@ -3381,11 +3382,14 @@ static UINT GetCaptureSelectionLabelRect(const RECT *selection,
     int labelWidth = ScaleCaptureUiValue(dpi, 118);
     int labelHeight = ScaleCaptureUiValue(dpi, 26);
     int gap = ScaleCaptureUiValue(dpi, 8);
+    BOOL inside = selection->top < labelHeight + gap * 2;
 
-    labelRect->left = selection->left;
-    labelRect->top = selection->top >= labelHeight + gap * 2
-        ? selection->top - labelHeight - gap
-        : selection->top + gap;
+    /* Inside the box (near the top of the desktop) the pill keeps the same
+       margin on the left as on the top; above the box it aligns flush with
+       the left edge. */
+    labelRect->left = inside ? selection->left + gap : selection->left;
+    labelRect->top = inside ? selection->top + gap
+                            : selection->top - labelHeight - gap;
     labelRect->right = labelRect->left + labelWidth;
     labelRect->bottom = labelRect->top + labelHeight;
     if (labelRect->right > g_captureWidth) {
@@ -3396,6 +3400,30 @@ static UINT GetCaptureSelectionLabelRect(const RECT *selection,
         OffsetRect(labelRect, 0, g_captureHeight - labelRect->bottom);
     }
     if (labelRect->top < 0) OffsetRect(labelRect, 0, -labelRect->top);
+    return dpi;
+}
+
+/* Round remove pill straddling the middle of a selection's right edge. */
+static UINT GetCaptureSelectionRemoveRect(const RECT *selection,
+                                          RECT *pillRect)
+{
+    POINT anchor = {selection->right, selection->top};
+    UINT dpi = GetCaptureDpiAtPoint(anchor);
+    int diameter = ScaleCaptureUiValue(dpi, 26);
+    int centerY = (selection->top + selection->bottom) / 2;
+
+    pillRect->left = selection->right - diameter / 2;
+    pillRect->top = centerY - diameter / 2;
+    pillRect->right = pillRect->left + diameter;
+    pillRect->bottom = pillRect->top + diameter;
+    if (pillRect->right > g_captureWidth) {
+        OffsetRect(pillRect, g_captureWidth - pillRect->right, 0);
+    }
+    if (pillRect->left < 0) OffsetRect(pillRect, -pillRect->left, 0);
+    if (pillRect->bottom > g_captureHeight) {
+        OffsetRect(pillRect, 0, g_captureHeight - pillRect->bottom);
+    }
+    if (pillRect->top < 0) OffsetRect(pillRect, 0, -pillRect->top);
     return dpi;
 }
 
@@ -3415,7 +3443,10 @@ static void DrawCaptureSelectionEdges(GpGraphics *graphics, GpPen *pen,
     GdipDrawLine(graphics, pen, left, bottom, left, top);
 }
 
-static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
+/* removeState: -1 = no remove pill (in-progress drag), 0 = pill shown,
+   1 = pill shown hovered. */
+static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection,
+                                 int removeState)
 {
     WCHAR dimensions[64];
     RECT labelRect;
@@ -3491,6 +3522,54 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection)
     }
     if (format) GdipDeleteStringFormat(format);
     if (font) GdipDeleteFont(font);
+
+    if (removeState >= 0) {
+        RECT pillRect;
+        UINT pillDpi = GetCaptureSelectionRemoveRect(selection, &pillRect);
+        float pillRadius = (float)(pillRect.bottom - pillRect.top) / 2.0f;
+        float hairline = ScaleCaptureUiFloat(pillDpi, 0.65f);
+        BOOL hoveredPill = removeState == 1;
+        GpPen *crossPen = NULL;
+        float crossHalf = ScaleCaptureUiFloat(pillDpi, 4.5f);
+        float crossWidth = ScaleCaptureUiFloat(pillDpi, 1.6f);
+        float centerX =
+            ((float)pillRect.left + (float)pillRect.right) / 2.0f;
+        float centerY =
+            ((float)pillRect.top + (float)pillRect.bottom) / 2.0f;
+
+        if (hairline < 0.6f) hairline = 0.6f;
+        if (crossWidth < 1.2f) crossWidth = 1.2f;
+        DrawCaptureSoftShadow(graphics, &pillRect, pillRadius, pillDpi,
+                              3, 1.3f, 2, 10);
+        if (hoveredPill) {
+            FillCaptureRoundedRect(graphics, &pillRect, RGB(224, 66, 66),
+                                   235, pillRadius);
+            StrokeCaptureRoundedRect(graphics, &pillRect, RGB(255, 158, 158),
+                                     150, hairline, pillRadius);
+        } else {
+            FillCaptureRoundedRectGradient(graphics, &pillRect,
+                                           CaptureArgb(242, RGB(40, 46, 57)),
+                                           CaptureArgb(242, RGB(21, 25, 32)),
+                                           pillRadius);
+            StrokeCaptureRoundedRect(graphics, &pillRect, RGB(255, 255, 255),
+                                     44, hairline, pillRadius);
+        }
+        if (GdipCreatePen1(CaptureArgb(255, hoveredPill
+                                                ? RGB(255, 255, 255)
+                                                : RGB(226, 233, 241)),
+                           crossWidth, CAPTURE_GDIP_UNIT_PIXEL,
+                           &crossPen) == 0 && crossPen) {
+            GdipSetPenStartCap(crossPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+            GdipSetPenEndCap(crossPen, CAPTURE_GDIP_LINE_CAP_ROUND);
+            GdipDrawLine(graphics, crossPen,
+                         centerX - crossHalf, centerY - crossHalf,
+                         centerX + crossHalf, centerY + crossHalf);
+            GdipDrawLine(graphics, crossPen,
+                         centerX + crossHalf, centerY - crossHalf,
+                         centerX - crossHalf, centerY + crossHalf);
+            GdipDeletePen(crossPen);
+        }
+    }
 }
 
 static void PaintScreenCaptureOverlay(HWND hwnd)
@@ -3548,7 +3627,12 @@ static void PaintScreenCaptureOverlay(HWND hwnd)
             graphics, CAPTURE_GDIP_TEXT_ANTIALIAS_GRID_FIT);
         for (size_t index = 0; index < displayedSelectionCount; index++) {
             if (GetDisplayedCaptureSelection(index, &selection)) {
-                DrawCaptureSelection(graphics, &selection);
+                int removeState = -1;
+                if (index < g_captureSelectionCount) {
+                    removeState =
+                        (int)index == g_captureHoveredRemoval ? 1 : 0;
+                }
+                DrawCaptureSelection(graphics, &selection, removeState);
             }
         }
         for (int panel = 0; panel < g_capturePanelCount; panel++) {
@@ -3617,10 +3701,55 @@ static void RefreshCaptureCopyLabels(HWND hwnd)
 }
 
 static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
+                                           const RECT *selection);
+
+static int HitTestCaptureRemovePills(POINT point)
+{
+    for (size_t i = 0; i < g_captureSelectionCount; i++) {
+        RECT pillRect;
+        GetCaptureSelectionRemoveRect(&g_captureSelections[i], &pillRect);
+        if (PtInRect(&pillRect, point)) return (int)i;
+    }
+    return -1;
+}
+
+static void InvalidateCaptureRemovePill(HWND hwnd, int index)
+{
+    RECT pillRect;
+    UINT dpi;
+    if (index < 0 || (size_t)index >= g_captureSelectionCount) return;
+    dpi = GetCaptureSelectionRemoveRect(&g_captureSelections[index],
+                                        &pillRect);
+    InflateRect(&pillRect, ScaleCaptureUiValue(dpi, 8),
+                ScaleCaptureUiValue(dpi, 8));
+    InvalidateRect(hwnd, &pillRect, FALSE);
+}
+
+static void RemoveCaptureSelectionAt(HWND hwnd, size_t index)
+{
+    RECT dirtyRect = {0};
+    BOOL hasDirty = FALSE;
+
+    if (index >= g_captureSelectionCount) return;
+    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty,
+                                   &g_captureSelections[index]);
+    g_captureSelectionCount--;
+    if (index < g_captureSelectionCount) {
+        memmove(&g_captureSelections[index], &g_captureSelections[index + 1],
+                (g_captureSelectionCount - index) *
+                    sizeof(*g_captureSelections));
+    }
+    g_captureHoveredRemoval = -1;
+    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
+    RefreshCaptureCopyLabels(hwnd);
+}
+
+static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
                                            const RECT *selection)
 {
     RECT area;
     RECT labelRect;
+    RECT pillRect;
     UINT dpi;
 
     if (selection->right - selection->left < 2 ||
@@ -3629,10 +3758,12 @@ static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
     }
     area = *selection;
     dpi = GetCaptureSelectionLabelRect(selection, &labelRect);
+    GetCaptureSelectionRemoveRect(selection, &pillRect);
     InflateRect(&area, ScaleCaptureUiValue(dpi, 4),
                  ScaleCaptureUiValue(dpi, 4));
     UnionRect(&area, &area, &labelRect);
-    /* Margin covers the dimension pill's layered drop shadow. */
+    UnionRect(&area, &area, &pillRect);
+    /* Margin covers the pills' layered drop shadows. */
     InflateRect(&area, ScaleCaptureUiValue(dpi, 8),
                  ScaleCaptureUiValue(dpi, 8));
     if (*hasDirty) {
@@ -3982,12 +4113,15 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         {
             POINT point = GetCaptureCursorPoint(hwnd);
             int panelIndex = -1;
+            int removeIndex = -1;
             int tool = HitTestCaptureToolbar(point, &panelIndex);
             if (tool >= 0) {
                 g_capturePressedPanel = panelIndex;
                 g_capturePressedTool = tool;
                 SetCapture(hwnd);
                 InvalidateCapturePanel(hwnd, panelIndex);
+            } else if ((removeIndex = HitTestCaptureRemovePills(point)) >= 0) {
+                RemoveCaptureSelectionAt(hwnd, (size_t)removeIndex);
             } else if (!IsPointInCapturePanel(point) &&
                        g_captureSelectedTool == CAPTURE_TOOL_CLIP) {
                 BOOL additive = (wParam & MK_SHIFT) != 0;
@@ -4017,6 +4151,15 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 InvalidateCapturePanel(hwnd, oldPanel);
                 if (panelIndex != oldPanel) {
                     InvalidateCapturePanel(hwnd, panelIndex);
+                }
+            }
+            if (!g_captureDragging) {
+                int hoveredRemoval = HitTestCaptureRemovePills(point);
+                if (hoveredRemoval != g_captureHoveredRemoval) {
+                    int oldRemoval = g_captureHoveredRemoval;
+                    g_captureHoveredRemoval = hoveredRemoval;
+                    InvalidateCaptureRemovePill(hwnd, oldRemoval);
+                    InvalidateCaptureRemovePill(hwnd, hoveredRemoval);
                 }
             }
             if (g_captureDragging) {
@@ -4085,9 +4228,13 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         if (LOWORD(lParam) == HTCLIENT) {
             POINT point = GetCaptureCursorPoint(hwnd);
             int tool = HitTestCaptureToolbar(point, NULL);
-            LPCWSTR cursorName = tool >= 0
-                ? IDC_HAND
-                : (IsPointInCapturePanel(point) ? IDC_ARROW : IDC_CROSS);
+            LPCWSTR cursorName;
+            if (tool >= 0 || HitTestCaptureRemovePills(point) >= 0) {
+                cursorName = IDC_HAND;
+            } else {
+                cursorName = IsPointInCapturePanel(point) ? IDC_ARROW
+                                                          : IDC_CROSS;
+            }
             SetCursor(LoadCursor(NULL, cursorName));
             return TRUE;
         }
@@ -4117,6 +4264,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         if (g_captureOverlayHwnd == hwnd) g_captureOverlayHwnd = NULL;
         g_captureHoveredPanel = -1;
         g_captureHoveredTool = -1;
+        g_captureHoveredRemoval = -1;
         ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
         return 0;
@@ -4166,6 +4314,7 @@ static BOOL BeginScreenCapture(void)
     g_capturePressedTool = -1;
     g_captureDragging = FALSE;
     g_captureCopyShowsSelection = FALSE;
+    g_captureHoveredRemoval = -1;
     ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
