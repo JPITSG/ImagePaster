@@ -26,10 +26,36 @@ export interface LogEntry {
   message: string;
 }
 
+export interface HistoryEntry {
+  token: string;
+  current: boolean;
+  width: number;
+  height: number;
+  bytes: number;
+  capturedAt: number;
+  url: string;
+  thumb: string;
+}
+
+export interface HistoryData {
+  pasteMethod: PasteMethod;
+  historyLimit: number;
+  total: number;
+  shown: number;
+  totalBytes: number;
+  entries: HistoryEntry[];
+}
+
+export interface HistoryActionResult {
+  ok: boolean;
+  message?: string;
+}
+
 export interface InitData {
-  view: "config" | "log";
+  view: "config" | "log" | "history";
   config?: ConfigData;
   log?: LogEntry[];
+  history?: HistoryData;
   updateCompletedVersion?: string;
 }
 
@@ -61,6 +87,9 @@ let logUpdateCallback: LogUpdateCallback | null = null;
 let saveResultCallback: SaveResultCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
+let historyActionResultCallback:
+  | ((result: HistoryActionResult) => void)
+  | null = null;
 
 declare global {
   interface Window {
@@ -69,6 +98,7 @@ declare global {
     onSaveResult: (result: { ok: boolean; message?: string }) => void;
     onUpdateResult: (result: UpdateResult) => void;
     onUpdateProgress: (progress: UpdateProgress) => void;
+    onHistoryActionResult: (result: HistoryActionResult) => void;
     chrome?: {
       webview?: {
         postMessage: (s: string) => void;
@@ -95,6 +125,10 @@ window.onUpdateResult = (result) => {
 
 window.onUpdateProgress = (progress) => {
   updateProgressCallback?.(progress);
+};
+
+window.onHistoryActionResult = (result) => {
+  historyActionResultCallback?.(result);
 };
 
 export function onInit(cb: InitCallback) {
@@ -189,6 +223,31 @@ export function clearLog() {
 
 export function copyLog() {
   postMessage({ action: "copyLog" });
+}
+
+export function onHistoryActionResult(
+  cb: (result: HistoryActionResult) => void,
+) {
+  historyActionResultCallback = cb;
+  return () => {
+    if (historyActionResultCallback === cb) historyActionResultCallback = null;
+  };
+}
+
+export function copyHistoryUrl(token: string) {
+  postMessage({ action: "historyCopyUrl", token });
+}
+
+export function saveHistoryImage(token: string) {
+  postMessage({ action: "historySave", token });
+}
+
+export function deleteHistoryImage(token: string) {
+  postMessage({ action: "historyDelete", token });
+}
+
+export function clearHistoryImages() {
+  postMessage({ action: "historyClearAll" });
 }
 
 export function closeDialog() {

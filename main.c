@@ -29,6 +29,7 @@
 #include <iphlpapi.h>
 #include <wincrypt.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -113,6 +114,15 @@ typedef struct {
 GpStatus __stdcall GdiplusStartup(ULONG_PTR *token, const GdiplusStartupInput *input, void *output);
 void     __stdcall GdiplusShutdown(ULONG_PTR token);
 GpStatus __stdcall GdipCreateBitmapFromGdiDib(const BITMAPINFO *gdiBitmapInfo, void *gdiBitmapData, GpBitmap **bitmap);
+GpStatus __stdcall GdipCreateBitmapFromStream(IStream *stream, GpBitmap **bitmap);
+GpStatus __stdcall GdipCreateBitmapFromScan0(INT width, INT height, INT stride,
+                                             INT format, BYTE *scan0,
+                                             GpBitmap **bitmap);
+GpStatus __stdcall GdipGetImageGraphicsContext(GpImage *image,
+                                               GpGraphics **graphics);
+GpStatus __stdcall GdipSetInterpolationMode(GpGraphics *graphics, int mode);
+GpStatus __stdcall GdipDrawImageRectI(GpGraphics *graphics, GpImage *image,
+                                      INT x, INT y, INT width, INT height);
 GpStatus __stdcall GdipGetImageEncodersSize(UINT *numEncoders, UINT *size);
 GpStatus __stdcall GdipGetImageEncoders(UINT numEncoders, UINT size, ImageCodecInfo *encoders);
 GpStatus __stdcall GdipSaveImageToStream(GpImage *image, IStream *stream, const CLSID *clsidEncoder, const void *encoderParams);
@@ -182,8 +192,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.14"
-#define APP_VERSION_W     L"1.0.14"
+#define APP_VERSION_A     "1.0.15"
+#define APP_VERSION_W     L"1.0.15"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -196,6 +206,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define ID_TRAY_LOG       1001
 #define ID_TRAY_CONFIGURE 1002
 #define ID_TRAY_EXIT      1003
+#define ID_TRAY_HISTORY   1004
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define ID_TIMER_HTTP_RECONCILE         1007
 #define ID_TIMER_CLIPBOARD_RETRY        1008
@@ -264,6 +275,14 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define CAPTURE_SEPARATOR_GAP 14
 #define CAPTURE_PANEL_BOTTOM_MARGIN 40
 
+/* History dialog: thumbnails are re-encoded small JPEGs pushed to the
+   WebView as data URIs; the entry list is capped to keep the payload sane. */
+#define HISTORY_VIEW_MAX_ENTRIES   100
+#define HISTORY_THUMB_MAX_DIM      256
+#define HISTORY_THUMB_JPEG_QUALITY 82
+#define HISTORY_THUMB_PIXEL_FORMAT 0x0026200A /* PixelFormat32bppARGB */
+#define GDIP_INTERPOLATION_HIGH_BICUBIC 7
+
 /* ── Log ring buffer ───────────────────────────────────────────────────── */
 
 typedef struct {
@@ -323,6 +342,7 @@ typedef struct {
     char token[IMAGE_TOKEN_HEX_LEN + 1];
     UINT width;
     UINT height;
+    ULONGLONG capturedAtMs; /* Unix epoch milliseconds, UTC */
 } CachedImage;
 
 static CachedImage g_cachedImage = {0};
@@ -700,6 +720,7 @@ static char *Base64Encode(const BYTE *data, DWORD len, DWORD *outLen)
 /* ── Logging (in-memory ring buffer) ───────────────────────────────────── */
 
 static void webview_execute_script(const wchar_t* script);
+static void NotifyHistoryViewChanged(void);
 
 static void LogMessage(const char *fmt, ...)
 {
@@ -979,6 +1000,16 @@ static void ArchiveCurrentImageLocked(void)
     EnforceImageHistoryLimitLocked();
 }
 
+static ULONGLONG GetUnixTimeMs(void)
+{
+    FILETIME fileTime;
+    ULARGE_INTEGER value;
+    GetSystemTimeAsFileTime(&fileTime);
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
+    return (value.QuadPart - 116444736000000000ULL) / 10000ULL;
+}
+
 static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
                                 char *base64Data, DWORD base64Len,
                                 const char *token, UINT width, UINT height)
@@ -992,7 +1023,9 @@ static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
     strncpy(g_cachedImage.token, token, sizeof(g_cachedImage.token) - 1);
     g_cachedImage.width = width;
     g_cachedImage.height = height;
+    g_cachedImage.capturedAtMs = GetUnixTimeMs();
     ReleaseSRWLockExclusive(&g_imageLock);
+    NotifyHistoryViewChanged();
 }
 
 static void ClearCurrentImage(const char *reason)
@@ -1009,6 +1042,7 @@ static void ClearCurrentImage(const char *reason)
     if (hadImage) {
         LogMessage("Current clipboard image cleared: %s (%llu historical retained)",
                    reason, (unsigned long long)retainedCount);
+        NotifyHistoryViewChanged();
     }
 }
 
@@ -1019,6 +1053,7 @@ static size_t SetImageHistoryLimit(int limit)
     g_configImageHistoryLimit = limit;
     evicted = EnforceImageHistoryLimitLocked();
     ReleaseSRWLockExclusive(&g_imageLock);
+    if (evicted > 0) NotifyHistoryViewChanged();
     return evicted;
 }
 
@@ -1048,6 +1083,106 @@ static BOOL HasCachedImage(void)
                 g_cachedImage.jpegData != NULL && g_cachedImage.base64Data != NULL;
     ReleaseSRWLockShared(&g_imageLock);
     return available;
+}
+
+static BOOL AnyRetainedImages(void)
+{
+    BOOL any;
+    AcquireSRWLockShared(&g_imageLock);
+    any = (g_cachedImage.token[0] != '\0' && g_cachedImage.jpegData != NULL) ||
+          g_imageHistoryCount > 0;
+    ReleaseSRWLockShared(&g_imageLock);
+    return any;
+}
+
+/* Copies the JPEG bytes of a retained image (current or historical) so they
+   can be used outside g_imageLock. The caller frees *jpegCopy. */
+static BOOL CopyRetainedImageByToken(const char *token, BYTE **jpegCopy,
+                                     DWORD *jpegSize, ULONGLONG *capturedAtMs)
+{
+    const CachedImage *found = NULL;
+    BOOL success = FALSE;
+
+    *jpegCopy = NULL;
+    *jpegSize = 0;
+    if (capturedAtMs) *capturedAtMs = 0;
+    if (!token || !token[0]) return FALSE;
+
+    AcquireSRWLockShared(&g_imageLock);
+    if (g_cachedImage.token[0] && strcmp(g_cachedImage.token, token) == 0) {
+        found = &g_cachedImage;
+    } else {
+        for (size_t i = 0; i < g_imageHistoryCount; i++) {
+            if (strcmp(g_imageHistory[i].token, token) == 0) {
+                found = &g_imageHistory[i];
+                break;
+            }
+        }
+    }
+    if (found && found->jpegData && found->jpegSize > 0) {
+        BYTE *copy = (BYTE *)malloc(found->jpegSize);
+        if (copy) {
+            memcpy(copy, found->jpegData, found->jpegSize);
+            *jpegCopy = copy;
+            *jpegSize = found->jpegSize;
+            if (capturedAtMs) *capturedAtMs = found->capturedAtMs;
+            success = TRUE;
+        }
+    }
+    ReleaseSRWLockShared(&g_imageLock);
+    return success;
+}
+
+/* Removes a retained image; its URL starts answering 410 Gone. Deleting the
+   current image intentionally leaves nothing to paste until the next copy. */
+static BOOL DeleteRetainedImageByToken(const char *token)
+{
+    BOOL removed = FALSE;
+
+    if (!token || !token[0]) return FALSE;
+    AcquireSRWLockExclusive(&g_imageLock);
+    if (g_cachedImage.token[0] && strcmp(g_cachedImage.token, token) == 0) {
+        RememberGoneTokenLocked(g_cachedImage.token);
+        FreeCachedImageData(&g_cachedImage);
+        removed = TRUE;
+    } else {
+        for (size_t i = 0; i < g_imageHistoryCount; i++) {
+            if (strcmp(g_imageHistory[i].token, token) != 0) continue;
+            RememberGoneTokenLocked(g_imageHistory[i].token);
+            FreeCachedImageData(&g_imageHistory[i]);
+            g_imageHistoryCount--;
+            if (i < g_imageHistoryCount) {
+                memmove(&g_imageHistory[i], &g_imageHistory[i + 1],
+                        (g_imageHistoryCount - i) * sizeof(*g_imageHistory));
+            }
+            ZeroMemory(&g_imageHistory[g_imageHistoryCount],
+                       sizeof(*g_imageHistory));
+            removed = TRUE;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_imageLock);
+    return removed;
+}
+
+static size_t ClearAllRetainedImages(void)
+{
+    size_t removed = 0;
+
+    AcquireSRWLockExclusive(&g_imageLock);
+    if (g_cachedImage.token[0]) {
+        RememberGoneTokenLocked(g_cachedImage.token);
+        FreeCachedImageData(&g_cachedImage);
+        removed++;
+    }
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        RememberGoneTokenLocked(g_imageHistory[i].token);
+        FreeCachedImageData(&g_imageHistory[i]);
+        removed++;
+    }
+    g_imageHistoryCount = 0;
+    ReleaseSRWLockExclusive(&g_imageLock);
+    return removed;
 }
 
 static BOOL RefreshClipboardImageCache(void)
@@ -3893,7 +4028,9 @@ static void UpdateTooltip(void)
 static void CreateContextMenu(void)
 {
     g_hMenu = CreatePopupMenu();
+    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_HISTORY, L"History");
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_LOG, L"Activity Log");
+    AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CONFIGURE, L"Configuration");
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -5755,6 +5892,277 @@ static void webview_push_init_log(void)
     free(logJson);
 }
 
+/* Decodes a retained JPEG and re-encodes a small preview as a data URI the
+   History view can show without any network access. Returns malloc'd text. */
+static char *CreateHistoryThumbnailDataUri(const BYTE *jpegData, DWORD jpegSize)
+{
+    static const char prefix[] = "data:image/jpeg;base64,";
+    IStream *stream = NULL;
+    GpBitmap *source = NULL;
+    GpBitmap *thumbnail = NULL;
+    GpGraphics *graphics = NULL;
+    BYTE *thumbJpeg = NULL;
+    DWORD thumbJpegSize = 0;
+    char *base64 = NULL;
+    DWORD base64Len = 0;
+    char *dataUri = NULL;
+    UINT width = 0;
+    UINT height = 0;
+    INT thumbWidth;
+    INT thumbHeight;
+    ULONG written = 0;
+    LARGE_INTEGER zero;
+
+    if (!jpegData || jpegSize == 0) return NULL;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) return NULL;
+    zero.QuadPart = 0;
+    if (IStream_Write(stream, jpegData, jpegSize, &written) != S_OK ||
+        written != jpegSize ||
+        IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL) != S_OK) {
+        goto cleanup;
+    }
+    if (GdipCreateBitmapFromStream(stream, &source) != 0 || !source) {
+        goto cleanup;
+    }
+    GdipGetImageWidth((GpImage *)source, &width);
+    GdipGetImageHeight((GpImage *)source, &height);
+    if (width == 0 || height == 0) goto cleanup;
+
+    if (width >= height) {
+        thumbWidth = width > HISTORY_THUMB_MAX_DIM
+            ? HISTORY_THUMB_MAX_DIM : (INT)width;
+        thumbHeight = (INT)(((ULONGLONG)height * (ULONGLONG)thumbWidth +
+                             width / 2) / width);
+    } else {
+        thumbHeight = height > HISTORY_THUMB_MAX_DIM
+            ? HISTORY_THUMB_MAX_DIM : (INT)height;
+        thumbWidth = (INT)(((ULONGLONG)width * (ULONGLONG)thumbHeight +
+                            height / 2) / height);
+    }
+    if (thumbWidth < 1) thumbWidth = 1;
+    if (thumbHeight < 1) thumbHeight = 1;
+
+    if (GdipCreateBitmapFromScan0(thumbWidth, thumbHeight, 0,
+                                  HISTORY_THUMB_PIXEL_FORMAT, NULL,
+                                  &thumbnail) != 0 || !thumbnail) {
+        goto cleanup;
+    }
+    if (GdipGetImageGraphicsContext((GpImage *)thumbnail, &graphics) != 0 ||
+        !graphics) {
+        goto cleanup;
+    }
+    GdipSetInterpolationMode(graphics, GDIP_INTERPOLATION_HIGH_BICUBIC);
+    GdipSetPixelOffsetMode(graphics, CAPTURE_GDIP_PIXEL_OFFSET_HIGH_QUALITY);
+    if (GdipDrawImageRectI(graphics, (GpImage *)source, 0, 0,
+                           thumbWidth, thumbHeight) != 0) {
+        goto cleanup;
+    }
+    GdipDeleteGraphics(graphics);
+    graphics = NULL;
+
+    if (!EncodeImageToMemory((GpImage *)thumbnail, L"image/jpeg",
+                             HISTORY_THUMB_JPEG_QUALITY,
+                             &thumbJpeg, &thumbJpegSize)) {
+        goto cleanup;
+    }
+    base64 = Base64Encode(thumbJpeg, thumbJpegSize, &base64Len);
+    if (!base64) goto cleanup;
+    dataUri = (char *)malloc(sizeof(prefix) + base64Len);
+    if (dataUri) {
+        memcpy(dataUri, prefix, sizeof(prefix) - 1);
+        memcpy(dataUri + sizeof(prefix) - 1, base64, base64Len + 1);
+    }
+
+cleanup:
+    free(base64);
+    free(thumbJpeg);
+    if (graphics) GdipDeleteGraphics(graphics);
+    if (thumbnail) GdipDisposeImage((GpImage *)thumbnail);
+    if (source) GdipDisposeImage((GpImage *)source);
+    if (stream) IStream_Release(stream);
+    return dataUri;
+}
+
+static void webview_push_init_history(void)
+{
+    const CachedImage *items[HISTORY_VIEW_MAX_ENTRIES];
+    BOOL currentFlags[HISTORY_VIEW_MAX_ENTRIES];
+    char *thumbs[HISTORY_VIEW_MAX_ENTRIES];
+    size_t shown = 0;
+    size_t total = 0;
+    ULONGLONG totalBytes = 0;
+    size_t scriptCap;
+    wchar_t *script = NULL;
+    size_t pos = 0;
+    BOOL formatted = TRUE;
+    int written;
+
+    if (!g_webviewView) return;
+
+    /* Mutations only happen on this thread, so the shared lock is held for
+       the whole snapshot without risking a self-deadlock. */
+    AcquireSRWLockShared(&g_imageLock);
+
+    if (g_cachedImage.token[0] && g_cachedImage.jpegData) {
+        total++;
+        totalBytes += g_cachedImage.jpegSize;
+        items[shown] = &g_cachedImage;
+        currentFlags[shown] = TRUE;
+        shown++;
+    }
+    for (size_t i = g_imageHistoryCount; i > 0; i--) {
+        const CachedImage *image = &g_imageHistory[i - 1];
+        total++;
+        totalBytes += image->jpegSize;
+        if (shown < HISTORY_VIEW_MAX_ENTRIES) {
+            items[shown] = image;
+            currentFlags[shown] = FALSE;
+            shown++;
+        }
+    }
+
+    scriptCap = 512;
+    for (size_t i = 0; i < shown; i++) {
+        thumbs[i] = CreateHistoryThumbnailDataUri(items[i]->jpegData,
+                                                  items[i]->jpegSize);
+        scriptCap += (thumbs[i] ? strlen(thumbs[i]) : 0) + 512;
+    }
+
+    script = (wchar_t *)malloc(scriptCap * sizeof(wchar_t));
+    if (script) {
+        written = swprintf(script + pos, scriptCap - pos,
+            L"window.onInit({\"view\":\"history\",\"history\":{"
+            L"\"pasteMethod\":\"%s\",\"historyLimit\":%d,"
+            L"\"total\":%I64u,\"shown\":%I64u,\"totalBytes\":%I64u,"
+            L"\"entries\":[",
+            g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
+            g_configImageHistoryLimit,
+            (ULONGLONG)total, (ULONGLONG)shown, totalBytes);
+        if (written < 0) formatted = FALSE; else pos += (size_t)written;
+        for (size_t i = 0; i < shown && formatted; i++) {
+            written = swprintf(script + pos, scriptCap - pos,
+                L"%s{\"token\":\"%hs\",\"current\":%s,"
+                L"\"width\":%u,\"height\":%u,\"bytes\":%lu,"
+                L"\"capturedAt\":%I64u,"
+                L"\"url\":\"http://%hs:%d/%hs.jpg\",\"thumb\":\"%hs\"}",
+                i == 0 ? L"" : L",",
+                items[i]->token,
+                currentFlags[i] ? L"true" : L"false",
+                items[i]->width, items[i]->height,
+                (unsigned long)items[i]->jpegSize,
+                items[i]->capturedAtMs,
+                g_configBindIp, g_configHttpPort, items[i]->token,
+                thumbs[i] ? thumbs[i] : "");
+            if (written < 0) formatted = FALSE; else pos += (size_t)written;
+        }
+        if (formatted) {
+            written = swprintf(script + pos, scriptCap - pos, L"]}})");
+            if (written < 0) formatted = FALSE;
+        }
+    }
+
+    ReleaseSRWLockShared(&g_imageLock);
+
+    if (script) {
+        if (formatted) webview_execute_script(script);
+        free(script);
+    }
+    for (size_t i = 0; i < shown; i++) free(thumbs[i]);
+}
+
+static void NotifyHistoryViewChanged(void)
+{
+    if (g_webviewView && strcmp(g_pendingView, "history") == 0) {
+        webview_push_init_history();
+    }
+}
+
+static void SendHistoryActionResult(BOOL ok, const wchar_t *message)
+{
+    wchar_t escaped[640];
+    wchar_t script[768];
+
+    if (!g_webviewView) return;
+    json_escape_wstring(message, escaped, 640);
+    swprintf(script, 768,
+             L"window.onHistoryActionResult && window.onHistoryActionResult("
+             L"{\"ok\":%s,\"message\":\"%s\"})",
+             ok ? L"true" : L"false", escaped);
+    webview_execute_script(script);
+}
+
+static void SaveHistoryImageToDisk(const char *token)
+{
+    BYTE *jpegData = NULL;
+    DWORD jpegSize = 0;
+    ULONGLONG capturedAtMs = 0;
+    WCHAR filePath[MAX_PATH];
+    OPENFILENAMEW dialog;
+    SYSTEMTIME localTime;
+    BOOL haveTime = FALSE;
+
+    if (!CopyRetainedImageByToken(token, &jpegData, &jpegSize,
+                                  &capturedAtMs)) {
+        SendHistoryActionResult(FALSE,
+            L"This image is no longer retained in memory.");
+        NotifyHistoryViewChanged();
+        return;
+    }
+
+    if (capturedAtMs > 0) {
+        FILETIME utcFile;
+        FILETIME localFile;
+        ULARGE_INTEGER value;
+        value.QuadPart = capturedAtMs * 10000ULL + 116444736000000000ULL;
+        utcFile.dwLowDateTime = value.LowPart;
+        utcFile.dwHighDateTime = value.HighPart;
+        haveTime = FileTimeToLocalFileTime(&utcFile, &localFile) &&
+                   FileTimeToSystemTime(&localFile, &localTime);
+    }
+    if (haveTime) {
+        swprintf(filePath, MAX_PATH,
+                 L"ImagePaster-%04u%02u%02u-%02u%02u%02u.jpg",
+                 localTime.wYear, localTime.wMonth, localTime.wDay,
+                 localTime.wHour, localTime.wMinute, localTime.wSecond);
+    } else {
+        wcscpy(filePath, L"ImagePaster-image.jpg");
+    }
+
+    ZeroMemory(&dialog, sizeof(dialog));
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = g_webviewHwnd;
+    dialog.lpstrFilter = L"JPEG image (*.jpg)\0*.jpg\0All files (*.*)\0*.*\0";
+    dialog.lpstrFile = filePath;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.lpstrDefExt = L"jpg";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetSaveFileNameW(&dialog)) {
+        HANDLE file = CreateFileW(filePath, GENERIC_WRITE, 0, NULL,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD bytesWritten = 0;
+            BOOL wrote = WriteFile(file, jpegData, jpegSize,
+                                   &bytesWritten, NULL) &&
+                         bytesWritten == jpegSize;
+            CloseHandle(file);
+            if (wrote) {
+                wchar_t message[MAX_PATH + 32];
+                swprintf(message, MAX_PATH + 32, L"Saved to %s", filePath);
+                LogMessage("History image %.12s... saved to disk", token);
+                SendHistoryActionResult(TRUE, message);
+            } else {
+                DeleteFileW(filePath);
+                SendHistoryActionResult(FALSE,
+                    L"The file could not be written.");
+            }
+        } else {
+            SendHistoryActionResult(FALSE, L"The file could not be created.");
+        }
+    }
+    free(jpegData);
+}
+
 /* ── COM callback handler implementations ────────────────────────────── */
 
 static HRESULT STDMETHODCALLTYPE EnvCompleted_Invoke(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*, HRESULT, ICoreWebView2Environment*);
@@ -5896,6 +6304,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             webview_push_init_config();
         } else if (strcmp(g_pendingView, "log") == 0) {
             webview_push_init_log();
+        } else if (strcmp(g_pendingView, "history") == 0) {
+            webview_push_init_history();
         }
     } else if (strcmp(action, "configReady") == 0) {
         if (IsConfigurationViewOpen()) {
@@ -6072,6 +6482,45 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         webview_execute_script(L"window.onInit && window.onInit({\"view\":\"log\",\"log\":[]})");
     } else if (strcmp(action, "copyLog") == 0) {
         CopyActivityLogToClipboard();
+    } else if (strcmp(action, "historyCopyUrl") == 0) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+        char url[192];
+        int urlWritten;
+        json_get_string(msg, "token", token, sizeof(token));
+        urlWritten = snprintf(url, sizeof(url), "http://%s:%d/%s.jpg",
+                              g_configBindIp, g_configHttpPort, token);
+        if (token[0] && urlWritten > 0 && urlWritten < (int)sizeof(url) &&
+            PlaceUtf8TextOnClipboard(url, TRUE)) {
+            LogMessage("History image URL copied to clipboard (id %.12s...)",
+                       token);
+            SendHistoryActionResult(TRUE, L"Image URL copied to the clipboard.");
+        } else {
+            SendHistoryActionResult(FALSE, L"The URL could not be copied.");
+        }
+    } else if (strcmp(action, "historySave") == 0) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+        json_get_string(msg, "token", token, sizeof(token));
+        SaveHistoryImageToDisk(token);
+    } else if (strcmp(action, "historyDelete") == 0) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+        json_get_string(msg, "token", token, sizeof(token));
+        if (DeleteRetainedImageByToken(token)) {
+            LogMessage("History image %.12s... removed by user", token);
+            SendHistoryActionResult(TRUE, L"Image removed from memory.");
+        } else {
+            SendHistoryActionResult(FALSE,
+                L"This image is no longer retained in memory.");
+        }
+        NotifyHistoryViewChanged();
+    } else if (strcmp(action, "historyClearAll") == 0) {
+        size_t removed = ClearAllRetainedImages();
+        wchar_t message[80];
+        LogMessage("History cleared by user (%llu image(s) discarded)",
+                   (unsigned long long)removed);
+        swprintf(message, 80, L"Removed %I64u image%s from memory.",
+                 (ULONGLONG)removed, removed == 1 ? L"" : L"s");
+        SendHistoryActionResult(TRUE, message);
+        NotifyHistoryViewChanged();
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0;
         json_get_int(msg, "height", &contentHeight);
@@ -6251,6 +6700,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
 
     const wchar_t *title = L"Configuration";
     if (strcmp(view, "log") == 0) title = L"Activity Log";
+    else if (strcmp(view, "history") == 0) title = L"Image History";
 
     RECT workArea;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
@@ -6313,6 +6763,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
+            EnableMenuItem(g_hMenu, ID_TRAY_HISTORY,
+                           (g_webviewHwnd || !AnyRetainedImages())
+                               ? MF_GRAYED : MF_ENABLED);
             EnableMenuItem(g_hMenu, ID_TRAY_LOG, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
             EnableMenuItem(g_hMenu, ID_TRAY_CONFIGURE, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
             TrackPopupMenu(g_hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
@@ -6321,6 +6774,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
+        case ID_TRAY_HISTORY:
+            LogMessage("Opening History dialog");
+            ShowWebViewDialog("history", 640, 560);
+            break;
         case ID_TRAY_LOG:
             LogMessage("Opening Activity Log dialog");
             ShowWebViewDialog("log", 700, 500);

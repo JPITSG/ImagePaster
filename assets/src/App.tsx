@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { onInit, getInit, reportHeight, type InitData } from "./lib/bridge";
 import ConfigView from "./ConfigView";
+import HistoryView from "./HistoryView";
 import LogView from "./LogView";
 
 export default function App() {
@@ -36,6 +37,8 @@ export default function App() {
           config={initData.config!}
           updateCompletedVersion={initData.updateCompletedVersion ?? ""}
         />
+      ) : initData.view === "history" ? (
+        <HistoryView history={initData.history!} />
       ) : (
         <LogView initialLog={initData.log ?? []} />
       )}
