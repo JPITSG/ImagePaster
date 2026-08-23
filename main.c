@@ -116,6 +116,7 @@ GpStatus __stdcall GdiplusStartup(ULONG_PTR *token, const GdiplusStartupInput *i
 void     __stdcall GdiplusShutdown(ULONG_PTR token);
 GpStatus __stdcall GdipCreateBitmapFromGdiDib(const BITMAPINFO *gdiBitmapInfo, void *gdiBitmapData, GpBitmap **bitmap);
 GpStatus __stdcall GdipCreateBitmapFromStream(IStream *stream, GpBitmap **bitmap);
+GpStatus __stdcall GdipLoadImageFromFile(const WCHAR *filename, GpImage **image);
 GpStatus __stdcall GdipCreateBitmapFromScan0(INT width, INT height, INT stride,
                                              INT format, BYTE *scan0,
                                              GpBitmap **bitmap);
@@ -193,8 +194,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.30"
-#define APP_VERSION_W     L"1.0.30"
+#define APP_VERSION_A     "1.0.31"
+#define APP_VERSION_W     L"1.0.31"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -264,6 +265,10 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define IMAGE_STORAGE_MEMORY 0
 #define IMAGE_STORAGE_DISK   1
 #define IMAGE_STORAGE_DIR_NAME L"ImagePaster"
+#define IMAGE_HISTORY_INDEX_NAME L"history-v1.dat"
+#define IMAGE_HISTORY_INDEX_TEMP_NAME L"history-v1.tmp"
+#define IMAGE_HISTORY_INDEX_MAGIC "IPIDX001"
+#define MAX_DISK_HISTORY_INDEX_RECORDS 1000000u
 #define HTTP_EVENT_SERVED   200
 #define HTTP_EVENT_GONE     410
 #define HTTP_EVENT_NOT_FOUND 404
@@ -361,11 +366,35 @@ typedef struct {
     WCHAR *diskPath; /* malloc'd file path when stored on disk, else NULL */
 } CachedImage;
 
+#pragma pack(push, 1)
+typedef struct {
+    char magic[8];
+    DWORD recordCount;
+} DiskHistoryIndexHeader;
+
+typedef struct {
+    char token[IMAGE_TOKEN_HEX_LEN + 1];
+    DWORD width;
+    DWORD height;
+    DWORD jpegSize;
+    ULONGLONG capturedAtMs;
+    BYTE isCurrent;
+    BYTE reserved[7];
+} DiskHistoryIndexRecord;
+#pragma pack(pop)
+
+typedef struct {
+    CachedImage image;
+    BOOL isCurrent;
+} LoadedDiskImage;
+
 static CachedImage g_cachedImage = {0};
 static CachedImage *g_imageHistory = NULL; /* oldest to newest */
 static size_t g_imageHistoryCount = 0;
 static size_t g_imageHistoryCapacity = 0;
 static SRWLOCK g_imageLock = SRWLOCK_INIT;
+static BOOL g_diskHistoryCatalogLoaded = FALSE;
+static BOOL g_restoredDiskCurrentNeedsClipboardCheck = FALSE;
 static char (*g_goneTokens)[IMAGE_TOKEN_HEX_LEN + 1] = NULL;
 static size_t g_goneTokenCount = 0;
 static size_t g_goneTokenCapacity = 0;
@@ -727,6 +756,8 @@ static void StopHttpServer(void);
 static BOOL RefreshClipboardImageCache(void);
 static void ClearCurrentImage(const char *reason);
 static void DestroyImageCache(void);
+static void PersistDiskHistoryIndex(void);
+static size_t LoadPersistedDiskHistory(void);
 static BOOL BeginScreenCapture(void);
 static BOOL CompleteScreenCapture(BOOL forceFullDesktop);
 static void CancelScreenCapture(const char *reason);
@@ -967,25 +998,148 @@ static void RememberGoneTokenLocked(const char *token)
 static BOOL BuildImageStorageDirectoryPath(WCHAR directory[MAX_PATH])
 {
     WCHAR base[MAX_PATH];
+    int written;
     if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL,
                                 SHGFP_TYPE_CURRENT, base))) {
         return FALSE;
     }
-    return swprintf(directory, MAX_PATH, L"%s\\%s", base,
-                    IMAGE_STORAGE_DIR_NAME) > 0;
+    written = swprintf(directory, MAX_PATH, L"%s\\%s", base,
+                       IMAGE_STORAGE_DIR_NAME);
+    return written > 0 && written < MAX_PATH;
 }
 
 static BOOL EnsureImageStorageDirectory(WCHAR directory[MAX_PATH])
 {
     if (!BuildImageStorageDirectoryPath(directory)) {
-        LogMessage("WARNING: Could not resolve %%LOCALAPPDATA%% for disk image storage; keeping image in memory");
+        LogMessage("WARNING: Could not resolve %%LOCALAPPDATA%% for disk image storage");
         return FALSE;
     }
     if (!CreateDirectoryW(directory, NULL) &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
-        LogMessage("WARNING: Could not create disk image storage directory (error %lu); keeping image in memory",
+        LogMessage("WARNING: Could not create disk image storage directory (error %lu)",
                    GetLastError());
         return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL BuildImageStorageFilePath(const WCHAR *directory,
+                                      const WCHAR *fileName,
+                                      WCHAR path[MAX_PATH])
+{
+    int written;
+    if (!directory || !directory[0] || !fileName || !fileName[0]) {
+        return FALSE;
+    }
+    written = swprintf(path, MAX_PATH, L"%s\\%s", directory, fileName);
+    return written > 0 && written < MAX_PATH;
+}
+
+static BOOL IsValidImageToken(const char *token)
+{
+    if (!token || strlen(token) != IMAGE_TOKEN_HEX_LEN) return FALSE;
+    for (int i = 0; i < IMAGE_TOKEN_HEX_LEN; i++) {
+        char c = token[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL ParseDiskImageFileName(
+    const WCHAR *fileName, char token[IMAGE_TOKEN_HEX_LEN + 1])
+{
+    size_t length;
+    if (!fileName || !token) return FALSE;
+    length = wcslen(fileName);
+    if (length != IMAGE_TOKEN_HEX_LEN + 4 ||
+        _wcsicmp(fileName + IMAGE_TOKEN_HEX_LEN, L".jpg") != 0) {
+        return FALSE;
+    }
+    for (int i = 0; i < IMAGE_TOKEN_HEX_LEN; i++) {
+        WCHAR c = fileName[i];
+        if (c >= L'A' && c <= L'F') c = c - L'A' + L'a';
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) {
+            return FALSE;
+        }
+        token[i] = (char)c;
+    }
+    token[IMAGE_TOKEN_HEX_LEN] = '\0';
+    return TRUE;
+}
+
+static ULONGLONG FileTimeToUnixTimeMs(const FILETIME *fileTime)
+{
+    ULARGE_INTEGER value;
+    if (!fileTime) return 0;
+    value.LowPart = fileTime->dwLowDateTime;
+    value.HighPart = fileTime->dwHighDateTime;
+    if (value.QuadPart < 116444736000000000ULL) return 0;
+    return (value.QuadPart - 116444736000000000ULL) / 10000ULL;
+}
+
+static BOOL GetDiskImageMetadata(const WCHAR *path, DWORD *jpegSize,
+                                 UINT *width, UINT *height,
+                                 ULONGLONG *capturedAtMs)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    GpImage *image = NULL;
+    UINT imageWidth = 0;
+    UINT imageHeight = 0;
+    const FILETIME *captureTime;
+
+    if (!path || !jpegSize || !width || !height || !capturedAtMs ||
+        !GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
+        (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        attributes.nFileSizeHigh != 0 || attributes.nFileSizeLow == 0) {
+        return FALSE;
+    }
+    if (GdipLoadImageFromFile(path, &image) != 0 || !image ||
+        GdipGetImageWidth(image, &imageWidth) != 0 ||
+        GdipGetImageHeight(image, &imageHeight) != 0 ||
+        imageWidth == 0 || imageHeight == 0) {
+        if (image) GdipDisposeImage(image);
+        return FALSE;
+    }
+    GdipDisposeImage(image);
+
+    captureTime = (attributes.ftCreationTime.dwLowDateTime ||
+                   attributes.ftCreationTime.dwHighDateTime)
+        ? &attributes.ftCreationTime : &attributes.ftLastWriteTime;
+    *jpegSize = attributes.nFileSizeLow;
+    *width = imageWidth;
+    *height = imageHeight;
+    *capturedAtMs = FileTimeToUnixTimeMs(captureTime);
+    return TRUE;
+}
+
+static BOOL ReadFileFully(HANDLE file, void *buffer, DWORD bytes)
+{
+    BYTE *next = (BYTE *)buffer;
+    DWORD total = 0;
+    while (total < bytes) {
+        DWORD readNow = 0;
+        if (!ReadFile(file, next + total, bytes - total, &readNow, NULL) ||
+            readNow == 0) {
+            return FALSE;
+        }
+        total += readNow;
+    }
+    return TRUE;
+}
+
+static BOOL WriteFileFully(HANDLE file, const void *buffer, DWORD bytes)
+{
+    const BYTE *next = (const BYTE *)buffer;
+    DWORD total = 0;
+    while (total < bytes) {
+        DWORD writtenNow = 0;
+        if (!WriteFile(file, next + total, bytes - total,
+                       &writtenNow, NULL) || writtenNow == 0) {
+            return FALSE;
+        }
+        total += writtenNow;
     }
     return TRUE;
 }
@@ -1112,12 +1266,41 @@ static size_t HistoricalImageLimitLocked(void)
     return (size_t)(g_configImageHistoryLimit - 1);
 }
 
+/* Caller must hold g_imageLock exclusively. Transfers image ownership into
+   the oldest-to-newest history array without enforcing its configured limit. */
+static BOOL AppendHistoricalImageLocked(CachedImage *image)
+{
+    size_t newCapacity;
+    void *expanded;
+
+    if (!image || !image->token[0] ||
+        (!image->jpegData && !image->diskPath)) {
+        return FALSE;
+    }
+    if (g_imageHistoryCount == g_imageHistoryCapacity) {
+        newCapacity = g_imageHistoryCapacity
+            ? g_imageHistoryCapacity * 2 : 8;
+        if (newCapacity < g_imageHistoryCapacity ||
+            newCapacity > (size_t)-1 / sizeof(*g_imageHistory)) {
+            return FALSE;
+        }
+        expanded = realloc(g_imageHistory,
+                           newCapacity * sizeof(*g_imageHistory));
+        if (!expanded) return FALSE;
+        g_imageHistory = expanded;
+        g_imageHistoryCapacity = newCapacity;
+    }
+    g_imageHistory[g_imageHistoryCount++] = *image;
+    ZeroMemory(image, sizeof(*image));
+    return TRUE;
+}
+
 /* Caller must hold g_imageLock exclusively. */
-static void EvictOldestHistoricalImageLocked(void)
+static void EvictOldestHistoricalImageLockedEx(BOOL deleteFile)
 {
     if (g_imageHistoryCount == 0) return;
     RememberGoneTokenLocked(g_imageHistory[0].token);
-    FreeCachedImageData(&g_imageHistory[0]);
+    FreeCachedImageDataEx(&g_imageHistory[0], deleteFile);
     g_imageHistoryCount--;
     if (g_imageHistoryCount > 0) {
         memmove(&g_imageHistory[0], &g_imageHistory[1],
@@ -1126,16 +1309,26 @@ static void EvictOldestHistoricalImageLocked(void)
     ZeroMemory(&g_imageHistory[g_imageHistoryCount], sizeof(*g_imageHistory));
 }
 
+static void EvictOldestHistoricalImageLocked(void)
+{
+    EvictOldestHistoricalImageLockedEx(TRUE);
+}
+
 /* Caller must hold g_imageLock exclusively. */
-static size_t EnforceImageHistoryLimitLocked(void)
+static size_t EnforceImageHistoryLimitLockedEx(BOOL deleteFiles)
 {
     size_t evicted = 0;
     size_t limit = HistoricalImageLimitLocked();
     while (g_imageHistoryCount > limit) {
-        EvictOldestHistoricalImageLocked();
+        EvictOldestHistoricalImageLockedEx(deleteFiles);
         evicted++;
     }
     return evicted;
+}
+
+static size_t EnforceImageHistoryLimitLocked(void)
+{
+    return EnforceImageHistoryLimitLockedEx(TRUE);
 }
 
 /* Caller must hold g_imageLock exclusively. Transfers the current JPEG into
@@ -1143,8 +1336,6 @@ static size_t EnforceImageHistoryLimitLocked(void)
 static void ArchiveCurrentImageLocked(void)
 {
     CachedImage archived;
-    size_t newCapacity;
-    void *expanded;
 
     if (!g_cachedImage.token[0]) {
         FreeCachedImageData(&g_cachedImage);
@@ -1164,26 +1355,11 @@ static void ArchiveCurrentImageLocked(void)
         return;
     }
 
-    if (g_imageHistoryCount == g_imageHistoryCapacity) {
-        newCapacity = g_imageHistoryCapacity ? g_imageHistoryCapacity * 2 : 8;
-        if (newCapacity < g_imageHistoryCapacity ||
-            newCapacity > (size_t)-1 / sizeof(*g_imageHistory)) {
-            RememberGoneTokenLocked(archived.token);
-            FreeCachedImageData(&archived);
-            return;
-        }
-        expanded = realloc(g_imageHistory,
-                           newCapacity * sizeof(*g_imageHistory));
-        if (!expanded) {
-            RememberGoneTokenLocked(archived.token);
-            FreeCachedImageData(&archived);
-            return;
-        }
-        g_imageHistory = expanded;
-        g_imageHistoryCapacity = newCapacity;
+    if (!AppendHistoricalImageLocked(&archived)) {
+        RememberGoneTokenLocked(archived.token);
+        FreeCachedImageData(&archived);
+        return;
     }
-
-    g_imageHistory[g_imageHistoryCount++] = archived;
     EnforceImageHistoryLimitLocked();
 }
 
@@ -1195,6 +1371,458 @@ static ULONGLONG GetUnixTimeMs(void)
     value.LowPart = fileTime.dwLowDateTime;
     value.HighPart = fileTime.dwHighDateTime;
     return (value.QuadPart - 116444736000000000ULL) / 10000ULL;
+}
+
+static BOOL BuildTokenImagePath(
+    const WCHAR *directory, const char *token, WCHAR path[MAX_PATH])
+{
+    WCHAR fileName[IMAGE_TOKEN_HEX_LEN + 5];
+    if (!IsValidImageToken(token) ||
+        swprintf(fileName, IMAGE_TOKEN_HEX_LEN + 5,
+                 L"%hs.jpg", token) <= 0) {
+        return FALSE;
+    }
+    return BuildImageStorageFilePath(directory, fileName, path);
+}
+
+static int CompareCachedImagesByCaptureTime(const void *left,
+                                            const void *right)
+{
+    const CachedImage *a = (const CachedImage *)left;
+    const CachedImage *b = (const CachedImage *)right;
+    if (a->capturedAtMs < b->capturedAtMs) return -1;
+    if (a->capturedAtMs > b->capturedAtMs) return 1;
+    return strcmp(a->token, b->token);
+}
+
+static int CompareLoadedDiskImagesByCaptureTime(const void *left,
+                                                const void *right)
+{
+    const LoadedDiskImage *a = (const LoadedDiskImage *)left;
+    const LoadedDiskImage *b = (const LoadedDiskImage *)right;
+    return CompareCachedImagesByCaptureTime(&a->image, &b->image);
+}
+
+static BOOL RetainedImageTokenExistsLocked(const char *token)
+{
+    if (g_cachedImage.token[0] &&
+        strcmp(g_cachedImage.token, token) == 0) {
+        return TRUE;
+    }
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        if (strcmp(g_imageHistory[i].token, token) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL LoadedDiskImageTokenExists(const LoadedDiskImage *images,
+                                       size_t count, const char *token)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(images[i].image.token, token) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL AppendLoadedDiskImage(LoadedDiskImage **images, size_t *count,
+                                  size_t *capacity,
+                                  LoadedDiskImage *candidate)
+{
+    size_t newCapacity;
+    void *expanded;
+    if (*count == *capacity) {
+        newCapacity = *capacity ? *capacity * 2 : 16;
+        if (newCapacity < *capacity ||
+            newCapacity > (size_t)-1 / sizeof(**images)) {
+            return FALSE;
+        }
+        expanded = realloc(*images, newCapacity * sizeof(**images));
+        if (!expanded) return FALSE;
+        *images = (LoadedDiskImage *)expanded;
+        *capacity = newCapacity;
+    }
+    (*images)[(*count)++] = *candidate;
+    ZeroMemory(candidate, sizeof(*candidate));
+    return TRUE;
+}
+
+static void FreeLoadedDiskImages(LoadedDiskImage *images, size_t count)
+{
+    if (!images) return;
+    for (size_t i = 0; i < count; i++) {
+        FreeCachedImageDataEx(&images[i].image, FALSE);
+    }
+    free(images);
+}
+
+static BOOL CreateLoadedDiskImage(const WCHAR *directory, const char *token,
+                                  ULONGLONG indexedCaptureTime,
+                                  BOOL isCurrent,
+                                  LoadedDiskImage *loaded)
+{
+    WCHAR path[MAX_PATH];
+    DWORD jpegSize = 0;
+    UINT width = 0;
+    UINT height = 0;
+    ULONGLONG fileCaptureTime = 0;
+
+    ZeroMemory(loaded, sizeof(*loaded));
+    if (!BuildTokenImagePath(directory, token, path) ||
+        !GetDiskImageMetadata(path, &jpegSize, &width, &height,
+                              &fileCaptureTime)) {
+        return FALSE;
+    }
+    loaded->image.diskPath = _wcsdup(path);
+    if (!loaded->image.diskPath) return FALSE;
+    strncpy(loaded->image.token, token, sizeof(loaded->image.token) - 1);
+    loaded->image.jpegSize = jpegSize;
+    loaded->image.width = width;
+    loaded->image.height = height;
+    loaded->image.capturedAtMs = indexedCaptureTime
+        ? indexedCaptureTime : fileCaptureTime;
+    loaded->isCurrent = isCurrent;
+    return TRUE;
+}
+
+static BOOL ReadDiskHistoryIndex(const WCHAR *directory,
+                                 LoadedDiskImage **images,
+                                 size_t *count, BOOL *indexFound)
+{
+    WCHAR indexPath[MAX_PATH];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    LARGE_INTEGER fileSize;
+    DiskHistoryIndexHeader header;
+    size_t capacity = 0;
+    BOOL valid = FALSE;
+
+    *images = NULL;
+    *count = 0;
+    *indexFound = FALSE;
+    if (!BuildImageStorageFilePath(directory, IMAGE_HISTORY_INDEX_NAME,
+                                   indexPath)) {
+        return FALSE;
+    }
+    file = CreateFileW(indexPath, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    *indexFound = TRUE;
+
+    if (!GetFileSizeEx(file, &fileSize) ||
+        fileSize.QuadPart < (LONGLONG)sizeof(header) ||
+        !ReadFileFully(file, &header, sizeof(header)) ||
+        memcmp(header.magic, IMAGE_HISTORY_INDEX_MAGIC,
+               sizeof(header.magic)) != 0 ||
+        header.recordCount > MAX_DISK_HISTORY_INDEX_RECORDS ||
+        fileSize.QuadPart !=
+            (LONGLONG)sizeof(header) +
+            (LONGLONG)header.recordCount *
+                (LONGLONG)sizeof(DiskHistoryIndexRecord)) {
+        goto cleanup;
+    }
+
+    for (DWORD i = 0; i < header.recordCount; i++) {
+        DiskHistoryIndexRecord record;
+        LoadedDiskImage loaded;
+        if (!ReadFileFully(file, &record, sizeof(record))) goto cleanup;
+        if (record.token[IMAGE_TOKEN_HEX_LEN] != '\0' ||
+            !IsValidImageToken(record.token) || record.isCurrent > 1 ||
+            LoadedDiskImageTokenExists(*images, *count, record.token)) {
+            continue;
+        }
+        if (!CreateLoadedDiskImage(directory, record.token,
+                                   record.capturedAtMs,
+                                   record.isCurrent != 0, &loaded)) {
+            continue;
+        }
+        if (!AppendLoadedDiskImage(images, count, &capacity, &loaded)) {
+            FreeCachedImageDataEx(&loaded.image, FALSE);
+            goto cleanup;
+        }
+    }
+    valid = TRUE;
+
+cleanup:
+    CloseHandle(file);
+    if (!valid) {
+        FreeLoadedDiskImages(*images, *count);
+        *images = NULL;
+        *count = 0;
+    }
+    return valid;
+}
+
+static BOOL ScanLegacyDiskHistory(const WCHAR *directory,
+                                  LoadedDiskImage **images, size_t *count)
+{
+    WCHAR pattern[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE search;
+    size_t capacity = 0;
+
+    *images = NULL;
+    *count = 0;
+    if (!BuildImageStorageFilePath(directory, L"*.jpg", pattern)) {
+        return FALSE;
+    }
+    search = FindFirstFileW(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        DWORD errorCode = GetLastError();
+        return errorCode == ERROR_FILE_NOT_FOUND ||
+               errorCode == ERROR_PATH_NOT_FOUND;
+    }
+    do {
+        char token[IMAGE_TOKEN_HEX_LEN + 1];
+        LoadedDiskImage loaded;
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            !ParseDiskImageFileName(found.cFileName, token) ||
+            LoadedDiskImageTokenExists(*images, *count, token) ||
+            !CreateLoadedDiskImage(directory, token, 0, FALSE, &loaded)) {
+            continue;
+        }
+        if (!AppendLoadedDiskImage(images, count, &capacity, &loaded)) {
+            FreeCachedImageDataEx(&loaded.image, FALSE);
+            FindClose(search);
+            FreeLoadedDiskImages(*images, *count);
+            *images = NULL;
+            *count = 0;
+            return FALSE;
+        }
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+
+    if (*count > 1) {
+        qsort(*images, *count, sizeof(**images),
+              CompareLoadedDiskImagesByCaptureTime);
+    }
+    if (*count > 0) (*images)[*count - 1].isCurrent = TRUE;
+    return TRUE;
+}
+
+static void FillDiskHistoryRecord(DiskHistoryIndexRecord *record,
+                                  const CachedImage *image, BOOL isCurrent)
+{
+    ZeroMemory(record, sizeof(*record));
+    strncpy(record->token, image->token, sizeof(record->token) - 1);
+    record->width = image->width;
+    record->height = image->height;
+    record->jpegSize = image->jpegSize;
+    record->capturedAtMs = image->capturedAtMs;
+    record->isCurrent = isCurrent ? 1 : 0;
+}
+
+/* A stale index is worse than no index: without one, the next launch safely
+   reconstructs the catalog from the token-named JPEG files. */
+static void InvalidateDiskHistoryIndex(const WCHAR *indexPath)
+{
+    if (!DeleteFileW(indexPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        LogMessage("WARNING: Could not invalidate the stale disk image history index (error %lu)",
+                   GetLastError());
+    }
+}
+
+static void PersistDiskHistoryIndex(void)
+{
+    WCHAR directory[MAX_PATH];
+    WCHAR indexPath[MAX_PATH];
+    WCHAR tempPath[MAX_PATH];
+    DiskHistoryIndexHeader header;
+    DiskHistoryIndexRecord *records = NULL;
+    size_t recordCount = 0;
+    size_t position = 0;
+    HANDLE file;
+    BOOL wrote;
+    DWORD errorCode;
+
+    if (!g_diskHistoryCatalogLoaded) return;
+
+    AcquireSRWLockShared(&g_imageLock);
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        if (g_imageHistory[i].diskPath &&
+            IsValidImageToken(g_imageHistory[i].token)) {
+            recordCount++;
+        }
+    }
+    if (g_cachedImage.diskPath && IsValidImageToken(g_cachedImage.token)) {
+        recordCount++;
+    }
+    if (recordCount > MAX_DISK_HISTORY_INDEX_RECORDS) {
+        ReleaseSRWLockShared(&g_imageLock);
+        LogMessage("WARNING: Disk image history is too large to persist its index");
+        return;
+    }
+    if (recordCount > 0) {
+        records = (DiskHistoryIndexRecord *)calloc(
+            recordCount, sizeof(*records));
+        if (!records) {
+            ReleaseSRWLockShared(&g_imageLock);
+            LogMessage("WARNING: Could not allocate the disk image history index");
+            return;
+        }
+    }
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        if (!g_imageHistory[i].diskPath ||
+            !IsValidImageToken(g_imageHistory[i].token)) {
+            continue;
+        }
+        FillDiskHistoryRecord(&records[position++], &g_imageHistory[i], FALSE);
+    }
+    if (g_cachedImage.diskPath && IsValidImageToken(g_cachedImage.token)) {
+        FillDiskHistoryRecord(&records[position++], &g_cachedImage, TRUE);
+    }
+    ReleaseSRWLockShared(&g_imageLock);
+
+    if (!EnsureImageStorageDirectory(directory) ||
+        !BuildImageStorageFilePath(directory, IMAGE_HISTORY_INDEX_NAME,
+                                   indexPath) ||
+        !BuildImageStorageFilePath(directory, IMAGE_HISTORY_INDEX_TEMP_NAME,
+                                   tempPath)) {
+        free(records);
+        return;
+    }
+
+    file = CreateFileW(tempPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        LogMessage("WARNING: Could not create the disk image history index (error %lu)",
+                   GetLastError());
+        InvalidateDiskHistoryIndex(indexPath);
+        free(records);
+        return;
+    }
+    ZeroMemory(&header, sizeof(header));
+    memcpy(header.magic, IMAGE_HISTORY_INDEX_MAGIC, sizeof(header.magic));
+    header.recordCount = (DWORD)recordCount;
+    wrote = WriteFileFully(file, &header, sizeof(header)) &&
+            (recordCount == 0 ||
+             WriteFileFully(file, records,
+                            (DWORD)(recordCount * sizeof(*records)))) &&
+            FlushFileBuffers(file);
+    errorCode = wrote ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    free(records);
+
+    if (!wrote ||
+        !MoveFileExW(tempPath, indexPath,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (wrote) errorCode = GetLastError();
+        DeleteFileW(tempPath);
+        InvalidateDiskHistoryIndex(indexPath);
+        LogMessage("WARNING: Could not update the disk image history index (error %lu)",
+                   errorCode);
+    }
+}
+
+static size_t LoadPersistedDiskHistory(void)
+{
+    WCHAR directory[MAX_PATH];
+    LoadedDiskImage *loaded = NULL;
+    size_t loadedCount = 0;
+    size_t restoredCount = 0;
+    size_t evicted = 0;
+    size_t currentIndex = (size_t)-1;
+    BOOL indexFound = FALSE;
+    BOOL indexValid;
+    BOOL recoveredLegacy = FALSE;
+
+    if (g_diskHistoryCatalogLoaded ||
+        g_configImageStorage != IMAGE_STORAGE_DISK) {
+        return 0;
+    }
+    g_diskHistoryCatalogLoaded = TRUE;
+    if (!BuildImageStorageDirectoryPath(directory)) {
+        LogMessage("WARNING: Could not resolve disk image history location");
+        return 0;
+    }
+
+    indexValid = ReadDiskHistoryIndex(directory, &loaded, &loadedCount,
+                                      &indexFound);
+    if (!indexValid) {
+        if (indexFound) {
+            LogMessage("WARNING: Disk image history index is invalid; rebuilding it from JPEG files");
+        }
+        if (!ScanLegacyDiskHistory(directory, &loaded, &loadedCount)) {
+            LogMessage("WARNING: Could not scan the disk image history folder");
+            return 0;
+        }
+        recoveredLegacy = loadedCount > 0;
+    }
+
+    for (size_t i = 0; i < loadedCount; i++) {
+        if (loaded[i].isCurrent) currentIndex = i;
+    }
+    if (loadedCount > 0 && currentIndex == (size_t)-1) {
+        /* If a formerly-current JPEG vanished, promote the newest surviving
+           indexed entry so the total-history limit still behaves normally. */
+        currentIndex = loadedCount - 1;
+    }
+
+    AcquireSRWLockExclusive(&g_imageLock);
+    for (size_t i = 0; i < loadedCount; i++) {
+        if (RetainedImageTokenExistsLocked(loaded[i].image.token)) continue;
+        if (i == currentIndex && !g_cachedImage.token[0]) {
+            g_cachedImage = loaded[i].image;
+            ZeroMemory(&loaded[i].image, sizeof(loaded[i].image));
+            g_restoredDiskCurrentNeedsClipboardCheck = TRUE;
+            restoredCount++;
+        } else if (AppendHistoricalImageLocked(&loaded[i].image)) {
+            restoredCount++;
+        }
+    }
+    if (g_imageHistoryCount > 1) {
+        qsort(g_imageHistory, g_imageHistoryCount,
+              sizeof(*g_imageHistory), CompareCachedImagesByCaptureTime);
+    }
+    /* A legacy scan can discover files that earlier releases deliberately
+       left as a lasting record. Keep excess migrated files on disk even when
+       the configured live-history limit omits them from the rebuilt index. */
+    evicted = EnforceImageHistoryLimitLockedEx(!recoveredLegacy);
+    ReleaseSRWLockExclusive(&g_imageLock);
+    FreeLoadedDiskImages(loaded, loadedCount);
+
+    PersistDiskHistoryIndex();
+    if (restoredCount > 0) {
+        LogMessage("Disk image history restored: %llu image(s)%s",
+                   (unsigned long long)restoredCount,
+                   recoveredLegacy ? " (migrated existing JPEG files)" : "");
+    }
+    if (evicted > 0) {
+        LogMessage("Disk image history limit evicted %llu restored image(s)",
+                   (unsigned long long)evicted);
+    }
+    NotifyHistoryViewChanged();
+    return restoredCount;
+}
+
+/* When the startup clipboard still contains the last persisted current image,
+   reuse its token and file instead of adding a duplicate on every restart. */
+static BOOL AttachClipboardDataToRestoredCurrent(
+    const BYTE *jpegData, DWORD jpegSize, char *base64Data, DWORD base64Len,
+    UINT width, UINT height, char token[IMAGE_TOKEN_HEX_LEN + 1])
+{
+    BYTE *storedBytes = NULL;
+    DWORD storedSize = 0;
+    BOOL matched = FALSE;
+
+    if (!g_restoredDiskCurrentNeedsClipboardCheck) return FALSE;
+    AcquireSRWLockExclusive(&g_imageLock);
+    g_restoredDiskCurrentNeedsClipboardCheck = FALSE;
+    if (g_cachedImage.diskPath && !g_cachedImage.base64Data &&
+        g_cachedImage.jpegSize == jpegSize) {
+        storedBytes = LoadCachedImageBytesLocked(&g_cachedImage, &storedSize);
+        if (storedBytes && storedSize == jpegSize &&
+            memcmp(storedBytes, jpegData, jpegSize) == 0) {
+            g_cachedImage.base64Data = base64Data;
+            g_cachedImage.base64Len = base64Len;
+            g_cachedImage.width = width;
+            g_cachedImage.height = height;
+            strncpy(token, g_cachedImage.token, IMAGE_TOKEN_HEX_LEN + 1);
+            matched = TRUE;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_imageLock);
+    free(storedBytes);
+    if (matched) NotifyHistoryViewChanged();
+    return matched;
 }
 
 /* Takes ownership of jpegData (may be NULL when diskPath is set), base64Data,
@@ -1216,6 +1844,7 @@ static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
     g_cachedImage.capturedAtMs = GetUnixTimeMs();
     g_cachedImage.diskPath = diskPath;
     ReleaseSRWLockExclusive(&g_imageLock);
+    PersistDiskHistoryIndex();
     NotifyHistoryViewChanged();
 }
 
@@ -1231,6 +1860,7 @@ static void ClearCurrentImage(const char *reason)
     ReleaseSRWLockExclusive(&g_imageLock);
 
     if (hadImage) {
+        PersistDiskHistoryIndex();
         LogMessage("Current clipboard image cleared: %s (%llu historical retained)",
                    reason, (unsigned long long)retainedCount);
         NotifyHistoryViewChanged();
@@ -1244,14 +1874,18 @@ static size_t SetImageHistoryLimit(int limit)
     g_configImageHistoryLimit = limit;
     evicted = EnforceImageHistoryLimitLocked();
     ReleaseSRWLockExclusive(&g_imageLock);
-    if (evicted > 0) NotifyHistoryViewChanged();
+    if (evicted > 0) {
+        PersistDiskHistoryIndex();
+        NotifyHistoryViewChanged();
+    }
     return evicted;
 }
 
 static void DestroyImageCache(void)
 {
+    PersistDiskHistoryIndex();
     AcquireSRWLockExclusive(&g_imageLock);
-    /* Exit keeps disk-stored files on disk. */
+    /* Exit keeps indexed disk-stored files on disk for the next session. */
     FreeCachedImageDataEx(&g_cachedImage, FALSE);
     for (size_t i = 0; i < g_imageHistoryCount; i++) {
         FreeCachedImageDataEx(&g_imageHistory[i], FALSE);
@@ -1379,6 +2013,7 @@ static BOOL DeleteRetainedImageByToken(const char *token)
         }
     }
     ReleaseSRWLockExclusive(&g_imageLock);
+    if (removed) PersistDiskHistoryIndex();
     return removed;
 }
 
@@ -1399,6 +2034,7 @@ static size_t ClearAllRetainedImages(void)
     }
     g_imageHistoryCount = 0;
     ReleaseSRWLockExclusive(&g_imageLock);
+    PersistDiskHistoryIndex();
     return removed;
 }
 
@@ -1415,11 +2051,12 @@ static BOOL RefreshClipboardImageCache(void)
     DWORD jpegSize = 0;
     char *base64Data = NULL;
     DWORD base64Len = 0;
-    char token[IMAGE_TOKEN_HEX_LEN + 1];
+    char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
     UINT width = 0, height = 0;
     BOOL success = FALSE;
 
     if (!IsClipboardFormatAvailable(CF_DIB)) {
+        g_restoredDiskCurrentNeedsClipboardCheck = FALSE;
         g_lastClipboardSequence = sequence;
         KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
         ClearCurrentImage("clipboard now contains non-image data");
@@ -1469,10 +2106,6 @@ cleanup_clipboard:
         return FALSE;
     }
 
-    /* Once the replacement image is readable, the previous URL is no longer
-       current even while the new encodings are being prepared. */
-    ClearCurrentImage("a newer clipboard image is being prepared");
-
     if (!EncodeImageToMemory((GpImage *)bitmap, L"image/png", 0, &pngData, &pngSize)) {
         LogMessage("ERROR: Failed to encode clipboard image as PNG");
         goto cleanup;
@@ -1483,7 +2116,7 @@ cleanup_clipboard:
         goto cleanup;
     }
     base64Data = Base64Encode(pngData, pngSize, &base64Len);
-    if (!base64Data || !GenerateImageToken(token)) {
+    if (!base64Data) {
         LogMessage("ERROR: Failed to prepare clipboard image cache");
         goto cleanup;
     }
@@ -1495,8 +2128,20 @@ cleanup_clipboard:
         goto cleanup;
     }
 
-    {
+    if (AttachClipboardDataToRestoredCurrent(
+            jpegData, jpegSize, base64Data, base64Len,
+            width, height, token)) {
+        free(jpegData);
+        jpegData = NULL;
+        base64Data = NULL;
+        LogMessage("Clipboard image matched restored disk history: %ux%u, JPEG=%lu bytes, id=%.12s...",
+                   width, height, jpegSize, token);
+    } else {
         WCHAR *diskPath = NULL;
+        if (!GenerateImageToken(token)) {
+            LogMessage("ERROR: Failed to prepare clipboard image cache");
+            goto cleanup;
+        }
         if (g_configImageStorage == IMAGE_STORAGE_DISK) {
             diskPath = StoreImageToDisk(token, jpegData, jpegSize);
             if (diskPath) {
@@ -7355,6 +8000,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
                            (unsigned long long)evicted);
             }
         }
+        if (g_configImageStorage == IMAGE_STORAGE_DISK) {
+            LoadPersistedDiskHistory();
+        }
         g_configCompatibilityPaste = compatibilityPaste != 0;
         g_configScreenCaptureEnabled = screenCaptureEnabled != 0;
         g_configCaptureGapFill = strcmp(captureGapFill, "black") == 0
@@ -7998,10 +8646,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     LogMessage("Interactive Print Screen capture: %s",
                g_configScreenCaptureEnabled ? "enabled" : "disabled");
     if (g_configImageHistoryLimit == 0) {
-        LogMessage("In-memory image history: unlimited");
+        LogMessage("Image history limit: unlimited");
     } else {
-        LogMessage("In-memory image history: %d image(s)",
+        LogMessage("Image history limit: %d image(s)",
                    g_configImageHistoryLimit);
+    }
+    LogMessage("Image storage: %s",
+               g_configImageStorage == IMAGE_STORAGE_DISK ? "disk" : "memory");
+    if (g_configImageStorage == IMAGE_STORAGE_DISK) {
+        LoadPersistedDiskHistory();
     }
 
     /* Clipboard monitoring keeps both paste modes synchronized with the user's

@@ -507,10 +507,11 @@ export default function ConfigView({
             <code className="font-mono text-neutral-700">
               {config.imageStorageDir || "%LOCALAPPDATA%\\ImagePaster"}
             </code>
-            ; if the folder or file cannot be written, the image stays in
-            memory and the failure is logged. Files are removed when images
-            are evicted or deleted during the session, but files still
-            present when ImagePaster exits are kept on disk.
+            , with a durable index that restores History after a restart. If
+            the folder, image, or index cannot be written, the failure is
+            logged; an image that cannot be written stays in memory. Files and
+            index entries are removed when images are evicted, deleted, or
+            cleared.
           </p>
         </div>
 
@@ -542,9 +543,9 @@ export default function ConfigView({
             </label>
           </div>
           <p className="text-[11px] text-neutral-500">
-            Maximum images retained until exit, whether stored in memory or on
-            disk, including the current image. A limit of 1 keeps only the
-            current image.
+            Maximum images retained, including the current image. A limit of 1
+            keeps only the current image. Disk-backed entries remain available
+            across restarts.
           </p>
         </div>
 
