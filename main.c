@@ -192,8 +192,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.15"
-#define APP_VERSION_W     L"1.0.15"
+#define APP_VERSION_A     "1.0.16"
+#define APP_VERSION_W     L"1.0.16"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -6496,6 +6496,21 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             SendHistoryActionResult(TRUE, L"Image URL copied to the clipboard.");
         } else {
             SendHistoryActionResult(FALSE, L"The URL could not be copied.");
+        }
+    } else if (strcmp(action, "historyOpenUrl") == 0) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
+        wchar_t url[192];
+        int urlWritten;
+        json_get_string(msg, "token", token, sizeof(token));
+        urlWritten = swprintf(url, 192, L"http://%hs:%d/%hs.jpg",
+                              g_configBindIp, g_configHttpPort, token);
+        if (token[0] && urlWritten > 0 &&
+            (INT_PTR)ShellExecuteW(NULL, L"open", url, NULL, NULL,
+                                   SW_SHOWNORMAL) > 32) {
+            LogMessage("History image URL opened in browser (id %.12s...)",
+                       token);
+        } else {
+            SendHistoryActionResult(FALSE, L"The link could not be opened.");
         }
     } else if (strcmp(action, "historySave") == 0) {
         char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};

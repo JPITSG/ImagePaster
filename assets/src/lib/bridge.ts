@@ -238,6 +238,10 @@ export function copyHistoryUrl(token: string) {
   postMessage({ action: "historyCopyUrl", token });
 }
 
+export function openHistoryUrl(token: string) {
+  postMessage({ action: "historyOpenUrl", token });
+}
+
 export function saveHistoryImage(token: string) {
   postMessage({ action: "historySave", token });
 }

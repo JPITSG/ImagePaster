@@ -1,4 +1,4 @@
-# ImagePaster 1.0.15
+# ImagePaster 1.0.16
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -10,7 +10,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
   - a short instruction containing a temporary HTTP JPEG URL
 - Watches the clipboard continuously and keeps the latest image encoded in memory for both methods
 - Retains configurable in-memory JPEG history: 1–1000 total images or Unlimited until exit
-- History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all
+- History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
 - Customizable HTTP paste message with case-sensitive `{URL}` substitution

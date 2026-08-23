@@ -5,6 +5,7 @@ import {
   copyHistoryUrl,
   deleteHistoryImage,
   onHistoryActionResult,
+  openHistoryUrl,
   saveHistoryImage,
   type HistoryActionResult,
   type HistoryData,
@@ -33,7 +34,12 @@ function formatCapturedAt(ms: number) {
 function HistoryRow({ entry }: { entry: HistoryEntry }) {
   return (
     <li className="flex items-center gap-3 px-3 py-2.5 hover:bg-neutral-50">
-      <div className="flex h-20 w-32 shrink-0 items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100">
+      <button
+        type="button"
+        title="Open in default browser"
+        onClick={() => openHistoryUrl(entry.token)}
+        className="flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
+      >
         {entry.thumb ? (
           <img
             src={entry.thumb}
@@ -44,7 +50,7 @@ function HistoryRow({ entry }: { entry: HistoryEntry }) {
         ) : (
           <span className="text-[10px] text-neutral-400">No preview</span>
         )}
-      </div>
+      </button>
 
       <div className="min-w-0 flex-1 space-y-0.5">
         <div className="flex items-center gap-2 text-xs font-medium text-neutral-900">
@@ -60,12 +66,14 @@ function HistoryRow({ entry }: { entry: HistoryEntry }) {
         <div className="text-[11px] tabular-nums text-neutral-500">
           {formatBytes(entry.bytes)} · {formatCapturedAt(entry.capturedAt)}
         </div>
-        <div
-          className="truncate font-mono text-[10px] text-neutral-400"
-          title={entry.url}
+        <button
+          type="button"
+          title={`Open ${entry.url} in default browser`}
+          onClick={() => openHistoryUrl(entry.token)}
+          className="block w-full cursor-pointer truncate text-left font-mono text-[10px] text-neutral-400 hover:text-neutral-600 hover:underline focus-visible:underline focus-visible:outline-none"
         >
           {entry.url}
-        </div>
+        </button>
       </div>
 
       <div className="flex shrink-0 flex-col gap-1">
