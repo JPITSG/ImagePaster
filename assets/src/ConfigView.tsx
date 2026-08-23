@@ -41,6 +41,9 @@ export default function ConfigView({ config }: Props) {
   );
   const [httpPort, setHttpPort] = useState(String(config.httpPort));
   const [jpegQuality, setJpegQuality] = useState(String(config.jpegQuality));
+  const [shiftInsertPaste, setShiftInsertPaste] = useState(
+    config.shiftInsertPaste,
+  );
   const [error, setError] = useState("");
 
   const selectedBindIp = useMemo(
@@ -79,6 +82,7 @@ export default function ConfigView({ config }: Props) {
       bindIp: selectedBindIp,
       httpPort: port,
       jpegQuality: quality,
+      shiftInsertPaste,
     });
   };
 
@@ -110,6 +114,26 @@ export default function ConfigView({ config }: Props) {
         />
         <p className="text-[11px] text-neutral-500">
           Comma-separated, case-insensitive window-title keywords.
+        </p>
+      </div>
+
+      <div className="rounded-md border border-neutral-200 px-3 py-2.5">
+        <label
+          htmlFor="shiftInsertPaste"
+          className="flex cursor-pointer items-center gap-2 text-xs font-medium"
+        >
+          <input
+            id="shiftInsertPaste"
+            type="checkbox"
+            checked={shiftInsertPaste}
+            onChange={(event) => setShiftInsertPaste(event.target.checked)}
+            className="h-4 w-4 rounded border-neutral-300"
+          />
+          Use Shift+Insert for generated text
+        </label>
+        <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
+          Xshell compatibility workaround. Disable it for applications that expect
+          the generic Ctrl+V shortcut.
         </p>
       </div>
 
@@ -195,7 +219,7 @@ export default function ConfigView({ config }: Props) {
       )}
 
       <div className="flex items-center justify-between gap-2 pt-1">
-        <span className="text-[10px] text-neutral-400">Version {config.version}</span>
+        <span className="text-[10px] text-neutral-400">v{config.version}</span>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" className="w-20" onClick={closeDialog}>
             Cancel

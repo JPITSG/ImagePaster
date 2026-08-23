@@ -94,8 +94,8 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.0"
-#define APP_VERSION_W     L"1.0.0"
+#define APP_VERSION_A     "1.0.1"
+#define APP_VERSION_W     L"1.0.1"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -106,9 +106,11 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define ID_TIMER_HTTP_RECONCILE         1007
 #define ID_TIMER_CLIPBOARD_RETRY        1008
+#define ID_TIMER_DEFERRED_PASTE         1009
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
 #define HTTP_RECONCILE_INTERVAL_MS      3000
 #define CLIPBOARD_RETRY_DELAY_MS        150
+#define DEFERRED_PASTE_DELAY_MS          10
 
 #define REG_KEY_PATH       "SOFTWARE\\JPIT\\ImagePaster"
 #define REG_VALUE_TITLE    "TitleMatch"
@@ -116,6 +118,7 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define REG_VALUE_BIND_IP  "BindIp"
 #define REG_VALUE_PORT     "HttpPort"
 #define REG_VALUE_QUALITY  "JpegQuality"
+#define REG_VALUE_SHIFT_INSERT "ShiftInsertPaste"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
@@ -167,6 +170,8 @@ static int  g_configPasteMethod = PASTE_METHOD_BASE64;
 static char g_configBindIp[INET_ADDRSTRLEN] = "127.0.0.1";
 static int  g_configHttpPort = DEFAULT_HTTP_PORT;
 static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
+static BOOL g_configShiftInsertPaste = TRUE;
+static BOOL g_pasteDeferred = FALSE;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
 static int   g_keywordCount = 0;
 
@@ -1233,6 +1238,7 @@ static void ReconcileHttpServer(void)
 static void SimulateCtrlV(void)
 {
     INPUT inputs[4];
+    UINT sent;
     ZeroMemory(inputs, sizeof(inputs));
 
     g_bSkipNextPaste = TRUE;
@@ -1255,11 +1261,56 @@ static void SimulateCtrlV(void)
     inputs[3].ki.wVk = VK_CONTROL;
     inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
 
-    SendInput(4, inputs, sizeof(INPUT));
-    LogMessage("Simulated Ctrl+V (re-injection)");
+    sent = SendInput(4, inputs, sizeof(INPUT));
+    if (sent == 4) {
+        LogMessage("Simulated Ctrl+V (generic text paste)");
+    } else {
+        g_bSkipNextPaste = FALSE;
+        LogMessage("ERROR: Ctrl+V re-injection sent %u of 4 events (%lu)",
+                   sent, GetLastError());
+    }
 }
 
-static BOOL PlaceUtf8TextOnClipboard(const char *text)
+static void SimulateShiftInsert(void)
+{
+    INPUT inputs[4];
+    UINT sent;
+    ZeroMemory(inputs, sizeof(inputs));
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_SHIFT;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_INSERT;
+    inputs[1].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = VK_INSERT;
+    inputs[2].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_SHIFT;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    sent = SendInput(4, inputs, sizeof(INPUT));
+    if (sent == 4) {
+        LogMessage("Simulated Shift+Insert (terminal compatibility text paste)");
+    } else {
+        LogMessage("ERROR: Shift+Insert re-injection sent %u of 4 events (%lu)",
+                   sent, GetLastError());
+    }
+}
+
+static void SimulateConfiguredPasteShortcut(void)
+{
+    if (g_configShiftInsertPaste) {
+        SimulateShiftInsert();
+    } else {
+        SimulateCtrlV();
+    }
+}
+
+static BOOL PlaceUtf8TextOnClipboard(const char *text, BOOL preserveCachedImage)
 {
     int wideLen;
     HGLOBAL memory;
@@ -1294,10 +1345,50 @@ static BOOL PlaceUtf8TextOnClipboard(const char *text)
     }
     CloseClipboard();
 
-    /* The cache represents the user's last copied image. Ignore our own text update. */
-    g_ownClipboardSequence = GetClipboardSequenceNumber();
-    g_lastClipboardSequence = g_ownClipboardSequence;
+    g_lastClipboardSequence = GetClipboardSequenceNumber();
+    g_ownClipboardSequence = preserveCachedImage ? g_lastClipboardSequence : 0;
     g_writingClipboardText = FALSE;
+    if (!preserveCachedImage) {
+        ClearCachedImage("activity log was copied as text");
+    }
+    return TRUE;
+}
+
+static BOOL CopyActivityLogToClipboard(void)
+{
+    int entryCount = g_logCount;
+    size_t bufferSize = (size_t)entryCount *
+                        (sizeof(g_logRing[0].time) + sizeof(g_logRing[0].message) + 4) + 1;
+    char *textBuffer = (char *)malloc(bufferSize);
+    size_t position = 0;
+
+    if (!textBuffer) {
+        LogMessage("ERROR: Could not allocate activity log clipboard text");
+        return FALSE;
+    }
+    textBuffer[0] = '\0';
+
+    for (int i = 0; i < entryCount; i++) {
+        int bufferIndex = entryCount < LOG_RING_CAPACITY
+            ? i : (g_logHead + i) % LOG_RING_CAPACITY;
+        LogEntry *entry = &g_logRing[bufferIndex];
+        int written = snprintf(textBuffer + position, bufferSize - position,
+                               "%s  %s\r\n", entry->time, entry->message);
+        if (written < 0 || (size_t)written >= bufferSize - position) {
+            free(textBuffer);
+            LogMessage("ERROR: Could not format activity log clipboard text");
+            return FALSE;
+        }
+        position += (size_t)written;
+    }
+
+    if (!PlaceUtf8TextOnClipboard(textBuffer, FALSE)) {
+        free(textBuffer);
+        return FALSE;
+    }
+
+    free(textBuffer);
+    LogMessage("Activity log copied to clipboard (%d entries)", entryCount);
     return TRUE;
 }
 
@@ -1346,11 +1437,11 @@ static BOOL PasteCachedImage(void)
         return FALSE;
     }
 
-    if (PlaceUtf8TextOnClipboard(pasteText)) {
+    if (PlaceUtf8TextOnClipboard(pasteText, TRUE)) {
         LogMessage("Prepared %s paste (%lu characters, image id %.12s...)",
                    g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP URL" : "base64",
                    textLen, token);
-        SimulateCtrlV();
+        SimulateConfiguredPasteShortcut();
         success = TRUE;
     }
     free(pasteText);
@@ -1434,6 +1525,13 @@ static BOOL LoadConfigFromRegistry(void)
         g_configJpegQuality = (int)value;
     }
 
+    size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_SHIFT_INSERT, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= 1) {
+        g_configShiftInsertPaste = value != 0;
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -1463,11 +1561,15 @@ static void SaveConfigToRegistry(void)
         value = (DWORD)g_configJpegQuality;
         RegSetValueExA(hKey, REG_VALUE_QUALITY, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configShiftInsertPaste;
+        RegSetValueExA(hKey, REG_VALUE_SHIFT_INSERT, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
     }
 
     RegCloseKey(hKey);
-    LogMessage("Configuration saved: method=%s, bind=%s:%d, JPEG=%d%%, titles=%s",
+    LogMessage("Configuration saved: method=%s, shortcut=%s, bind=%s:%d, JPEG=%d%%, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
+               g_configShiftInsertPaste ? "Shift+Insert" : "Ctrl+V",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
                g_configTitleMatch);
 }
@@ -1748,13 +1850,15 @@ static void webview_push_init_config(void)
         L"\"bindIp\":\"%s\","
         L"\"httpPort\":%d,"
         L"\"jpegQuality\":%d,"
+        L"\"shiftInsertPaste\":%s,"
         L"\"availableIps\":%s,"
         L"\"bindIpAvailable\":%s,"
         L"\"serverStatus\":\"%s\","
         L"\"version\":\"%s\"}})",
         wTitleMatch,
         g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
-        wBindIp, g_configHttpPort, g_configJpegQuality, ipsJson,
+        wBindIp, g_configHttpPort, g_configJpegQuality,
+        g_configShiftInsertPaste ? L"true" : L"false", ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
         wHttpStatus, APP_VERSION_W);
     webview_execute_script(script);
@@ -1950,6 +2054,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char bindIp[INET_ADDRSTRLEN] = {0};
         int httpPort = 0;
         int jpegQuality = -1;
+        int shiftInsertPaste = -1;
         IN_ADDR parsedAddress;
 
         json_get_string(msg, "titleMatch", titleMatch, sizeof(titleMatch));
@@ -1957,6 +2062,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
         json_get_int(msg, "httpPort", &httpPort);
         json_get_int(msg, "jpegQuality", &jpegQuality);
+        json_get_int(msg, "shiftInsertPaste", &shiftInsertPaste);
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid paste method.'})");
@@ -1978,6 +2084,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             free(msg);
             return S_OK;
         }
+        if (shiftInsertPaste < 0 || shiftInsertPaste > 1) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid text-paste shortcut.'})");
+            free(msg);
+            return S_OK;
+        }
 
         BOOL networkChanged = strcmp(g_configBindIp, bindIp) != 0 ||
                               g_configHttpPort != httpPort;
@@ -1992,6 +2103,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
         g_configHttpPort = httpPort;
         g_configJpegQuality = jpegQuality;
+        g_configShiftInsertPaste = shiftInsertPaste != 0;
         SaveConfigToRegistry();
         ParseKeywords();
         UpdateTooltip();
@@ -2009,6 +2121,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         g_logHead = 0;
         /* Push empty log array back to JS */
         webview_execute_script(L"window.onInit && window.onInit({\"view\":\"log\",\"log\":[]})");
+    } else if (strcmp(action, "copyLog") == 0) {
+        CopyActivityLogToClipboard();
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0;
         json_get_int(msg, "height", &contentHeight);
@@ -2197,6 +2311,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
             KillTimer(hWnd, ID_TIMER_HTTP_RECONCILE);
             KillTimer(hWnd, ID_TIMER_CLIPBOARD_RETRY);
+            KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
             if (fnRemoveClipboardFormatListener) fnRemoveClipboardFormatListener(hWnd);
             StopHttpServer();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -2231,6 +2346,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DO_PASTE:
         {
+            if (g_configShiftInsertPaste &&
+                (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) {
+                if (!g_pasteDeferred) {
+                    LogMessage("Waiting for Ctrl release before Shift+Insert paste");
+                    g_pasteDeferred = TRUE;
+                }
+                SetTimer(hWnd, ID_TIMER_DEFERRED_PASTE,
+                         DEFERRED_PASTE_DELAY_MS, NULL);
+                return 0;
+            }
+            KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
+            g_pasteDeferred = FALSE;
             DWORD sequence = GetClipboardSequenceNumber();
             if (sequence != g_lastClipboardSequence) {
                 if (!RefreshClipboardImageCache()) {
@@ -2262,6 +2389,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         if (wParam == ID_TIMER_CLIPBOARD_RETRY) {
             RefreshClipboardImageCache();
+            return 0;
+        }
+        if (wParam == ID_TIMER_DEFERRED_PASTE) {
+            KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
+            PostMessage(hWnd, WM_DO_PASTE, 0, 0);
             return 0;
         }
         break;
@@ -2354,6 +2486,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     LogMessage("GDI+ initialized");
     LogMessage("Title match keywords: %s", g_configTitleMatch);
     LogMessage("Paste method: %s", g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
+    LogMessage("Text paste shortcut: %s",
+               g_configShiftInsertPaste ? "Shift+Insert" : "Ctrl+V");
 
     /* Clipboard monitoring keeps both paste modes synchronized with the user's
        latest clipboard image, independent of which mode is currently selected. */

@@ -1,4 +1,4 @@
-# ImagePaster 1.0.0
+# ImagePaster 1.0.1
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -15,8 +15,9 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Keeps an unavailable saved address and automatically starts listening if that address returns
 - Uses a random 256-bit image identifier; superseded URLs return `410 Gone`
 - Configurable window title matching (comma-separated keywords)
+- Optional Shift+Insert text-paste compatibility mode for terminals such as Xshell
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
-- In-memory activity log with live updates (500-entry ring buffer)
+- In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
 - System tray icon with context menu
 - Single-instance enforcement
@@ -41,7 +42,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
      [ image available at http://192.168.1.100:10444/<random-id>.jpg - if you feel this image will be useful later on be sure to save it to /tmp or a temp location for later use ]
      ```
 
-5. `Ctrl+V` is re-injected so the target application receives the selected representation.
+5. The configured text-paste shortcut is injected so the target application receives the selected representation. The default Shift+Insert compatibility mode avoids forwarding a second Ctrl+V into Xshell; it can be disabled to use generic Ctrl+V re-injection.
 
 The HTTP server runs in both modes. A URL for the current image returns `200 OK` with `image/jpeg`. A previously issued URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`.
 
@@ -78,6 +79,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | HTTP Bind Address | `BindIp` | REG_SZ | `127.0.0.1` |
 | HTTP Port | `HttpPort` | REG_DWORD | `10444` |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
+| Shift+Insert Paste | `ShiftInsertPaste` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
 

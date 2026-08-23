@@ -6,6 +6,7 @@ export interface ConfigData {
   bindIp: string;
   httpPort: number;
   jpegQuality: number;
+  shiftInsertPaste: boolean;
   availableIps: string[];
   bindIpAvailable: boolean;
   serverStatus: string;
@@ -88,11 +89,16 @@ export function saveSettings(config: ConfigData) {
     bindIp: config.bindIp,
     httpPort: config.httpPort,
     jpegQuality: config.jpegQuality,
+    shiftInsertPaste: config.shiftInsertPaste ? 1 : 0,
   });
 }
 
 export function clearLog() {
   postMessage({ action: "clearLog" });
+}
+
+export function copyLog() {
+  postMessage({ action: "copyLog" });
 }
 
 export function closeDialog() {
