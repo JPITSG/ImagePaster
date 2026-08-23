@@ -236,40 +236,40 @@ export default function ConfigView({
         </p>
       </div>
 
-      <div className="rounded-md border border-neutral-200 px-3 py-2.5">
-        <label
-          htmlFor="compatibilityPaste"
-          className="flex cursor-pointer items-center gap-2 text-xs font-medium"
-        >
-          <Checkbox
-            id="compatibilityPaste"
-            checked={compatibilityPaste}
-            onChange={(event) => setCompatibilityPaste(event.target.checked)}
-          />
-          Use compatibility paste shortcut
-        </label>
-        <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
-          Uses Shift+Insert instead of Ctrl+V when inserting generated text. Enable
-          it for applications that handle Ctrl+V themselves.
-        </p>
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="compatibilityPaste"
+          className="mt-0.5"
+          checked={compatibilityPaste}
+          onChange={(event) => setCompatibilityPaste(event.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="compatibilityPaste" className="cursor-pointer">
+            Use compatibility paste shortcut
+          </Label>
+          <p className="text-[11px] leading-snug text-neutral-500">
+            Uses Shift+Insert instead of Ctrl+V when inserting generated text.
+            Enable it for applications that handle Ctrl+V themselves.
+          </p>
+        </div>
       </div>
 
-      <div className="rounded-md border border-neutral-200 px-3 py-2.5">
-        <label
-          htmlFor="screenCaptureEnabled"
-          className="flex cursor-pointer items-center gap-2 text-xs font-medium"
-        >
-          <Checkbox
-            id="screenCaptureEnabled"
-            checked={screenCaptureEnabled}
-            onChange={(event) => setScreenCaptureEnabled(event.target.checked)}
-          />
-          Enable interactive Print Screen capture
-        </label>
-        <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
-          Opens a multi-monitor selection overlay. Print Screen again copies the
-          full desktop; Esc cancels.
-        </p>
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="screenCaptureEnabled"
+          className="mt-0.5"
+          checked={screenCaptureEnabled}
+          onChange={(event) => setScreenCaptureEnabled(event.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="screenCaptureEnabled" className="cursor-pointer">
+            Enable interactive Print Screen capture
+          </Label>
+          <p className="text-[11px] leading-snug text-neutral-500">
+            Opens a multi-monitor selection overlay. Print Screen again copies
+            the full desktop; Esc cancels.
+          </p>
+        </div>
       </div>
 
       <div className="border-t border-neutral-200 pt-4 space-y-3">
@@ -375,9 +375,12 @@ export default function ConfigView({
           </p>
         </div>
 
-        <div className="rounded-md bg-neutral-50 px-3 py-2 text-[11px] text-neutral-600">
-          Server status: {config.serverStatus}
-        </div>
+        <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+          <dt className="text-neutral-500">Server status</dt>
+          <dd className="font-medium tabular-nums text-neutral-900">
+            {config.serverStatus}
+          </dd>
+        </dl>
       </div>
 
       <div className="flex items-start gap-2 pt-1">

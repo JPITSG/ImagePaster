@@ -4,10 +4,11 @@
 IDI_APPICON      ICON   "assets/icon.ico"
 IDR_HTML_UI      RCDATA "assets/dist/index.html"
 IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
+1                24     "ImagePaster.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,4,0
- PRODUCTVERSION 1,0,4,0
+ FILEVERSION 1,0,5,0
+ PRODUCTVERSION 1,0,5,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -20,11 +21,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "JPIT\0"
             VALUE "FileDescription", "ImagePaster\0"
-            VALUE "FileVersion", "1.0.4\0"
+            VALUE "FileVersion", "1.0.5\0"
             VALUE "InternalName", "ImagePaster\0"
             VALUE "OriginalFilename", "ImagePaster.exe\0"
             VALUE "ProductName", "ImagePaster\0"
-            VALUE "ProductVersion", "1.0.4\0"
+            VALUE "ProductVersion", "1.0.5\0"
         END
     END
     BLOCK "VarFileInfo"

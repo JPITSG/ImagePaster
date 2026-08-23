@@ -38,6 +38,11 @@
 #include <winhttp.h>
 #include <winver.h>
 #include <userenv.h>
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,8 +106,8 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.4"
-#define APP_VERSION_W     L"1.0.4"
+#define APP_VERSION_A     "1.0.5"
+#define APP_VERSION_W     L"1.0.5"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -3051,6 +3056,32 @@ static void webview_sync_controller_bounds(void)
     g_webviewController->lpVtbl->put_IsVisible(g_webviewController, TRUE);
 }
 
+/* The manifest makes the process per-monitor DPI aware, so WebView-reported
+ * CSS dimensions must be converted to the physical pixels used by Win32. */
+typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+
+static UINT GetWebViewWindowDpi(HWND hwnd)
+{
+    static PFN_GetDpiForWindow fnGetDpiForWindow = NULL;
+    static BOOL resolved = FALSE;
+    HDC hdc;
+    UINT dpi;
+
+    if (!resolved) {
+        fnGetDpiForWindow = (PFN_GetDpiForWindow)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+        resolved = TRUE;
+    }
+    if (fnGetDpiForWindow && hwnd) {
+        dpi = fnGetDpiForWindow(hwnd);
+        if (dpi) return dpi;
+    }
+    hdc = GetDC(hwnd);
+    dpi = hdc ? (UINT)GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+    if (hdc) ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96;
+}
+
 static void UpdateDebugPrint(const wchar_t *format, ...)
 {
     wchar_t buffer[1024];
@@ -4686,12 +4717,15 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0;
         json_get_int(msg, "height", &contentHeight);
-        if (contentHeight > 0 && g_webviewHwnd) {
+        if (contentHeight > 0 && g_webviewHwnd &&
+            !IsZoomed(g_webviewHwnd) && !IsIconic(g_webviewHwnd)) {
+            int physicalHeight = MulDiv(
+                contentHeight, (int)GetWebViewWindowDpi(g_webviewHwnd), 96);
             RECT clientRect = {0}, windowRect = {0};
             GetClientRect(g_webviewHwnd, &clientRect);
             GetWindowRect(g_webviewHwnd, &windowRect);
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
-            int newWindowH = contentHeight + chromeH;
+            int newWindowH = physicalHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
             int newX = windowRect.left;
             int newY = windowRect.top;
@@ -4811,6 +4845,15 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             webview_sync_controller_bounds();
             return 0;
 
+        case WM_DPICHANGED: {
+            const RECT *suggested = (const RECT *)lParam;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+
         case WM_TIMER:
             if (wParam == ID_TIMER_WEBVIEW_SHOW_FALLBACK) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
@@ -4895,13 +4938,19 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     const wchar_t *title = L"Configuration";
     if (strcmp(view, "log") == 0) title = L"Activity Log";
 
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int posX = (screenW - width) / 2;
-    int posY = (screenH - height) / 2;
+    RECT workArea;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    int dpi = (int)GetWebViewWindowDpi(NULL);
+    width = MulDiv(width, dpi, 96);
+    height = MulDiv(height, dpi, 96);
+    if (height > workArea.bottom - workArea.top) {
+        height = workArea.bottom - workArea.top;
+    }
+    int posX = workArea.left + ((workArea.right - workArea.left) - width) / 2;
+    int posY = workArea.top + ((workArea.bottom - workArea.top) - height) / 2;
 
     g_webviewHwnd = CreateWindowExW(0, L"ImagePasterWebViewWnd", title,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPEDWINDOW,
         posX, posY, width, height,
         NULL, NULL, g_hInstance, NULL);
 

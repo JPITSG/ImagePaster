@@ -28,7 +28,7 @@ main.o: main.c resource.h
 	@echo "Compiling main.c..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resources.o: resources.rc resource.h assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
+resources.o: resources.rc resource.h ImagePaster.manifest assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 
