@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.25"
-#define APP_VERSION_W     L"1.0.25"
+#define APP_VERSION_A     "1.0.26"
+#define APP_VERSION_W     L"1.0.26"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -411,7 +411,11 @@ enum {
     CAPTURE_EDGE_LEFT,
     CAPTURE_EDGE_TOP,
     CAPTURE_EDGE_RIGHT,
-    CAPTURE_EDGE_BOTTOM
+    CAPTURE_EDGE_BOTTOM,
+    CAPTURE_EDGE_TOPLEFT,
+    CAPTURE_EDGE_TOPRIGHT,
+    CAPTURE_EDGE_BOTTOMLEFT,
+    CAPTURE_EDGE_BOTTOMRIGHT
 };
 static int g_captureResizingIndex = -1;  /* box being resized, or -1 */
 static int g_captureResizingEdge = CAPTURE_EDGE_NONE;
@@ -1028,59 +1032,23 @@ static WCHAR *StoreImageToDisk(const char *token, const BYTE *jpegData,
     return path;
 }
 
-static BOOL IsImageStorageFileName(const WCHAR *fileName)
-{
-    for (int i = 0; i < IMAGE_TOKEN_HEX_LEN; i++) {
-        WCHAR c = fileName[i];
-        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) {
-            return FALSE;
-        }
-    }
-    return wcscmp(fileName + IMAGE_TOKEN_HEX_LEN, L".jpg") == 0;
-}
-
-/* Removes image files left behind by an earlier session that did not shut
-   down cleanly. Only files matching the <64-hex>.jpg pattern are touched. */
-static void CleanImageStorageDirectory(void)
-{
-    WCHAR directory[MAX_PATH];
-    WCHAR pattern[MAX_PATH];
-    WIN32_FIND_DATAW findData;
-    HANDLE find;
-    unsigned removed = 0;
-
-    if (!BuildImageStorageDirectoryPath(directory)) return;
-    if (swprintf(pattern, MAX_PATH, L"%s\\*.jpg", directory) <= 0) return;
-    find = FindFirstFileW(pattern, &findData);
-    if (find == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-            IsImageStorageFileName(findData.cFileName)) {
-            WCHAR path[MAX_PATH];
-            if (swprintf(path, MAX_PATH, L"%s\\%s", directory,
-                         findData.cFileName) > 0 && DeleteFileW(path)) {
-                removed++;
-            }
-        }
-    } while (FindNextFileW(find, &findData));
-    FindClose(find);
-    if (removed > 0) {
-        LogMessage("Removed %u stale image file(s) from disk storage",
-                   removed);
-    }
-}
-
-/* Frees an image's resources; a disk-stored JPEG file is deleted because the
-   cache entry owns it. */
-static void FreeCachedImageData(CachedImage *image)
+/* Frees an image's resources. In-session removal (eviction, delete, clear)
+   deletes a disk-stored file; app exit keeps the files so disk storage
+   doubles as a lasting record. */
+static void FreeCachedImageDataEx(CachedImage *image, BOOL deleteFile)
 {
     if (image->diskPath) {
-        DeleteFileW(image->diskPath);
+        if (deleteFile) DeleteFileW(image->diskPath);
         free(image->diskPath);
     }
     free(image->jpegData);
     free(image->base64Data);
     ZeroMemory(image, sizeof(*image));
+}
+
+static void FreeCachedImageData(CachedImage *image)
+{
+    FreeCachedImageDataEx(image, TRUE);
 }
 
 /* Returns a malloc'd copy of the image's JPEG bytes from memory or disk.
@@ -1281,9 +1249,10 @@ static size_t SetImageHistoryLimit(int limit)
 static void DestroyImageCache(void)
 {
     AcquireSRWLockExclusive(&g_imageLock);
-    FreeCachedImageData(&g_cachedImage);
+    /* Exit keeps disk-stored files on disk. */
+    FreeCachedImageDataEx(&g_cachedImage, FALSE);
     for (size_t i = 0; i < g_imageHistoryCount; i++) {
-        FreeCachedImageData(&g_imageHistory[i]);
+        FreeCachedImageDataEx(&g_imageHistory[i], FALSE);
     }
     free(g_imageHistory);
     g_imageHistory = NULL;
@@ -3173,6 +3142,63 @@ static GpStringFormat *CreateCaptureCenteredTextFormat(void)
     return format;
 }
 
+/* Font/format cache for the overlay. The GDI+ font-family lookup is
+   expensive and the toolbars repaint on every mouse move while a box is
+   drawn near them, so fonts are created once per size (one per monitor
+   DPI) and reused until the overlay closes. */
+typedef struct {
+    float pixelSize;
+    GpFont *font;
+} CaptureFontCacheEntry;
+
+static CaptureFontCacheEntry g_captureFontCache[MAX_CAPTURE_MONITORS];
+static int g_captureFontCacheCount = 0;
+static GpStringFormat *g_captureTextFormatCache = NULL;
+
+static GpFont *GetCaptureFont(float pixelSize)
+{
+    GpFont *font;
+    for (int i = 0; i < g_captureFontCacheCount; i++) {
+        if (g_captureFontCache[i].pixelSize == pixelSize) {
+            return g_captureFontCache[i].font;
+        }
+    }
+    font = CreateCaptureFont(pixelSize);
+    if (font) {
+        if (g_captureFontCacheCount == MAX_CAPTURE_MONITORS) {
+            GdipDeleteFont(g_captureFontCache[0].font);
+            memmove(&g_captureFontCache[0], &g_captureFontCache[1],
+                    (MAX_CAPTURE_MONITORS - 1) *
+                        sizeof(g_captureFontCache[0]));
+            g_captureFontCacheCount--;
+        }
+        g_captureFontCache[g_captureFontCacheCount].pixelSize = pixelSize;
+        g_captureFontCache[g_captureFontCacheCount].font = font;
+        g_captureFontCacheCount++;
+    }
+    return font;
+}
+
+static GpStringFormat *GetCaptureTextFormat(void)
+{
+    if (!g_captureTextFormatCache) {
+        g_captureTextFormatCache = CreateCaptureCenteredTextFormat();
+    }
+    return g_captureTextFormatCache;
+}
+
+static void ReleaseCaptureDrawingCache(void)
+{
+    for (int i = 0; i < g_captureFontCacheCount; i++) {
+        GdipDeleteFont(g_captureFontCache[i].font);
+    }
+    g_captureFontCacheCount = 0;
+    if (g_captureTextFormatCache) {
+        GdipDeleteStringFormat(g_captureTextFormatCache);
+        g_captureTextFormatCache = NULL;
+    }
+}
+
 static void DrawCaptureCenteredText(GpGraphics *graphics, const WCHAR *text,
                                     const RECT *rect, COLORREF color,
                                     BYTE alpha, GpFont *font,
@@ -3327,8 +3353,8 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
         }
     }
 
-    font = CreateCaptureFont(ScaleCaptureUiFloat(panel->dpi, 12.0f));
-    format = CreateCaptureCenteredTextFormat();
+    font = GetCaptureFont(ScaleCaptureUiFloat(panel->dpi, 12.0f));
+    format = GetCaptureTextFormat();
     for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
         RECT buttonRect = panel->buttonRects[tool];
         RECT labelRect = buttonRect;
@@ -3389,8 +3415,6 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
                                 labelColor, ScaleCaptureAlpha(255, opacity),
                                 font, format);
     }
-    if (format) GdipDeleteStringFormat(format);
-    if (font) GdipDeleteFont(font);
 }
 
 static RECT GetCapturePanelPaintRect(int panelIndex)
@@ -3526,8 +3550,8 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection,
     swprintf(dimensions, sizeof(dimensions) / sizeof(dimensions[0]),
              L"%d × %d", selection->right - selection->left,
              selection->bottom - selection->top);
-    font = CreateCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
-    format = CreateCaptureCenteredTextFormat();
+    font = GetCaptureFont(ScaleCaptureUiFloat(dpi, 12.0f));
+    format = GetCaptureTextFormat();
 
     /* Shrink the pill to hug the text; the rect from
        GetCaptureSelectionLabelRect stays the invalidation superset. */
@@ -3564,8 +3588,6 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection,
         DrawCaptureCenteredText(graphics, dimensions, &labelRect,
                                 RGB(245, 249, 255), 255, font, format);
     }
-    if (format) GdipDeleteStringFormat(format);
-    if (font) GdipDeleteFont(font);
 
     if (removeState >= 0) {
         RECT pillRect;
@@ -3773,9 +3795,9 @@ static int HitTestCaptureSelections(POINT point)
     return -1;
 }
 
-/* Finds a box wall under the cursor for resizing. The grab band straddles
-   each edge; the newest box wins. Returns the index or -1; *edge receives
-   the CAPTURE_EDGE_* value. */
+/* Finds a box wall or corner under the cursor for resizing. The grab band
+   straddles each edge; corners take precedence over walls and the newest
+   box wins. Returns the index or -1; *edge receives CAPTURE_EDGE_*. */
 static int HitTestCaptureSelectionEdges(POINT point, int *edge)
 {
     int margin = ScaleCaptureUiValue(GetCaptureDpiAtPoint(point), 5);
@@ -3783,28 +3805,43 @@ static int HitTestCaptureSelectionEdges(POINT point, int *edge)
     *edge = CAPTURE_EDGE_NONE;
     for (size_t i = g_captureSelectionCount; i > 0; i--) {
         const RECT *box = &g_captureSelections[i - 1];
+        BOOL nearLeft = abs(point.x - box->left) <= margin;
+        BOOL nearRight = abs(point.x - box->right) <= margin;
+        BOOL nearTop = abs(point.y - box->top) <= margin;
+        BOOL nearBottom = abs(point.y - box->bottom) <= margin;
         BOOL inVerticalSpan = point.y >= box->top - margin &&
                               point.y <= box->bottom + margin;
         BOOL inHorizontalSpan = point.x >= box->left - margin &&
                                 point.x <= box->right + margin;
-        if (inVerticalSpan && abs(point.x - box->left) <= margin) {
-            *edge = CAPTURE_EDGE_LEFT;
-            return (int)(i - 1);
-        }
-        if (inVerticalSpan && abs(point.x - box->right) <= margin) {
-            *edge = CAPTURE_EDGE_RIGHT;
-            return (int)(i - 1);
-        }
-        if (inHorizontalSpan && abs(point.y - box->top) <= margin) {
-            *edge = CAPTURE_EDGE_TOP;
-            return (int)(i - 1);
-        }
-        if (inHorizontalSpan && abs(point.y - box->bottom) <= margin) {
-            *edge = CAPTURE_EDGE_BOTTOM;
-            return (int)(i - 1);
-        }
+
+        if (nearLeft && nearTop) *edge = CAPTURE_EDGE_TOPLEFT;
+        else if (nearRight && nearTop) *edge = CAPTURE_EDGE_TOPRIGHT;
+        else if (nearLeft && nearBottom) *edge = CAPTURE_EDGE_BOTTOMLEFT;
+        else if (nearRight && nearBottom) *edge = CAPTURE_EDGE_BOTTOMRIGHT;
+        else if (inVerticalSpan && nearLeft) *edge = CAPTURE_EDGE_LEFT;
+        else if (inVerticalSpan && nearRight) *edge = CAPTURE_EDGE_RIGHT;
+        else if (inHorizontalSpan && nearTop) *edge = CAPTURE_EDGE_TOP;
+        else if (inHorizontalSpan && nearBottom) *edge = CAPTURE_EDGE_BOTTOM;
+        if (*edge != CAPTURE_EDGE_NONE) return (int)(i - 1);
     }
     return -1;
+}
+
+static LPCWSTR GetCaptureEdgeCursor(int edge)
+{
+    switch (edge) {
+    case CAPTURE_EDGE_LEFT:
+    case CAPTURE_EDGE_RIGHT:
+        return IDC_SIZEWE;
+    case CAPTURE_EDGE_TOP:
+    case CAPTURE_EDGE_BOTTOM:
+        return IDC_SIZENS;
+    case CAPTURE_EDGE_TOPLEFT:
+    case CAPTURE_EDGE_BOTTOMRIGHT:
+        return IDC_SIZENWSE;
+    default:
+        return IDC_SIZENESW;
+    }
 }
 
 static void InvalidateCaptureRemovePill(HWND hwnd, int index)
@@ -4264,8 +4301,11 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             POINT point = GetCaptureCursorPoint(hwnd);
             int panelIndex = -1;
             int tool = HitTestCaptureToolbar(point, &panelIndex);
-            if (panelIndex != g_captureHoveredPanel ||
-                tool != g_captureHoveredTool) {
+            /* Hover feedback is suppressed while drawing, so skip the state
+               churn (and the panel repaints it triggers) during a drag. */
+            if (!g_captureDragging &&
+                (panelIndex != g_captureHoveredPanel ||
+                 tool != g_captureHoveredTool)) {
                 int oldPanel = g_captureHoveredPanel;
                 g_captureHoveredPanel = panelIndex;
                 g_captureHoveredTool = tool;
@@ -4288,23 +4328,30 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 (size_t)g_captureResizingIndex < g_captureSelectionCount) {
                 RECT *box = &g_captureSelections[g_captureResizingIndex];
                 RECT oldBox = *box;
-                switch (g_captureResizingEdge) {
-                case CAPTURE_EDGE_LEFT:
+                int edge = g_captureResizingEdge;
+                if (edge == CAPTURE_EDGE_LEFT ||
+                    edge == CAPTURE_EDGE_TOPLEFT ||
+                    edge == CAPTURE_EDGE_BOTTOMLEFT) {
                     box->left = point.x > box->right - 2
                         ? box->right - 2 : point.x;
-                    break;
-                case CAPTURE_EDGE_RIGHT:
+                }
+                if (edge == CAPTURE_EDGE_RIGHT ||
+                    edge == CAPTURE_EDGE_TOPRIGHT ||
+                    edge == CAPTURE_EDGE_BOTTOMRIGHT) {
                     box->right = point.x < box->left + 2
                         ? box->left + 2 : point.x;
-                    break;
-                case CAPTURE_EDGE_TOP:
+                }
+                if (edge == CAPTURE_EDGE_TOP ||
+                    edge == CAPTURE_EDGE_TOPLEFT ||
+                    edge == CAPTURE_EDGE_TOPRIGHT) {
                     box->top = point.y > box->bottom - 2
                         ? box->bottom - 2 : point.y;
-                    break;
-                case CAPTURE_EDGE_BOTTOM:
+                }
+                if (edge == CAPTURE_EDGE_BOTTOM ||
+                    edge == CAPTURE_EDGE_BOTTOMLEFT ||
+                    edge == CAPTURE_EDGE_BOTTOMRIGHT) {
                     box->bottom = point.y < box->top + 2
                         ? box->top + 2 : point.y;
-                    break;
                 }
                 if (!EqualRect(&oldBox, box)) {
                     RECT dirtyRect = {0};
@@ -4426,9 +4473,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             if (g_captureDragging) {
                 cursorName = IDC_CROSS;
             } else if (g_captureResizingIndex >= 0) {
-                cursorName = (g_captureResizingEdge == CAPTURE_EDGE_LEFT ||
-                              g_captureResizingEdge == CAPTURE_EDGE_RIGHT)
-                    ? IDC_SIZEWE : IDC_SIZENS;
+                cursorName = GetCaptureEdgeCursor(g_captureResizingEdge);
             } else if (g_captureMovingIndex >= 0 ||
                        HitTestCaptureToolbar(point, NULL) >= 0 ||
                        HitTestCaptureRemovePills(point) >= 0) {
@@ -4436,9 +4481,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             } else if (IsPointInCapturePanel(point)) {
                 cursorName = IDC_ARROW;
             } else if (HitTestCaptureSelectionEdges(point, &hoverEdge) >= 0) {
-                cursorName = (hoverEdge == CAPTURE_EDGE_LEFT ||
-                              hoverEdge == CAPTURE_EDGE_RIGHT)
-                    ? IDC_SIZEWE : IDC_SIZENS;
+                cursorName = GetCaptureEdgeCursor(hoverEdge);
             } else if (HitTestCaptureSelections(point) >= 0) {
                 cursorName = IDC_HAND;
             } else {
@@ -4477,6 +4520,7 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         g_captureMovingIndex = -1;
         g_captureResizingIndex = -1;
         g_captureResizingEdge = CAPTURE_EDGE_NONE;
+        ReleaseCaptureDrawingCache();
         ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
         return 0;
@@ -7840,7 +7884,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Load configuration */
     LoadConfigFromRegistry();
     ApplyHttpAllowList();
-    CleanImageStorageDirectory();
     ParseKeywords();
 
     /* Load application icon */

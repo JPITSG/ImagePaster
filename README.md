@@ -1,4 +1,4 @@
-# ImagePaster 1.0.25
+# ImagePaster 1.0.26
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -10,7 +10,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
   - a short instruction containing a temporary HTTP JPEG URL
 - Watches the clipboard continuously and keeps the latest image encoded and ready for both methods
 - Retains a configurable JPEG history (1–1000 total images or Unlimited) in memory or on disk until exit
-- Selectable image storage: memory (default) or disk under `%LOCALAPPDATA%\ImagePaster`, with graceful fallback to memory when the folder or a file cannot be written and automatic file cleanup on eviction, exit, and startup
+- Selectable image storage: memory (default) or disk under `%LOCALAPPDATA%\ImagePaster`, with graceful fallback to memory when the folder or a file cannot be written; disk files are removed on in-session eviction or deletion but persist after ImagePaster exits
 - History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser, and each entry shows whether it is stored in memory or on disk with a click-to-reveal path that opens File Explorer with the file selected
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
@@ -56,9 +56,9 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
 
-The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is discarded when ImagePaster exits regardless of the storage setting.
+The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. The history index is discarded when ImagePaster exits; with disk storage the JPEG files themselves remain on disk.
 
-**Image Storage** chooses where retained JPEGs live. Memory (the default) keeps everything in RAM, exactly as before. Disk writes each new image to `%LOCALAPPDATA%\ImagePaster\<image-id>.jpg` and serves HTTP requests, thumbnails, and saves from that file; the base64 PNG for the current image always stays in memory so base64 pasting is unaffected. The setting applies to newly copied images — existing entries keep their location until evicted. Failure handling is deliberately graceful: if the folder cannot be created or a file cannot be written, the failure is logged to the Activity Log and that image is kept in memory instead; nothing crashes and pasting keeps working. Disk files are deleted when their image is evicted, deleted, cleared, or when ImagePaster exits, and stale `<image-id>.jpg` files left by an unclean shutdown are removed at the next startup.
+**Image Storage** chooses where retained JPEGs live. Memory (the default) keeps everything in RAM, exactly as before. Disk writes each new image to `%LOCALAPPDATA%\ImagePaster\<image-id>.jpg` and serves HTTP requests, thumbnails, and saves from that file; the base64 PNG for the current image always stays in memory so base64 pasting is unaffected. The setting applies to newly copied images — existing entries keep their location until evicted. Failure handling is deliberately graceful: if the folder cannot be created or a file cannot be written, the failure is logged to the Activity Log and that image is kept in memory instead; nothing crashes and pasting keeps working. Disk files are deleted when their image is evicted, deleted, or cleared during the session, but files still present when ImagePaster exits are kept on disk as a lasting record — a new session lists only its own images in the History dialog, while earlier files stay in the folder until removed manually.
 
 If the **Allowed Clients** list is non-empty, only connections from the listed IPv4 addresses and CIDR subnets are served; everything else is dropped before the request is read and the rejection is recorded in the Activity Log. An empty list allows every client (equivalent to `0.0.0.0/0`).
 
@@ -77,9 +77,9 @@ the normal Print Screen action with a multi-monitor capture workflow:
    dashed outline and live dimensions. Hold `Shift` while dragging additional
    regions to retain the existing selections; dragging without `Shift` starts a
    new selection set. Existing boxes can be picked up and moved by dragging
-   inside them, resized by dragging any of their four walls, and removed with
-   the ✕ pill at their top-right corner; `Shift`+drag inside a box draws a
-   new region across it instead.
+   inside them, resized by dragging any of their four walls or corners, and
+   removed with the ✕ pill at their top-right corner; `Shift`+drag inside a
+   box draws a new region across it instead.
 3. Copy places the selection on the Windows clipboard. If multiple regions are
    selected, their leftmost, topmost, rightmost, and bottommost edges define the
    output bounds. Selected pixels keep their exact relative positions. The

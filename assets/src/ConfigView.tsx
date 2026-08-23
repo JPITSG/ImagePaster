@@ -483,7 +483,8 @@ export default function ConfigView({
             </code>
             ; if the folder or file cannot be written, the image stays in
             memory and the failure is logged. Files are removed when images
-            are evicted and when ImagePaster exits.
+            are evicted or deleted during the session, but files still
+            present when ImagePaster exits are kept on disk.
           </p>
         </div>
 

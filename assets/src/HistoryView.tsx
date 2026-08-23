@@ -160,7 +160,8 @@ export default function HistoryView({ history }: Props) {
           <div className="text-xs font-medium">Retained Images</div>
           <p className="mt-1 text-[11px] text-neutral-500">
             Clipboard images retained by the built-in HTTP server, in memory
-            or on disk. Everything here is discarded when ImagePaster exits.
+            or on disk. This list resets when ImagePaster exits; disk-stored
+            files remain in their folder.
           </p>
         </div>
         <span className="whitespace-nowrap text-[11px] tabular-nums text-neutral-400">
