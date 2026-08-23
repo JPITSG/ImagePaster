@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.29"
-#define APP_VERSION_W     L"1.0.29"
+#define APP_VERSION_A     "1.0.30"
+#define APP_VERSION_W     L"1.0.30"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -4556,6 +4556,10 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         }
         if (wParam == VK_SNAPSHOT) {
             PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, TRUE, 0);
+            return 0;
+        }
+        if (wParam == VK_RETURN && g_captureSelectionCount > 0) {
+            PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, FALSE, 0);
             return 0;
         }
         break;

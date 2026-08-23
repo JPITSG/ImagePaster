@@ -1,4 +1,4 @@
-# ImagePaster 1.0.29
+# ImagePaster 1.0.30
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -81,13 +81,15 @@ the normal Print Screen action with a multi-monitor capture workflow:
    inside them, resized by dragging any of their four walls or corners, and
    removed with the ✕ pill at their top-right corner; `Shift`+drag inside a
    box draws a new region across it instead.
-3. Copy places the selection on the Windows clipboard. If multiple regions are
-   selected, their leftmost, topmost, rightmost, and bottommost edges define the
-   output bounds. Selected pixels keep their exact relative positions. The
-   configurable **Multi-region Gap Fill** makes all unselected space inside those
-   bounds white, black, or a heavy blur of the real underlying desktop. If no
-   selection exists, Copy captures the complete virtual desktop. The overlay then
-   closes and the image enters the normal ImagePaster cache and history pipeline.
+3. Copy places the selection on the Windows clipboard. After creating a box,
+   pressing `Enter` performs the same action as **Copy Selection**. If multiple
+   regions are selected, their leftmost, topmost, rightmost, and bottommost edges
+   define the output bounds. Selected pixels keep their exact relative positions.
+   The configurable **Multi-region Gap Fill** makes all unselected space inside
+   those bounds white, black, or a heavy blur of the real underlying desktop. If
+   no selection exists, Copy captures the complete virtual desktop. The overlay
+   then closes and the image enters the normal ImagePaster cache and history
+   pipeline.
 4. Pressing `Print Screen` again while the overlay is open immediately copies the
    complete virtual desktop. Pressing `Esc` or choosing Cancel closes the overlay
    without changing the clipboard.
