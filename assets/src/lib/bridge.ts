@@ -8,6 +8,7 @@ export interface ConfigData {
   jpegQuality: number;
   imageHistoryLimit: number;
   compatibilityPaste: boolean;
+  screenCaptureEnabled: boolean;
   autoCheckForUpdates: boolean;
   availableIps: string[];
   bindIpAvailable: boolean;
@@ -138,6 +139,7 @@ export function saveSettings(config: ConfigData) {
     jpegQuality: config.jpegQuality,
     imageHistoryLimit: config.imageHistoryLimit,
     compatibilityPaste: config.compatibilityPaste ? 1 : 0,
+    screenCaptureEnabled: config.screenCaptureEnabled ? 1 : 0,
     autoCheckForUpdates: config.autoCheckForUpdates ? 1 : 0,
   });
 }

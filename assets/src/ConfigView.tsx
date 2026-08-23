@@ -63,6 +63,9 @@ export default function ConfigView({
   const [compatibilityPaste, setCompatibilityPaste] = useState(
     config.compatibilityPaste,
   );
+  const [screenCaptureEnabled, setScreenCaptureEnabled] = useState(
+    config.screenCaptureEnabled,
+  );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true,
   );
@@ -197,6 +200,7 @@ export default function ConfigView({
       jpegQuality: quality,
       imageHistoryLimit: historyLimit,
       compatibilityPaste,
+      screenCaptureEnabled,
       autoCheckForUpdates,
     });
   };
@@ -247,6 +251,24 @@ export default function ConfigView({
         <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
           Uses Shift+Insert instead of Ctrl+V when inserting generated text. Enable
           it for applications that handle Ctrl+V themselves.
+        </p>
+      </div>
+
+      <div className="rounded-md border border-neutral-200 px-3 py-2.5">
+        <label
+          htmlFor="screenCaptureEnabled"
+          className="flex cursor-pointer items-center gap-2 text-xs font-medium"
+        >
+          <Checkbox
+            id="screenCaptureEnabled"
+            checked={screenCaptureEnabled}
+            onChange={(event) => setScreenCaptureEnabled(event.target.checked)}
+          />
+          Enable interactive Print Screen capture
+        </label>
+        <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
+          Opens a multi-monitor selection overlay. Print Screen again copies the
+          full desktop; Esc cancels.
         </p>
       </div>
 

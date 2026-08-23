@@ -8,6 +8,7 @@
  * Features:
  *   - Shared in-memory clipboard image cache with configurable JPEG history
  *   - Configurable base64 or HTTP URL paste mode
+ *   - Optional multi-monitor Print Screen capture and selection overlay
  *   - Configurable title matching and HTTP bind settings (registry-persisted)
  *   - WebView2-based configuration and activity log modals
  *   - System tray icon with context menu
@@ -100,14 +101,17 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.3"
-#define APP_VERSION_W     L"1.0.3"
+#define APP_VERSION_A     "1.0.4"
+#define APP_VERSION_W     L"1.0.4"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
 #define WM_HTTP_EVENT      (WM_APP + 2)
 #define WM_APP_UPDATE_RESULT   (WM_APP + 3)
 #define WM_APP_UPDATE_PROGRESS (WM_APP + 4)
+#define WM_SCREEN_CAPTURE_BEGIN  (WM_APP + 5)
+#define WM_SCREEN_CAPTURE_COPY   (WM_APP + 6)
+#define WM_SCREEN_CAPTURE_CANCEL (WM_APP + 7)
 #define ID_TRAY_LOG       1001
 #define ID_TRAY_CONFIGURE 1002
 #define ID_TRAY_EXIT      1003
@@ -135,11 +139,13 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define REG_VALUE_HISTORY_LIMIT "ImageHistoryLimit"
 #define REG_VALUE_COMPATIBILITY_PASTE "CompatibilityPaste"
 #define REG_VALUE_LEGACY_COMPATIBILITY_PASTE "ShiftInsertPaste"
+#define REG_VALUE_SCREEN_CAPTURE "ScreenCaptureEnabled"
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
 #define MAX_DETECTED_IPS    64
+#define MAX_CAPTURE_MONITORS 32
 #define IMAGE_TOKEN_BYTES   32
 #define IMAGE_TOKEN_HEX_LEN (IMAGE_TOKEN_BYTES * 2)
 #define DEFAULT_HTTP_PORT   10444
@@ -151,6 +157,16 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define HTTP_EVENT_SERVED   200
 #define HTTP_EVENT_GONE     410
 #define HTTP_EVENT_NOT_FOUND 404
+#define CAPTURE_TOOL_CLIP    0
+#define CAPTURE_TOOL_COPY    1
+#define CAPTURE_TOOL_CANCEL  2
+#define CAPTURE_TOOL_COUNT   3
+#define CAPTURE_PANEL_WIDTH  250
+#define CAPTURE_PANEL_HEIGHT 74
+#define CAPTURE_BUTTON_WIDTH 70
+#define CAPTURE_BUTTON_HEIGHT 54
+#define CAPTURE_BUTTON_GAP    8
+#define CAPTURE_PANEL_BOTTOM_MARGIN 40
 
 /* ── Log ring buffer ───────────────────────────────────────────────────── */
 
@@ -192,6 +208,7 @@ static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
 /* Zero means unlimited; finite limits include the current image. */
 static int  g_configImageHistoryLimit = DEFAULT_IMAGE_HISTORY_LIMIT;
 static BOOL g_configCompatibilityPaste = TRUE;
+static BOOL g_configScreenCaptureEnabled = FALSE;
 static BOOL g_configAutoCheckForUpdates = TRUE;
 static BOOL g_pasteDeferred = FALSE;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
@@ -216,6 +233,37 @@ static SRWLOCK g_imageLock = SRWLOCK_INIT;
 static char (*g_goneTokens)[IMAGE_TOKEN_HEX_LEN + 1] = NULL;
 static size_t g_goneTokenCount = 0;
 static size_t g_goneTokenCapacity = 0;
+
+/* Interactive Print Screen capture overlay. Coordinates are relative to the
+   top-left of the Windows virtual desktop, which can have a negative origin. */
+typedef struct {
+    RECT panelRect;
+    RECT buttonRects[CAPTURE_TOOL_COUNT];
+    UINT dpi;
+} CapturePanel;
+
+static HWND g_captureOverlayHwnd = NULL;
+static HBITMAP g_captureOriginalBitmap = NULL;
+static DWORD *g_captureOriginalPixels = NULL;
+static int g_captureVirtualX = 0;
+static int g_captureVirtualY = 0;
+static int g_captureWidth = 0;
+static int g_captureHeight = 0;
+static CapturePanel g_capturePanels[MAX_CAPTURE_MONITORS];
+static int g_capturePanelCount = 0;
+static int g_captureSelectedTool = CAPTURE_TOOL_CLIP;
+static int g_captureHoveredPanel = -1;
+static int g_captureHoveredTool = -1;
+static int g_capturePressedPanel = -1;
+static int g_capturePressedTool = -1;
+static BOOL g_captureDragging = FALSE;
+static BOOL g_captureHasSelection = FALSE;
+static POINT g_captureDragStart = {0};
+static POINT g_captureDragCurrent = {0};
+static RECT g_captureSelection = {0};
+static HANDLE g_capturePreviousDpiContext = NULL;
+static BOOL g_printScreenKeyDown = FALSE;
+static BOOL g_escapeKeyDown = FALSE;
 
 /* HTTP listener state. */
 static BOOL g_winsockReady = FALSE;
@@ -495,6 +543,9 @@ static void StopHttpServer(void);
 static BOOL RefreshClipboardImageCache(void);
 static void ClearCurrentImage(const char *reason);
 static void DestroyImageCache(void);
+static BOOL BeginScreenCapture(void);
+static BOOL CompleteScreenCapture(BOOL forceFullDesktop);
+static void CancelScreenCapture(const char *reason);
 static void StartUpdateCheck(void);
 static void CancelUpdateCheck(void);
 static void InstallPreparedUpdate(void);
@@ -1615,13 +1666,13 @@ static BOOL PasteCachedImage(void)
     }
 
     if (g_configPasteMethod == PASTE_METHOD_HTTP) {
-        const char *format =
+        char formatted[512];
+        int formattedLen = snprintf(
+            formatted, sizeof(formatted),
             "[ image available at http://%s:%d/%s.jpg - if you feel this image "
             "will be useful later on be sure to save it to /tmp or a temp location "
-            "for later use ]";
-        char formatted[512];
-        int formattedLen = snprintf(formatted, sizeof(formatted), format,
-                                    g_configBindIp, g_configHttpPort, token);
+            "for later use ]",
+            g_configBindIp, g_configHttpPort, token);
         if (formattedLen > 0 && formattedLen < (int)sizeof(formatted)) {
             pasteText = (char *)malloc((size_t)formattedLen + 1);
             if (pasteText) {
@@ -1745,6 +1796,13 @@ static BOOL LoadConfigFromRegistry(void)
     }
 
     size = sizeof(value);
+    if (RegQueryValueExA(hKey, REG_VALUE_SCREEN_CAPTURE, NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= 1) {
+        g_configScreenCaptureEnabled = value != 0;
+    }
+
+    size = sizeof(value);
     if (RegQueryValueExA(hKey, REG_VALUE_AUTO_UPDATE, NULL, &type,
                          (LPBYTE)&value, &size) == ERROR_SUCCESS &&
         type == REG_DWORD && value <= 1) {
@@ -1788,6 +1846,9 @@ static void SaveConfigToRegistry(void)
         RegSetValueExA(hKey, REG_VALUE_COMPATIBILITY_PASTE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
         RegDeleteValueA(hKey, REG_VALUE_LEGACY_COMPATIBILITY_PASTE);
+        value = (DWORD)g_configScreenCaptureEnabled;
+        RegSetValueExA(hKey, REG_VALUE_SCREEN_CAPTURE, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
         value = (DWORD)g_configAutoCheckForUpdates;
         RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
@@ -1800,21 +1861,1016 @@ static void SaveConfigToRegistry(void)
         snprintf(historyText, sizeof(historyText), "%d",
                  g_configImageHistoryLimit);
     }
-    LogMessage("Configuration saved: method=%s, shortcut=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
+    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
                g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V",
+               g_configScreenCaptureEnabled ? "enabled" : "disabled",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
                historyText, g_configTitleMatch);
+}
+
+/* ── Interactive multi-monitor screen capture ─────────────────────────── */
+
+static void EnterScreenCaptureDpiMode(void)
+{
+    typedef HANDLE (WINAPI *PFN_SetThreadDpiAwarenessContextCompat)(HANDLE);
+    HMODULE user32Module = GetModuleHandleW(L"user32.dll");
+    PFN_SetThreadDpiAwarenessContextCompat setContext = NULL;
+
+    if (!user32Module || g_capturePreviousDpiContext) return;
+    setContext = (PFN_SetThreadDpiAwarenessContextCompat)GetProcAddress(
+        user32Module, "SetThreadDpiAwarenessContext");
+    if (setContext) {
+        g_capturePreviousDpiContext = setContext((HANDLE)(LONG_PTR)-4);
+    }
+}
+
+static void LeaveScreenCaptureDpiMode(void)
+{
+    typedef HANDLE (WINAPI *PFN_SetThreadDpiAwarenessContextCompat)(HANDLE);
+    HMODULE user32Module;
+    PFN_SetThreadDpiAwarenessContextCompat setContext;
+
+    if (!g_capturePreviousDpiContext) return;
+    user32Module = GetModuleHandleW(L"user32.dll");
+    setContext = user32Module
+        ? (PFN_SetThreadDpiAwarenessContextCompat)GetProcAddress(
+            user32Module, "SetThreadDpiAwarenessContext")
+        : NULL;
+    if (setContext) setContext(g_capturePreviousDpiContext);
+    g_capturePreviousDpiContext = NULL;
+}
+
+static HBITMAP CreateTopDownCaptureBitmap(HDC referenceDc, int width, int height,
+                                          DWORD **pixels)
+{
+    BITMAPINFO bitmapInfo;
+    ZeroMemory(&bitmapInfo, sizeof(bitmapInfo));
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(referenceDc, &bitmapInfo, DIB_RGB_COLORS,
+                            (void **)pixels, NULL, 0);
+}
+
+static void ReleaseScreenCaptureBitmaps(void)
+{
+    if (g_captureOriginalBitmap) DeleteObject(g_captureOriginalBitmap);
+    g_captureOriginalBitmap = NULL;
+    g_captureOriginalPixels = NULL;
+    g_captureWidth = 0;
+    g_captureHeight = 0;
+}
+
+static BOOL CaptureVirtualDesktopSnapshot(void)
+{
+    HDC screenDc = NULL;
+    HDC memoryDc = NULL;
+    HGDIOBJ previousBitmap = NULL;
+    size_t pixelCount;
+    BOOL captured = FALSE;
+
+    ReleaseScreenCaptureBitmaps();
+    g_captureVirtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    g_captureVirtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_captureWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    g_captureHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (g_captureWidth <= 0 || g_captureHeight <= 0 ||
+        (size_t)g_captureWidth > (size_t)-1 / (size_t)g_captureHeight) {
+        goto cleanup;
+    }
+    pixelCount = (size_t)g_captureWidth * (size_t)g_captureHeight;
+    if (pixelCount > (size_t)-1 / sizeof(DWORD)) goto cleanup;
+
+    screenDc = GetDC(NULL);
+    if (!screenDc) goto cleanup;
+    memoryDc = CreateCompatibleDC(screenDc);
+    if (!memoryDc) goto cleanup;
+
+    g_captureOriginalBitmap = CreateTopDownCaptureBitmap(
+        screenDc, g_captureWidth, g_captureHeight, &g_captureOriginalPixels);
+    if (!g_captureOriginalBitmap || !g_captureOriginalPixels) {
+        goto cleanup;
+    }
+
+    previousBitmap = SelectObject(memoryDc, g_captureOriginalBitmap);
+    if (!BitBlt(memoryDc, 0, 0, g_captureWidth, g_captureHeight,
+                screenDc, g_captureVirtualX, g_captureVirtualY,
+                SRCCOPY | CAPTUREBLT)) {
+        goto cleanup;
+    }
+    SelectObject(memoryDc, previousBitmap);
+    previousBitmap = NULL;
+
+    captured = TRUE;
+
+cleanup:
+    if (previousBitmap && memoryDc) SelectObject(memoryDc, previousBitmap);
+    if (memoryDc) DeleteDC(memoryDc);
+    if (screenDc) ReleaseDC(NULL, screenDc);
+    if (!captured) ReleaseScreenCaptureBitmaps();
+    return captured;
+}
+
+static UINT GetCaptureMonitorDpi(HMONITOR monitor)
+{
+    typedef HRESULT (WINAPI *PFN_GetDpiForMonitorCompat)(HMONITOR, int,
+                                                         UINT *, UINT *);
+    HMODULE shcoreModule = LoadLibraryW(L"shcore.dll");
+    UINT dpiX = 96;
+    UINT dpiY = 96;
+    if (shcoreModule) {
+        PFN_GetDpiForMonitorCompat getDpiForMonitor =
+            (PFN_GetDpiForMonitorCompat)GetProcAddress(
+                shcoreModule, "GetDpiForMonitor");
+        if (getDpiForMonitor &&
+            FAILED(getDpiForMonitor(monitor, 0, &dpiX, &dpiY))) {
+            dpiX = 96;
+        }
+        FreeLibrary(shcoreModule);
+    }
+    if (dpiX < 72) dpiX = 72;
+    if (dpiX > 288) dpiX = 288;
+    return dpiX;
+}
+
+static int ScaleCaptureUiValue(UINT dpi, int value)
+{
+    return MulDiv(value, (int)dpi, 96);
+}
+
+static BOOL CALLBACK CaptureMonitorEnumProc(HMONITOR monitor, HDC monitorDc,
+                                             LPRECT monitorRect, LPARAM context)
+{
+    CapturePanel *panel;
+    UINT dpi;
+    int panelWidth;
+    int panelHeight;
+    int buttonWidth;
+    int buttonHeight;
+    int buttonGap;
+    int panelBottomMargin;
+    int panelTopPadding;
+    int panelLeft;
+    int panelTop;
+    int buttonLeft;
+    int horizontalPadding;
+
+    (void)monitorDc;
+    (void)context;
+    if (g_capturePanelCount >= MAX_CAPTURE_MONITORS) return FALSE;
+
+    dpi = GetCaptureMonitorDpi(monitor);
+    {
+        int monitorWidth = monitorRect->right - monitorRect->left;
+        UINT maximumDpi = monitorWidth > 32
+            ? (UINT)MulDiv(monitorWidth - 16, 96, CAPTURE_PANEL_WIDTH)
+            : 72;
+        if (maximumDpi < 72) maximumDpi = 72;
+        if (dpi > maximumDpi) dpi = maximumDpi;
+    }
+    panelWidth = ScaleCaptureUiValue(dpi, CAPTURE_PANEL_WIDTH);
+    panelHeight = ScaleCaptureUiValue(dpi, CAPTURE_PANEL_HEIGHT);
+    buttonWidth = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_WIDTH);
+    buttonHeight = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_HEIGHT);
+    buttonGap = ScaleCaptureUiValue(dpi, CAPTURE_BUTTON_GAP);
+    panelBottomMargin = ScaleCaptureUiValue(
+        dpi, CAPTURE_PANEL_BOTTOM_MARGIN);
+    panelTopPadding = ScaleCaptureUiValue(dpi, 10);
+    horizontalPadding =
+        (panelWidth - (buttonWidth * CAPTURE_TOOL_COUNT) -
+         (buttonGap * (CAPTURE_TOOL_COUNT - 1))) / 2;
+
+    panelLeft = monitorRect->left - g_captureVirtualX +
+                ((monitorRect->right - monitorRect->left) -
+                 panelWidth) / 2;
+    panelTop = monitorRect->bottom - g_captureVirtualY -
+               panelBottomMargin - panelHeight;
+    if (panelTop < monitorRect->top - g_captureVirtualY + 8) {
+        panelTop = monitorRect->top - g_captureVirtualY + 8;
+    }
+
+    panel = &g_capturePanels[g_capturePanelCount++];
+    panel->dpi = dpi;
+    SetRect(&panel->panelRect, panelLeft, panelTop,
+            panelLeft + panelWidth,
+            panelTop + panelHeight);
+    buttonLeft = panelLeft + horizontalPadding;
+    for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
+        SetRect(&panel->buttonRects[tool],
+                buttonLeft, panelTop + panelTopPadding,
+                buttonLeft + buttonWidth,
+                panelTop + panelTopPadding + buttonHeight);
+        buttonLeft += buttonWidth + buttonGap;
+    }
+    return TRUE;
+}
+
+static void BuildCapturePanels(void)
+{
+    g_capturePanelCount = 0;
+    EnumDisplayMonitors(NULL, NULL, CaptureMonitorEnumProc, 0);
+    if (g_capturePanelCount == 0) {
+        RECT fallback = {
+            g_captureVirtualX,
+            g_captureVirtualY,
+            g_captureVirtualX + g_captureWidth,
+            g_captureVirtualY + g_captureHeight
+        };
+        CaptureMonitorEnumProc(NULL, NULL, &fallback, 0);
+    }
+}
+
+static POINT GetCaptureCursorPoint(HWND hwnd)
+{
+    POINT point = {0};
+    GetCursorPos(&point);
+    ScreenToClient(hwnd, &point);
+    if (point.x < 0) point.x = 0;
+    if (point.y < 0) point.y = 0;
+    if (point.x > g_captureWidth) point.x = g_captureWidth;
+    if (point.y > g_captureHeight) point.y = g_captureHeight;
+    return point;
+}
+
+static RECT NormalizeCaptureRect(POINT start, POINT end)
+{
+    RECT rect;
+    rect.left = start.x < end.x ? start.x : end.x;
+    rect.top = start.y < end.y ? start.y : end.y;
+    rect.right = start.x > end.x ? start.x : end.x;
+    rect.bottom = start.y > end.y ? start.y : end.y;
+    if (rect.left < 0) rect.left = 0;
+    if (rect.top < 0) rect.top = 0;
+    if (rect.right > g_captureWidth) rect.right = g_captureWidth;
+    if (rect.bottom > g_captureHeight) rect.bottom = g_captureHeight;
+    return rect;
+}
+
+static BOOL GetActiveCaptureSelection(RECT *selection)
+{
+    RECT rect;
+    if (g_captureDragging) {
+        rect = NormalizeCaptureRect(g_captureDragStart, g_captureDragCurrent);
+    } else if (g_captureHasSelection) {
+        rect = g_captureSelection;
+    } else {
+        return FALSE;
+    }
+    if (rect.right - rect.left < 2 || rect.bottom - rect.top < 2) return FALSE;
+    *selection = rect;
+    return TRUE;
+}
+
+static void AlphaFillRect(HDC destinationDc, const RECT *rect,
+                          COLORREF color, BYTE opacity)
+{
+    int width = rect->right - rect->left;
+    int height = rect->bottom - rect->top;
+    HDC sourceDc;
+    HBITMAP sourceBitmap;
+    HGDIOBJ oldBitmap;
+    BITMAPINFO bitmapInfo;
+    DWORD *pixel = NULL;
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, opacity, 0};
+
+    if (width <= 0 || height <= 0) return;
+    sourceDc = CreateCompatibleDC(destinationDc);
+    if (!sourceDc) return;
+    ZeroMemory(&bitmapInfo, sizeof(bitmapInfo));
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = 1;
+    bitmapInfo.bmiHeader.biHeight = -1;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    sourceBitmap = CreateDIBSection(destinationDc, &bitmapInfo, DIB_RGB_COLORS,
+                                    (void **)&pixel, NULL, 0);
+    if (!sourceBitmap || !pixel) {
+        if (sourceBitmap) DeleteObject(sourceBitmap);
+        DeleteDC(sourceDc);
+        return;
+    }
+    *pixel = (DWORD)GetBValue(color) |
+             ((DWORD)GetGValue(color) << 8) |
+             ((DWORD)GetRValue(color) << 16);
+    oldBitmap = SelectObject(sourceDc, sourceBitmap);
+    AlphaBlend(destinationDc, rect->left, rect->top, width, height,
+               sourceDc, 0, 0, 1, 1, blend);
+    SelectObject(sourceDc, oldBitmap);
+    DeleteObject(sourceBitmap);
+    DeleteDC(sourceDc);
+}
+
+static void AlphaFillRoundedRect(HDC destinationDc, const RECT *rect,
+                                 COLORREF color, BYTE opacity, int radius)
+{
+    int width = rect->right - rect->left;
+    int height = rect->bottom - rect->top;
+    HDC sourceDc;
+    HBITMAP sourceBitmap;
+    HGDIOBJ oldBitmap;
+    BITMAPINFO bitmapInfo;
+    DWORD *pixels = NULL;
+    HRGN roundedRegion;
+    int savedDc;
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, opacity, 0};
+
+    if (width <= 0 || height <= 0) return;
+    sourceDc = CreateCompatibleDC(destinationDc);
+    if (!sourceDc) return;
+    ZeroMemory(&bitmapInfo, sizeof(bitmapInfo));
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    sourceBitmap = CreateDIBSection(destinationDc, &bitmapInfo, DIB_RGB_COLORS,
+                                    (void **)&pixels, NULL, 0);
+    if (!sourceBitmap || !pixels) {
+        if (sourceBitmap) DeleteObject(sourceBitmap);
+        DeleteDC(sourceDc);
+        return;
+    }
+    {
+        DWORD pixel = (DWORD)GetBValue(color) |
+                      ((DWORD)GetGValue(color) << 8) |
+                      ((DWORD)GetRValue(color) << 16);
+        size_t pixelCount = (size_t)width * (size_t)height;
+        for (size_t i = 0; i < pixelCount; i++) pixels[i] = pixel;
+    }
+
+    oldBitmap = SelectObject(sourceDc, sourceBitmap);
+    roundedRegion = CreateRoundRectRgn(rect->left, rect->top,
+                                       rect->right + 1, rect->bottom + 1,
+                                       radius, radius);
+    savedDc = SaveDC(destinationDc);
+    if (roundedRegion && savedDc != 0) {
+        ExtSelectClipRgn(destinationDc, roundedRegion, RGN_AND);
+        AlphaBlend(destinationDc, rect->left, rect->top, width, height,
+                   sourceDc, 0, 0, width, height, blend);
+    }
+    if (savedDc != 0) RestoreDC(destinationDc, savedDc);
+    if (roundedRegion) DeleteObject(roundedRegion);
+    SelectObject(sourceDc, oldBitmap);
+    DeleteObject(sourceBitmap);
+    DeleteDC(sourceDc);
+}
+
+static void DrawCaptureToolIcon(HDC dc, int tool, const RECT *buttonRect,
+                                COLORREF color, UINT dpi)
+{
+    int centerX = (buttonRect->left + buttonRect->right) / 2;
+    int top = buttonRect->top + ScaleCaptureUiValue(dpi, 7);
+    int inner = ScaleCaptureUiValue(dpi, 10);
+    int middle = ScaleCaptureUiValue(dpi, 4);
+    int shortStep = ScaleCaptureUiValue(dpi, 6);
+    int iconHeight = ScaleCaptureUiValue(dpi, 18);
+    int penWidth = ScaleCaptureUiValue(dpi, 2);
+    HPEN pen;
+    HGDIOBJ oldPen;
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    if (penWidth < 1) penWidth = 1;
+    pen = CreatePen(PS_SOLID, penWidth, color);
+    if (!pen) {
+        SelectObject(dc, oldBrush);
+        return;
+    }
+    oldPen = SelectObject(dc, pen);
+
+    if (tool == CAPTURE_TOOL_CLIP) {
+        MoveToEx(dc, centerX - inner, top + shortStep, NULL);
+        LineTo(dc, centerX - inner, top);
+        LineTo(dc, centerX - middle, top);
+        MoveToEx(dc, centerX + middle, top, NULL);
+        LineTo(dc, centerX + inner, top);
+        LineTo(dc, centerX + inner, top + shortStep);
+        MoveToEx(dc, centerX + inner, top + iconHeight - shortStep, NULL);
+        LineTo(dc, centerX + inner, top + iconHeight);
+        LineTo(dc, centerX + middle, top + iconHeight);
+        MoveToEx(dc, centerX - middle, top + iconHeight, NULL);
+        LineTo(dc, centerX - inner, top + iconHeight);
+        LineTo(dc, centerX - inner, top + iconHeight - shortStep);
+    } else if (tool == CAPTURE_TOOL_COPY) {
+        int overlap = ScaleCaptureUiValue(dpi, 5);
+        int corner = ScaleCaptureUiValue(dpi, 3);
+        RoundRect(dc, centerX - inner, top, centerX + overlap,
+                  top + ScaleCaptureUiValue(dpi, 13), corner, corner);
+        RoundRect(dc, centerX - overlap, top + overlap, centerX + inner,
+                  top + iconHeight, corner, corner);
+    } else {
+        int cross = ScaleCaptureUiValue(dpi, 8);
+        MoveToEx(dc, centerX - cross, top, NULL);
+        LineTo(dc, centerX + cross, top + iconHeight);
+        MoveToEx(dc, centerX + cross, top, NULL);
+        LineTo(dc, centerX - cross, top + iconHeight);
+    }
+
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+static void DrawCapturePanel(HDC dc, int panelIndex)
+{
+    static const WCHAR *labels[CAPTURE_TOOL_COUNT] = {
+        L"Clip", L"Copy", L"Cancel"
+    };
+    CapturePanel *panel = &g_capturePanels[panelIndex];
+    RECT shadowRect = panel->panelRect;
+    int shadowOffset = ScaleCaptureUiValue(panel->dpi, 5);
+    int panelRadius = ScaleCaptureUiValue(panel->dpi, 22);
+    int buttonRadius = ScaleCaptureUiValue(panel->dpi, 14);
+    HPEN borderPen;
+    HGDIOBJ oldPen;
+    HGDIOBJ oldBrush;
+    HFONT font;
+    HGDIOBJ oldFont;
+
+    if (!RectVisible(dc, &panel->panelRect)) return;
+    OffsetRect(&shadowRect, 0, shadowOffset);
+    AlphaFillRoundedRect(dc, &shadowRect, RGB(0, 0, 0), 110, panelRadius);
+    AlphaFillRoundedRect(dc, &panel->panelRect, RGB(25, 30, 38), 225,
+                         panelRadius);
+
+    borderPen = CreatePen(PS_SOLID, 1, RGB(105, 118, 135));
+    oldPen = SelectObject(dc, borderPen);
+    oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, panel->panelRect.left, panel->panelRect.top,
+              panel->panelRect.right, panel->panelRect.bottom,
+              panelRadius, panelRadius);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(borderPen);
+
+    font = CreateFontW(-ScaleCaptureUiValue(panel->dpi, 12),
+                       0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    oldFont = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
+        RECT buttonRect = panel->buttonRects[tool];
+        RECT labelRect = buttonRect;
+        BOOL selected = tool == g_captureSelectedTool;
+        BOOL hovered = panelIndex == g_captureHoveredPanel &&
+                       tool == g_captureHoveredTool;
+        BOOL pressed = panelIndex == g_capturePressedPanel &&
+                       tool == g_capturePressedTool;
+        COLORREF accent = tool == CAPTURE_TOOL_CANCEL
+            ? RGB(255, 128, 128) : RGB(116, 220, 255);
+        COLORREF foreground = (selected || hovered || pressed)
+            ? RGB(255, 255, 255) : RGB(210, 218, 228);
+
+        if (pressed) {
+            COLORREF pressedColor = tool == CAPTURE_TOOL_CANCEL
+                ? RGB(118, 35, 42) : RGB(28, 103, 132);
+            AlphaFillRoundedRect(dc, &buttonRect, pressedColor, 220,
+                                 buttonRadius);
+        } else if (selected) {
+            AlphaFillRoundedRect(dc, &buttonRect, RGB(35, 126, 158), 185,
+                                 buttonRadius);
+        } else if (hovered) {
+            COLORREF hoverColor = tool == CAPTURE_TOOL_CANCEL
+                ? RGB(142, 48, 55) : RGB(74, 87, 104);
+            AlphaFillRoundedRect(dc, &buttonRect, hoverColor, 175,
+                                 buttonRadius);
+        }
+        DrawCaptureToolIcon(dc, tool, &buttonRect,
+                            selected || hovered || pressed ? accent : foreground,
+                            panel->dpi);
+        labelRect.top = buttonRect.top + ScaleCaptureUiValue(panel->dpi, 32);
+        SetTextColor(dc, foreground);
+        DrawTextW(dc, labels[tool], -1, &labelRect,
+                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    SelectObject(dc, oldFont);
+    if (font) DeleteObject(font);
+}
+
+static void DrawCaptureSelection(HDC dc, const RECT *selection)
+{
+    HDC sourceDc = CreateCompatibleDC(dc);
+    HGDIOBJ oldBitmap;
+    HGDIOBJ oldBrush;
+    HPEN outlinePen;
+    HGDIOBJ oldPen;
+    WCHAR dimensions[64];
+    RECT labelRect;
+    HFONT font;
+    HGDIOBJ oldFont;
+
+    if (!sourceDc) return;
+    oldBitmap = SelectObject(sourceDc, g_captureOriginalBitmap);
+    BitBlt(dc, selection->left, selection->top,
+           selection->right - selection->left,
+           selection->bottom - selection->top,
+           sourceDc, selection->left, selection->top, SRCCOPY);
+    SelectObject(sourceDc, oldBitmap);
+    DeleteDC(sourceDc);
+
+    outlinePen = CreatePen(PS_DASH, 1, RGB(235, 248, 255));
+    oldPen = SelectObject(dc, outlinePen);
+    oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    SetBkMode(dc, TRANSPARENT);
+    Rectangle(dc, selection->left, selection->top,
+              selection->right, selection->bottom);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(outlinePen);
+
+    swprintf(dimensions, sizeof(dimensions) / sizeof(dimensions[0]),
+             L"%d × %d", selection->right - selection->left,
+             selection->bottom - selection->top);
+    labelRect.left = selection->left;
+    labelRect.top = selection->top >= 32
+        ? selection->top - 28 : selection->top + 6;
+    labelRect.right = labelRect.left + 104;
+    labelRect.bottom = labelRect.top + 23;
+    if (labelRect.right > g_captureWidth) {
+        OffsetRect(&labelRect, g_captureWidth - labelRect.right, 0);
+    }
+    AlphaFillRoundedRect(dc, &labelRect, RGB(20, 25, 32), 220, 10);
+    font = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    oldFont = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+    SetTextColor(dc, RGB(240, 248, 255));
+    SetBkMode(dc, TRANSPARENT);
+    DrawTextW(dc, dimensions, -1, &labelRect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    if (font) DeleteObject(font);
+}
+
+static void PaintScreenCaptureOverlay(HWND hwnd)
+{
+    PAINTSTRUCT paint;
+    HDC dc = BeginPaint(hwnd, &paint);
+    HDC sourceDc;
+    HGDIOBJ oldBitmap;
+    RECT selection;
+
+    if (!dc) return;
+    sourceDc = CreateCompatibleDC(dc);
+    if (sourceDc && g_captureOriginalBitmap) {
+        oldBitmap = SelectObject(sourceDc, g_captureOriginalBitmap);
+        BitBlt(dc, paint.rcPaint.left, paint.rcPaint.top,
+               paint.rcPaint.right - paint.rcPaint.left,
+               paint.rcPaint.bottom - paint.rcPaint.top,
+               sourceDc, paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
+        SelectObject(sourceDc, oldBitmap);
+        DeleteDC(sourceDc);
+        AlphaFillRect(dc, &paint.rcPaint, RGB(0, 0, 0), 102);
+    } else {
+        if (sourceDc) DeleteDC(sourceDc);
+        FillRect(dc, &paint.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+
+    if (GetActiveCaptureSelection(&selection)) {
+        DrawCaptureSelection(dc, &selection);
+    }
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        DrawCapturePanel(dc, panel);
+    }
+    EndPaint(hwnd, &paint);
+}
+
+static int HitTestCaptureToolbar(POINT point, int *panelIndex)
+{
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        for (int tool = 0; tool < CAPTURE_TOOL_COUNT; tool++) {
+            if (PtInRect(&g_capturePanels[panel].buttonRects[tool], point)) {
+                if (panelIndex) *panelIndex = panel;
+                return tool;
+            }
+        }
+    }
+    if (panelIndex) *panelIndex = -1;
+    return -1;
+}
+
+static BOOL IsPointInCapturePanel(POINT point)
+{
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        if (PtInRect(&g_capturePanels[panel].panelRect, point)) return TRUE;
+    }
+    return FALSE;
+}
+
+static void InvalidateCapturePanels(HWND hwnd)
+{
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        RECT area = g_capturePanels[panel].panelRect;
+        InflateRect(&area,
+                    ScaleCaptureUiValue(g_capturePanels[panel].dpi, 6),
+                    ScaleCaptureUiValue(g_capturePanels[panel].dpi, 8));
+        InvalidateRect(hwnd, &area, FALSE);
+    }
+}
+
+static HGLOBAL CreateCaptureClipboardDib(const RECT *sourceRect)
+{
+    int width = sourceRect->right - sourceRect->left;
+    int height = sourceRect->bottom - sourceRect->top;
+    size_t rowBytes;
+    size_t pixelBytes;
+    size_t totalBytes;
+    HGLOBAL dibMemory;
+    BYTE *dibData;
+    BITMAPINFOHEADER *header;
+    BYTE *destinationPixels;
+
+    if (!g_captureOriginalPixels || width <= 0 || height <= 0 ||
+        (size_t)width > (size_t)-1 / 4u) return NULL;
+    rowBytes = (size_t)width * 4u;
+    if ((size_t)height > (size_t)-1 / rowBytes) return NULL;
+    pixelBytes = rowBytes * (size_t)height;
+    if (pixelBytes > 0xffffffffu ||
+        pixelBytes > (size_t)-1 - sizeof(BITMAPINFOHEADER)) return NULL;
+    totalBytes = sizeof(BITMAPINFOHEADER) + pixelBytes;
+
+    dibMemory = GlobalAlloc(GMEM_MOVEABLE, totalBytes);
+    if (!dibMemory) return NULL;
+    dibData = (BYTE *)GlobalLock(dibMemory);
+    if (!dibData) {
+        GlobalFree(dibMemory);
+        return NULL;
+    }
+
+    header = (BITMAPINFOHEADER *)dibData;
+    ZeroMemory(header, sizeof(*header));
+    header->biSize = sizeof(*header);
+    header->biWidth = width;
+    header->biHeight = height;
+    header->biPlanes = 1;
+    header->biBitCount = 32;
+    header->biCompression = BI_RGB;
+    header->biSizeImage = (DWORD)pixelBytes;
+    destinationPixels = dibData + sizeof(*header);
+
+    for (int row = 0; row < height; row++) {
+        const DWORD *source = g_captureOriginalPixels +
+            ((size_t)(sourceRect->top + row) * (size_t)g_captureWidth) +
+            (size_t)sourceRect->left;
+        BYTE *destination = destinationPixels +
+            ((size_t)(height - 1 - row) * rowBytes);
+        memcpy(destination, source, rowBytes);
+    }
+    GlobalUnlock(dibMemory);
+    return dibMemory;
+}
+
+static void CloseScreenCaptureOverlay(void)
+{
+    HWND overlay = g_captureOverlayHwnd;
+    if (overlay) {
+        ShowWindow(overlay, SW_HIDE);
+        DestroyWindow(overlay);
+    } else {
+        ReleaseScreenCaptureBitmaps();
+    }
+}
+
+static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
+                                             WPARAM wParam, LPARAM lParam)
+{
+    (void)wParam;
+    (void)lParam;
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        PaintScreenCaptureOverlay(hwnd);
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        {
+            POINT point = GetCaptureCursorPoint(hwnd);
+            int panelIndex = -1;
+            int tool = HitTestCaptureToolbar(point, &panelIndex);
+            if (tool >= 0) {
+                g_capturePressedPanel = panelIndex;
+                g_capturePressedTool = tool;
+                SetCapture(hwnd);
+                InvalidateCapturePanels(hwnd);
+            } else if (!IsPointInCapturePanel(point) &&
+                       g_captureSelectedTool == CAPTURE_TOOL_CLIP) {
+                g_captureHasSelection = FALSE;
+                g_captureDragging = TRUE;
+                g_captureDragStart = point;
+                g_captureDragCurrent = point;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        {
+            POINT point = GetCaptureCursorPoint(hwnd);
+            int panelIndex = -1;
+            int tool = HitTestCaptureToolbar(point, &panelIndex);
+            if (panelIndex != g_captureHoveredPanel ||
+                tool != g_captureHoveredTool) {
+                g_captureHoveredPanel = panelIndex;
+                g_captureHoveredTool = tool;
+                InvalidateCapturePanels(hwnd);
+            }
+            if (g_captureDragging) {
+                RECT oldRect = NormalizeCaptureRect(g_captureDragStart,
+                                                    g_captureDragCurrent);
+                RECT newRect;
+                RECT dirtyRect;
+                g_captureDragCurrent = point;
+                newRect = NormalizeCaptureRect(g_captureDragStart,
+                                               g_captureDragCurrent);
+                UnionRect(&dirtyRect, &oldRect, &newRect);
+                InflateRect(&dirtyRect, 120, 36);
+                InvalidateRect(hwnd, &dirtyRect, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (g_capturePressedTool >= 0) {
+            POINT point = GetCaptureCursorPoint(hwnd);
+            int releasePanel = -1;
+            int releaseTool = HitTestCaptureToolbar(point, &releasePanel);
+            int pressedPanel = g_capturePressedPanel;
+            int pressedTool = g_capturePressedTool;
+            g_capturePressedPanel = -1;
+            g_capturePressedTool = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateCapturePanels(hwnd);
+            if (releasePanel == pressedPanel && releaseTool == pressedTool) {
+                if (pressedTool == CAPTURE_TOOL_CLIP) {
+                    g_captureSelectedTool = CAPTURE_TOOL_CLIP;
+                    g_captureHasSelection = FALSE;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                } else if (pressedTool == CAPTURE_TOOL_COPY) {
+                    PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, FALSE, 0);
+                } else if (pressedTool == CAPTURE_TOOL_CANCEL) {
+                    PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
+                }
+            }
+            return 0;
+        }
+        if (g_captureDragging) {
+            g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
+            g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
+                                                      g_captureDragCurrent);
+            g_captureHasSelection =
+                g_captureSelection.right - g_captureSelection.left >= 2 &&
+                g_captureSelection.bottom - g_captureSelection.top >= 2;
+            g_captureDragging = FALSE;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if (g_capturePressedTool >= 0) {
+            g_capturePressedPanel = -1;
+            g_capturePressedTool = -1;
+            InvalidateCapturePanels(hwnd);
+        }
+        if (g_captureDragging) {
+            g_captureDragCurrent = GetCaptureCursorPoint(hwnd);
+            g_captureSelection = NormalizeCaptureRect(g_captureDragStart,
+                                                      g_captureDragCurrent);
+            g_captureHasSelection =
+                g_captureSelection.right - g_captureSelection.left >= 2 &&
+                g_captureSelection.bottom - g_captureSelection.top >= 2;
+            g_captureDragging = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            POINT point = GetCaptureCursorPoint(hwnd);
+            int tool = HitTestCaptureToolbar(point, NULL);
+            LPCWSTR cursorName = tool >= 0
+                ? IDC_HAND
+                : (IsPointInCapturePanel(point) ? IDC_ARROW : IDC_CROSS);
+            SetCursor(LoadCursor(NULL, cursorName));
+            return TRUE;
+        }
+        break;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
+            return 0;
+        }
+        if (wParam == VK_SNAPSHOT) {
+            PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_COPY, TRUE, 0);
+            return 0;
+        }
+        break;
+
+    case WM_DISPLAYCHANGE:
+        PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 1, 0);
+        return 0;
+
+    case WM_DESTROY:
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (g_captureOverlayHwnd == hwnd) g_captureOverlayHwnd = NULL;
+        g_captureDragging = FALSE;
+        g_captureHasSelection = FALSE;
+        g_captureHoveredPanel = -1;
+        g_captureHoveredTool = -1;
+        g_capturePressedPanel = -1;
+        g_capturePressedTool = -1;
+        ReleaseScreenCaptureBitmaps();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+static BOOL BeginScreenCapture(void)
+{
+    static BOOL classRegistered = FALSE;
+    WNDCLASSEXW windowClass;
+
+    if (!g_configScreenCaptureEnabled) return FALSE;
+    if (g_captureOverlayHwnd) return TRUE;
+    EnterScreenCaptureDpiMode();
+    if (!CaptureVirtualDesktopSnapshot()) {
+        LogMessage("ERROR: Could not capture the virtual desktop (%lu)",
+                   GetLastError());
+        MessageBeep(MB_ICONWARNING);
+        LeaveScreenCaptureDpiMode();
+        return FALSE;
+    }
+    BuildCapturePanels();
+
+    if (!classRegistered) {
+        ZeroMemory(&windowClass, sizeof(windowClass));
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.style = CS_HREDRAW | CS_VREDRAW;
+        windowClass.lpfnWndProc = ScreenCaptureWndProc;
+        windowClass.hInstance = g_hInstance;
+        windowClass.hCursor = LoadCursor(NULL, IDC_CROSS);
+        windowClass.lpszClassName = L"ImagePasterCaptureOverlay";
+        if (!RegisterClassExW(&windowClass)) {
+            LogMessage("ERROR: Could not register screen capture overlay (%lu)",
+                       GetLastError());
+            ReleaseScreenCaptureBitmaps();
+            LeaveScreenCaptureDpiMode();
+            return FALSE;
+        }
+        classRegistered = TRUE;
+    }
+
+    g_captureSelectedTool = CAPTURE_TOOL_CLIP;
+    g_captureHoveredPanel = -1;
+    g_captureHoveredTool = -1;
+    g_capturePressedPanel = -1;
+    g_capturePressedTool = -1;
+    g_captureDragging = FALSE;
+    g_captureHasSelection = FALSE;
+    g_captureOverlayHwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"ImagePasterCaptureOverlay", L"ImagePaster Screen Capture",
+        WS_POPUP, g_captureVirtualX, g_captureVirtualY,
+        g_captureWidth, g_captureHeight,
+        NULL, NULL, g_hInstance, NULL);
+    if (!g_captureOverlayHwnd) {
+        LogMessage("ERROR: Could not create screen capture overlay (%lu)",
+                   GetLastError());
+        ReleaseScreenCaptureBitmaps();
+        LeaveScreenCaptureDpiMode();
+        return FALSE;
+    }
+
+    ShowWindow(g_captureOverlayHwnd, SW_SHOW);
+    SetWindowPos(g_captureOverlayHwnd, HWND_TOPMOST,
+                 g_captureVirtualX, g_captureVirtualY,
+                 g_captureWidth, g_captureHeight,
+                 SWP_SHOWWINDOW);
+    SetForegroundWindow(g_captureOverlayHwnd);
+    SetFocus(g_captureOverlayHwnd);
+    UpdateWindow(g_captureOverlayHwnd);
+    LeaveScreenCaptureDpiMode();
+    LogMessage("Print Screen capture opened across %d monitor(s)",
+               g_capturePanelCount);
+    return TRUE;
+}
+
+static BOOL CompleteScreenCapture(BOOL forceFullDesktop)
+{
+    RECT sourceRect;
+    HGLOBAL dibMemory;
+    int width;
+    int height;
+    BOOL usedSelection = FALSE;
+
+    if (!g_captureOverlayHwnd || !g_captureOriginalPixels) return FALSE;
+    if (!forceFullDesktop && GetActiveCaptureSelection(&sourceRect)) {
+        usedSelection = TRUE;
+    } else {
+        SetRect(&sourceRect, 0, 0, g_captureWidth, g_captureHeight);
+    }
+    width = sourceRect.right - sourceRect.left;
+    height = sourceRect.bottom - sourceRect.top;
+    dibMemory = CreateCaptureClipboardDib(&sourceRect);
+    if (!dibMemory) {
+        LogMessage("ERROR: Could not allocate the screen capture clipboard image");
+        MessageBeep(MB_ICONWARNING);
+        return FALSE;
+    }
+
+    if (!OpenClipboard(g_hWndMain)) {
+        LogMessage("ERROR: Could not open the clipboard for screen capture (%lu)",
+                   GetLastError());
+        GlobalFree(dibMemory);
+        MessageBeep(MB_ICONWARNING);
+        return FALSE;
+    }
+    if (!EmptyClipboard() || !SetClipboardData(CF_DIB, dibMemory)) {
+        DWORD errorCode = GetLastError();
+        CloseClipboard();
+        GlobalFree(dibMemory);
+        LogMessage("ERROR: Could not place screen capture on the clipboard (%lu)",
+                   errorCode);
+        MessageBeep(MB_ICONWARNING);
+        return FALSE;
+    }
+    CloseClipboard();
+
+    CloseScreenCaptureOverlay();
+    LogMessage("Screen capture copied: %dx%d (%s)", width, height,
+               usedSelection ? "selection" : "full desktop");
+    g_lastClipboardSequence = 0;
+    RefreshClipboardImageCache();
+    return TRUE;
+}
+
+static void CancelScreenCapture(const char *reason)
+{
+    if (!g_captureOverlayHwnd) return;
+    CloseScreenCaptureOverlay();
+    LogMessage("Screen capture cancelled: %s", reason);
 }
 
 /* ── Low-level keyboard hook ────────────────────────────────────────────── */
 
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && wParam == WM_KEYDOWN) {
+    if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT *pKb = (KBDLLHOOKSTRUCT *)lParam;
+        BOOL keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+        BOOL keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
 
-        if (pKb->vkCode == 'V') {
+        if (pKb->vkCode == VK_SNAPSHOT &&
+            (g_configScreenCaptureEnabled || g_captureOverlayHwnd)) {
+            if (keyDown && !g_printScreenKeyDown) {
+                g_printScreenKeyDown = TRUE;
+                PostMessage(g_hWndMain,
+                            g_captureOverlayHwnd
+                                ? WM_SCREEN_CAPTURE_COPY
+                                : WM_SCREEN_CAPTURE_BEGIN,
+                            g_captureOverlayHwnd ? TRUE : 0, 0);
+            } else if (keyUp) {
+                /* Some keyboards expose only the key-up transition. */
+                if (!g_printScreenKeyDown) {
+                    PostMessage(g_hWndMain,
+                                g_captureOverlayHwnd
+                                    ? WM_SCREEN_CAPTURE_COPY
+                                    : WM_SCREEN_CAPTURE_BEGIN,
+                                g_captureOverlayHwnd ? TRUE : 0, 0);
+                }
+                g_printScreenKeyDown = FALSE;
+            }
+            return 1;
+        }
+
+        if (pKb->vkCode == VK_ESCAPE &&
+            (g_captureOverlayHwnd || g_escapeKeyDown)) {
+            if (keyDown && !g_escapeKeyDown) {
+                g_escapeKeyDown = TRUE;
+                PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
+            } else if (keyUp) {
+                if (!g_escapeKeyDown && g_captureOverlayHwnd) {
+                    PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
+                }
+                g_escapeKeyDown = FALSE;
+            }
+            return 1;
+        }
+
+        if (keyDown && pKb->vkCode == 'V') {
             BOOL ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             BOOL altDown  = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 
@@ -3306,6 +4362,7 @@ static void webview_push_init_config(void)
         L"\"jpegQuality\":%d,"
         L"\"imageHistoryLimit\":%d,"
         L"\"compatibilityPaste\":%s,"
+        L"\"screenCaptureEnabled\":%s,"
         L"\"autoCheckForUpdates\":%s,"
         L"\"availableIps\":%s,"
         L"\"bindIpAvailable\":%s,"
@@ -3317,6 +4374,7 @@ static void webview_push_init_config(void)
         wBindIp, g_configHttpPort, g_configJpegQuality,
         g_configImageHistoryLimit,
         g_configCompatibilityPaste ? L"true" : L"false",
+        g_configScreenCaptureEnabled ? L"true" : L"false",
         g_configAutoCheckForUpdates ? L"true" : L"false", ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
         wHttpStatus, APP_VERSION_W, wUpdateCompletedVersion);
@@ -3525,6 +4583,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         int jpegQuality = -1;
         int imageHistoryLimit = -1;
         int compatibilityPaste = -1;
+        int screenCaptureEnabled = -1;
         int autoCheckForUpdates = -1;
         IN_ADDR parsedAddress;
 
@@ -3535,6 +4594,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_int(msg, "jpegQuality", &jpegQuality);
         json_get_int(msg, "imageHistoryLimit", &imageHistoryLimit);
         json_get_int(msg, "compatibilityPaste", &compatibilityPaste);
+        json_get_int(msg, "screenCaptureEnabled", &screenCaptureEnabled);
         json_get_int(msg, "autoCheckForUpdates", &autoCheckForUpdates);
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
@@ -3567,6 +4627,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             free(msg);
             return S_OK;
         }
+        if (screenCaptureEnabled < 0 || screenCaptureEnabled > 1) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid Print Screen capture setting.'})");
+            free(msg);
+            return S_OK;
+        }
         if (autoCheckForUpdates < 0 || autoCheckForUpdates > 1) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid automatic update setting.'})");
             free(msg);
@@ -3594,6 +4659,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             }
         }
         g_configCompatibilityPaste = compatibilityPaste != 0;
+        g_configScreenCaptureEnabled = screenCaptureEnabled != 0;
+        if (!g_configScreenCaptureEnabled && g_captureOverlayHwnd) {
+            CancelScreenCapture("feature was disabled");
+        }
         g_configAutoCheckForUpdates = autoCheckForUpdates != 0;
         SaveConfigToRegistry();
         ParseKeywords();
@@ -3624,14 +4693,38 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = contentHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
-            UINT flags = SWP_NOMOVE | SWP_NOZORDER;
+            int newX = windowRect.left;
+            int newY = windowRect.top;
+            HMONITOR monitor = MonitorFromWindow(g_webviewHwnd,
+                                                  MONITOR_DEFAULTTONEAREST);
+            MONITORINFO monitorInfo = {0};
+            UINT flags = SWP_NOZORDER;
+            monitorInfo.cbSize = sizeof(monitorInfo);
+            if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
+                int availableHeight = monitorInfo.rcWork.bottom -
+                                      monitorInfo.rcWork.top - 24;
+                if (newWindowH > availableHeight) newWindowH = availableHeight;
+                if (newY + newWindowH > monitorInfo.rcWork.bottom - 12) {
+                    newY = monitorInfo.rcWork.bottom - newWindowH - 12;
+                }
+                if (newY < monitorInfo.rcWork.top + 12) {
+                    newY = monitorInfo.rcWork.top + 12;
+                }
+                if (newX + windowW > monitorInfo.rcWork.right - 12) {
+                    newX = monitorInfo.rcWork.right - windowW - 12;
+                }
+                if (newX < monitorInfo.rcWork.left + 12) {
+                    newX = monitorInfo.rcWork.left + 12;
+                }
+            }
             if (g_webviewWindowShown) {
                 flags |= SWP_NOACTIVATE;
             } else {
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             }
-            SetWindowPos(g_webviewHwnd, NULL, 0, 0, windowW, newWindowH, flags);
+            SetWindowPos(g_webviewHwnd, NULL, newX, newY,
+                         windowW, newWindowH, flags);
             g_webviewWindowShown = TRUE;
             webview_sync_controller_bounds();
         }
@@ -3874,6 +4967,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case ID_TRAY_EXIT:
             LogMessage("User selected Exit");
+            CancelScreenCapture("application is exiting");
             /* Close WebView if open */
             if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
             KillTimer(hWnd, ID_TIMER_HTTP_RECONCILE);
@@ -3903,6 +4997,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             break;
         }
+        return 0;
+
+    case WM_SCREEN_CAPTURE_BEGIN:
+        BeginScreenCapture();
+        return 0;
+
+    case WM_SCREEN_CAPTURE_COPY:
+        CompleteScreenCapture((BOOL)wParam);
+        return 0;
+
+    case WM_SCREEN_CAPTURE_CANCEL:
+        CancelScreenCapture(wParam
+            ? "display configuration changed" : "requested by user");
         return 0;
 
     case WM_DO_PASTE:
@@ -4064,6 +5171,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     LogMessage("Paste method: %s", g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
     LogMessage("Text paste shortcut: %s",
                g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V");
+    LogMessage("Interactive Print Screen capture: %s",
+               g_configScreenCaptureEnabled ? "enabled" : "disabled");
     if (g_configImageHistoryLimit == 0) {
         LogMessage("In-memory image history: unlimited");
     } else {
@@ -4108,7 +5217,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         LogMessage("ERROR: Failed to install keyboard hook (%lu)", GetLastError());
     } else {
         LogMessage("Keyboard hook installed (WH_KEYBOARD_LL)");
-        LogMessage("Monitoring for Ctrl+V with image clipboard...");
+        LogMessage("Monitoring for Ctrl+V%s...",
+                   g_configScreenCaptureEnabled ? " and Print Screen" : "");
     }
 
     if (updateCompleted) {

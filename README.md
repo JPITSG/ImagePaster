@@ -1,4 +1,4 @@
-# ImagePaster 1.0.3
+# ImagePaster 1.0.4
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -17,6 +17,8 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Uses a random 256-bit image identifier; retained URLs stay available and evicted URLs return `410 Gone`
 - Configurable window title matching (comma-separated keywords)
 - Optional, application-neutral compatibility paste mode using Shift+Insert
+- Optional interactive Print Screen capture across the full multi-monitor desktop
+- Dimmed capture overlay with cross-monitor selection and a glass-style toolbar on every display
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
@@ -47,6 +49,27 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
 
 The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is memory-only and is discarded when ImagePaster exits.
+
+### Interactive Print Screen Capture
+
+When **Enable interactive Print Screen capture** is enabled, ImagePaster replaces
+the normal Print Screen action with a multi-monitor capture workflow:
+
+1. Pressing `Print Screen` freezes and gently darkens the full Windows virtual
+   desktop. A compact Clip, Copy, and Cancel toolbar appears near the bottom of
+   every monitor.
+2. The Clip tool is selected initially. Drag anywhere across the virtual desktop,
+   including across monitor boundaries, to reveal a bright selection with a
+   dashed outline and live dimensions.
+3. Copy places the selection on the Windows clipboard. If no selection exists,
+   it copies the complete virtual desktop. The overlay then closes and the image
+   enters the normal ImagePaster cache and history pipeline.
+4. Pressing `Print Screen` again while the overlay is open immediately copies the
+   complete virtual desktop. Pressing `Esc` or choosing Cancel closes the overlay
+   without changing the clipboard.
+
+The overlay and its controls are rendered from a pre-overlay snapshot, so neither
+the dimming nor the toolbar is included in the copied image.
 
 ## Building
 
@@ -83,6 +106,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
 | Image History Limit | `ImageHistoryLimit` | REG_DWORD | `1` |
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
+| Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
