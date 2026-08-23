@@ -43,6 +43,14 @@ function isValidIpv4(value: string) {
   );
 }
 
+function isValidAllowEntry(value: string) {
+  const [address, prefix, ...rest] = value.split("/");
+  if (rest.length > 0 || !isValidIpv4(address)) return false;
+  if (prefix === undefined) return true;
+  if (!/^\d{1,2}$/.test(prefix)) return false;
+  return Number(prefix) <= 32;
+}
+
 export default function ConfigView({
   config,
   updateCompletedVersion,
@@ -60,6 +68,7 @@ export default function ConfigView({
     configuredIpIsDetected ? "" : config.bindIp,
   );
   const [httpPort, setHttpPort] = useState(String(config.httpPort));
+  const [httpAllowList, setHttpAllowList] = useState(config.httpAllowList);
   const [jpegQuality, setJpegQuality] = useState(String(config.jpegQuality));
   const [imageHistoryLimit, setImageHistoryLimit] = useState(
     String(config.imageHistoryLimit === 0 ? 1 : config.imageHistoryLimit),
@@ -213,6 +222,20 @@ export default function ConfigView({
       setError("HTTP port must be between 1 and 65535.");
       return;
     }
+    const allowEntries = httpAllowList
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (!allowEntries.every(isValidAllowEntry)) {
+      setError(
+        "Allowed clients must be IPv4 addresses or CIDR subnets (e.g. 192.168.1.0/24), separated by commas.",
+      );
+      return;
+    }
+    if (allowEntries.length > 64) {
+      setError("Allowed clients can contain at most 64 entries.");
+      return;
+    }
     if (!Number.isInteger(quality) || quality < 0 || quality > 100) {
       setError("JPEG quality must be between 0 and 100.");
       return;
@@ -232,6 +255,7 @@ export default function ConfigView({
       httpMessageTemplate,
       bindIp: selectedBindIp,
       httpPort: port,
+      httpAllowList: allowEntries.join(", "),
       jpegQuality: quality,
       imageHistoryLimit: historyLimit,
       compatibilityPaste,
@@ -402,6 +426,25 @@ export default function ConfigView({
             )}
           </div>
         )}
+
+        <div className="space-y-1.5">
+          <Label htmlFor="httpAllowList">Allowed Clients</Label>
+          <Input
+            id="httpAllowList"
+            value={httpAllowList}
+            onChange={(event) => setHttpAllowList(event.target.value)}
+            placeholder="0.0.0.0/0"
+          />
+          <p className="text-[11px] leading-snug text-neutral-500">
+            Comma-separated IPv4 addresses or CIDR subnets permitted to fetch
+            images, e.g.{" "}
+            <code className="font-mono text-neutral-700">
+              192.168.1.0/24, 10.0.0.5
+            </code>
+            . Leave empty to allow every client. Connections from other
+            addresses are dropped and logged.
+          </p>
+        </div>
 
         <div className="space-y-1.5">
           <Label htmlFor="jpegQuality">JPEG Quality (%)</Label>

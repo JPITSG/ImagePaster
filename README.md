@@ -1,4 +1,4 @@
-# ImagePaster 1.0.17
+# ImagePaster 1.0.18
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -13,6 +13,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
+- Optional HTTP client allowlist restricting image downloads to specific IPv4 addresses and CIDR subnets
 - Customizable HTTP paste message with case-sensitive `{URL}` substitution
 - Detects active local IPv4 addresses for selection in the configuration dialog
 - Keeps an unavailable saved address and automatically starts listening if that address returns
@@ -54,6 +55,8 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
 
 The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is memory-only and is discarded when ImagePaster exits.
+
+If the **Allowed Clients** list is non-empty, only connections from the listed IPv4 addresses and CIDR subnets are served; everything else is dropped before the request is read and the rejection is recorded in the Activity Log. An empty list allows every client (equivalent to `0.0.0.0/0`).
 
 ### Interactive Print Screen Capture
 
@@ -115,6 +118,7 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | HTTP Paste Message | `HttpMessageTemplate` | REG_SZ | `[ image available at {URL} - ... ]` |
 | HTTP Bind Address | `BindIp` | REG_SZ | `127.0.0.1` |
 | HTTP Port | `HttpPort` | REG_DWORD | `10444` |
+| Allowed Clients | `HttpAllowList` | REG_SZ | Empty (allow all) |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
 | Image History Limit | `ImageHistoryLimit` | REG_DWORD | `1` |
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |

@@ -7,6 +7,7 @@ export interface ConfigData {
   httpMessageTemplate: string;
   bindIp: string;
   httpPort: number;
+  httpAllowList: string;
   jpegQuality: number;
   imageHistoryLimit: number;
   compatibilityPaste: boolean;
@@ -177,6 +178,7 @@ export function saveSettings(config: ConfigData) {
     httpMessageTemplate: config.httpMessageTemplate,
     bindIp: config.bindIp,
     httpPort: config.httpPort,
+    httpAllowList: config.httpAllowList,
     jpegQuality: config.jpegQuality,
     imageHistoryLimit: config.imageHistoryLimit,
     compatibilityPaste: config.compatibilityPaste ? 1 : 0,

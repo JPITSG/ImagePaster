@@ -192,8 +192,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.17"
-#define APP_VERSION_W     L"1.0.17"
+#define APP_VERSION_A     "1.0.18"
+#define APP_VERSION_W     L"1.0.18"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -238,6 +238,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define REG_VALUE_CAPTURE_GAP_FILL "CaptureGapFill"
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 #define REG_VALUE_IGNORED_UPDATE_VERSION "IgnoredUpdateVersion"
+#define REG_VALUE_HTTP_ALLOW_LIST "HttpAllowList"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
@@ -260,6 +261,9 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define HTTP_EVENT_SERVED   200
 #define HTTP_EVENT_GONE     410
 #define HTTP_EVENT_NOT_FOUND 404
+#define HTTP_EVENT_DENIED   403
+#define MAX_HTTP_ALLOW_LIST_BYTES 512
+#define MAX_HTTP_ALLOW_RULES 64
 #define CAPTURE_TOOL_CLIP    0
 #define CAPTURE_TOOL_COPY    1
 #define CAPTURE_TOOL_CANCEL  2
@@ -393,6 +397,21 @@ static size_t g_captureSelectionCapacity = 0;
 static HANDLE g_capturePreviousDpiContext = NULL;
 static BOOL g_printScreenKeyDown = FALSE;
 static BOOL g_escapeKeyDown = FALSE;
+
+/* HTTP client allowlist. Empty text allows every client; otherwise only
+   matching source addresses may connect. The parsed rules are shared with
+   the HTTP worker thread. */
+static char g_configHttpAllowList[MAX_HTTP_ALLOW_LIST_BYTES] = "";
+
+typedef struct {
+    DWORD network; /* host byte order, already masked */
+    DWORD mask;    /* host byte order */
+} HttpAllowRule;
+
+static HttpAllowRule g_httpAllowRules[MAX_HTTP_ALLOW_RULES];
+static int g_httpAllowRuleCount = 0;
+static BOOL g_httpAllowRestrictive = FALSE;
+static SRWLOCK g_httpAllowLock = SRWLOCK_INIT;
 
 /* HTTP listener state. */
 static BOOL g_winsockReady = FALSE;
@@ -1530,6 +1549,114 @@ static void SendHttpResponse(SOCKET client, int status, BOOL headOnly,
     }
 }
 
+/* Parses one allowlist entry: "a.b.c.d" (treated as /32) or "a.b.c.d/n". */
+static BOOL ParseHttpAllowEntry(const char *entry, HttpAllowRule *rule)
+{
+    char addressText[64];
+    const char *slash = strchr(entry, '/');
+    size_t addressLen = slash ? (size_t)(slash - entry) : strlen(entry);
+    IN_ADDR parsed;
+    int prefix = 32;
+
+    if (addressLen == 0 || addressLen >= sizeof(addressText)) return FALSE;
+    memcpy(addressText, entry, addressLen);
+    addressText[addressLen] = '\0';
+    if (InetPtonA(AF_INET, addressText, &parsed) != 1) return FALSE;
+    if (slash) {
+        const char *digits = slash + 1;
+        size_t digitCount = strlen(digits);
+        if (digitCount == 0 || digitCount > 2) return FALSE;
+        for (size_t i = 0; i < digitCount; i++) {
+            if (digits[i] < '0' || digits[i] > '9') return FALSE;
+        }
+        prefix = atoi(digits);
+        if (prefix > 32) return FALSE;
+    }
+    rule->mask = prefix == 0 ? 0 : 0xffffffffu << (32 - prefix);
+    rule->network = ntohl(parsed.s_addr) & rule->mask;
+    return TRUE;
+}
+
+/* Parses a comma-separated allowlist. Blank segments are skipped; any
+   malformed entry or rule overflow fails the whole list. */
+static BOOL ParseHttpAllowList(const char *text, HttpAllowRule *rules,
+                               int maxRules, int *count)
+{
+    char copy[MAX_HTTP_ALLOW_LIST_BYTES];
+    char *entry;
+    int parsed = 0;
+
+    *count = 0;
+    strncpy(copy, text, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+
+    entry = strtok(copy, ",");
+    while (entry) {
+        char *start = entry;
+        char *end;
+        while (*start == ' ' || *start == '\t') start++;
+        end = start + strlen(start);
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        *end = '\0';
+        if (*start) {
+            if (parsed >= maxRules) return FALSE;
+            if (!ParseHttpAllowEntry(start, &rules[parsed])) return FALSE;
+            parsed++;
+        }
+        entry = strtok(NULL, ",");
+    }
+    *count = parsed;
+    return TRUE;
+}
+
+/* Publishes the parsed form of g_configHttpAllowList for the HTTP worker.
+   An unparseable list fails closed: every client is rejected until the
+   configuration is corrected. */
+static void ApplyHttpAllowList(void)
+{
+    HttpAllowRule rules[MAX_HTTP_ALLOW_RULES];
+    int count = 0;
+    BOOL restrictive;
+
+    if (ParseHttpAllowList(g_configHttpAllowList, rules,
+                           MAX_HTTP_ALLOW_RULES, &count)) {
+        restrictive = count > 0;
+    } else {
+        LogMessage("WARNING: HTTP allowlist is invalid; rejecting all clients until it is corrected");
+        count = 0;
+        restrictive = TRUE;
+    }
+
+    AcquireSRWLockExclusive(&g_httpAllowLock);
+    if (count > 0) {
+        memcpy(g_httpAllowRules, rules, (size_t)count * sizeof(rules[0]));
+    }
+    g_httpAllowRuleCount = count;
+    g_httpAllowRestrictive = restrictive;
+    ReleaseSRWLockExclusive(&g_httpAllowLock);
+}
+
+/* Called from the HTTP worker thread for every accepted connection. */
+static BOOL IsHttpClientAllowed(DWORD addressHostOrder)
+{
+    BOOL allowed = FALSE;
+
+    AcquireSRWLockShared(&g_httpAllowLock);
+    if (!g_httpAllowRestrictive) {
+        allowed = TRUE;
+    } else {
+        for (int i = 0; i < g_httpAllowRuleCount; i++) {
+            if ((addressHostOrder & g_httpAllowRules[i].mask) ==
+                g_httpAllowRules[i].network) {
+                allowed = TRUE;
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_httpAllowLock);
+    return allowed;
+}
+
 static void HandleHttpClient(SOCKET client)
 {
     char request[4096];
@@ -1589,9 +1716,23 @@ static DWORD WINAPI HttpServerThreadProc(LPVOID parameter)
         if (ready == SOCKET_ERROR) break;
         if (ready == 0) continue;
 
-        SOCKET client = accept(listenSocket, NULL, NULL);
+        struct sockaddr_in clientAddress;
+        int addressLength = (int)sizeof(clientAddress);
+        ZeroMemory(&clientAddress, sizeof(clientAddress));
+        SOCKET client = accept(listenSocket,
+                               (struct sockaddr *)&clientAddress,
+                               &addressLength);
         if (client == INVALID_SOCKET) {
             if (InterlockedCompareExchange(&g_httpStopRequested, 0, 0) != 0) break;
+            continue;
+        }
+
+        if (!IsHttpClientAllowed(ntohl(clientAddress.sin_addr.s_addr))) {
+            /* Drop before reading anything; the request never gets a
+               response, matching firewall-style filtering. */
+            closesocket(client);
+            PostMessage(g_hWndMain, WM_HTTP_EVENT, (WPARAM)HTTP_EVENT_DENIED,
+                        (LPARAM)clientAddress.sin_addr.s_addr);
             continue;
         }
 
@@ -2127,6 +2268,14 @@ static BOOL LoadConfigFromRegistry(void)
     }
     g_ignoredUpdateVersion[sizeof(g_ignoredUpdateVersion) - 1] = '\0';
 
+    size = sizeof(g_configHttpAllowList);
+    if (RegQueryValueExA(hKey, REG_VALUE_HTTP_ALLOW_LIST, NULL, &type,
+                         (LPBYTE)g_configHttpAllowList, &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        g_configHttpAllowList[0] = '\0';
+    }
+    g_configHttpAllowList[sizeof(g_configHttpAllowList) - 1] = '\0';
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -2180,6 +2329,9 @@ static void SaveConfigToRegistry(void)
     RegSetValueExA(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
                    (const BYTE *)g_ignoredUpdateVersion,
                    (DWORD)(strlen(g_ignoredUpdateVersion) + 1));
+    RegSetValueExA(hKey, REG_VALUE_HTTP_ALLOW_LIST, 0, REG_SZ,
+                   (const BYTE *)g_configHttpAllowList,
+                   (DWORD)(strlen(g_configHttpAllowList) + 1));
 
     RegCloseKey(hKey);
     if (g_configImageHistoryLimit == 0) {
@@ -2188,7 +2340,7 @@ static void SaveConfigToRegistry(void)
         snprintf(historyText, sizeof(historyText), "%d",
                  g_configImageHistoryLimit);
     }
-    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, gap=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
+    LogMessage("Configuration saved: method=%s, shortcut=%s, capture=%s, gap=%s, bind=%s:%d, JPEG=%d%%, history=%s, allow=%s, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
                g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V",
                g_configScreenCaptureEnabled ? "enabled" : "disabled",
@@ -2196,7 +2348,9 @@ static void SaveConfigToRegistry(void)
                g_configCaptureGapFill == CAPTURE_GAP_FILL_BLUR ? "blur" :
                                                                   "white",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
-               historyText, g_configTitleMatch);
+               historyText,
+               g_configHttpAllowList[0] ? g_configHttpAllowList : "all",
+               g_configTitleMatch);
 }
 
 /* ── Interactive multi-monitor screen capture ─────────────────────────── */
@@ -5783,6 +5937,7 @@ static void webview_push_init_config(void)
     wchar_t wTitleMatch[4096];
     wchar_t wHttpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES * 2];
     wchar_t wBindIp[128];
+    wchar_t wHttpAllowList[MAX_HTTP_ALLOW_LIST_BYTES * 2];
     wchar_t wHttpStatus[512];
     wchar_t wUpdateCompletedVersion[64];
     wchar_t ipsJson[4096];
@@ -5796,6 +5951,8 @@ static void webview_push_init_config(void)
     json_escape_string(g_configHttpMessageTemplate, wHttpMessageTemplate,
                        MAX_HTTP_MESSAGE_TEMPLATE_BYTES * 2);
     json_escape_string(g_configBindIp, wBindIp, 128);
+    json_escape_string(g_configHttpAllowList, wHttpAllowList,
+                       MAX_HTTP_ALLOW_LIST_BYTES * 2);
     json_escape_string(g_httpStatus, wHttpStatus, 512);
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_W : L"",
                         wUpdateCompletedVersion, 64);
@@ -5817,6 +5974,7 @@ static void webview_push_init_config(void)
         L"\"httpMessageTemplate\":\"%s\","
         L"\"bindIp\":\"%s\","
         L"\"httpPort\":%d,"
+        L"\"httpAllowList\":\"%s\","
         L"\"jpegQuality\":%d,"
         L"\"imageHistoryLimit\":%d,"
         L"\"compatibilityPaste\":%s,"
@@ -5832,8 +5990,8 @@ static void webview_push_init_config(void)
         L"\"updateCompletedVersion\":\"%s\"})",
         wTitleMatch,
         g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
-        wHttpMessageTemplate, wBindIp, g_configHttpPort, g_configJpegQuality,
-        g_configImageHistoryLimit,
+        wHttpMessageTemplate, wBindIp, g_configHttpPort, wHttpAllowList,
+        g_configJpegQuality, g_configImageHistoryLimit,
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
@@ -6346,6 +6504,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char httpMessageTemplate[MAX_HTTP_MESSAGE_TEMPLATE_BYTES] = {0};
         char captureGapFill[16] = {0};
         char bindIp[INET_ADDRSTRLEN] = {0};
+        char httpAllowList[MAX_HTTP_ALLOW_LIST_BYTES] = {0};
+        HttpAllowRule allowScratch[MAX_HTTP_ALLOW_RULES];
+        int allowScratchCount = 0;
         int httpPort = 0;
         int jpegQuality = -1;
         int imageHistoryLimit = -1;
@@ -6361,6 +6522,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             msg, "httpMessageTemplate", httpMessageTemplate,
             sizeof(httpMessageTemplate));
         json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
+        json_get_string(msg, "httpAllowList", httpAllowList,
+                        sizeof(httpAllowList));
         json_get_int(msg, "httpPort", &httpPort);
         json_get_int(msg, "jpegQuality", &jpegQuality);
         json_get_int(msg, "imageHistoryLimit", &imageHistoryLimit);
@@ -6392,6 +6555,12 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
         if (httpPort < 1 || httpPort > 65535) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'HTTP port must be between 1 and 65535.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (!ParseHttpAllowList(httpAllowList, allowScratch,
+                                MAX_HTTP_ALLOW_RULES, &allowScratchCount)) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Allowed clients must be IPv4 addresses or CIDR subnets separated by commas (at most 64 entries).'})");
             free(msg);
             return S_OK;
         }
@@ -6444,6 +6613,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         strncpy(g_configBindIp, bindIp, sizeof(g_configBindIp) - 1);
         g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
         g_configHttpPort = httpPort;
+        strncpy(g_configHttpAllowList, httpAllowList,
+                sizeof(g_configHttpAllowList) - 1);
+        g_configHttpAllowList[sizeof(g_configHttpAllowList) - 1] = '\0';
+        ApplyHttpAllowList(); /* takes effect immediately, no restart needed */
         g_configJpegQuality = jpegQuality;
         {
             size_t evicted = SetImageHistoryLimit(imageHistoryLimit);
@@ -6938,6 +7111,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             LogMessage("HTTP request for evicted image returned 410 Gone");
         } else if ((int)wParam == HTTP_EVENT_NOT_FOUND) {
             LogMessage("HTTP request for unknown image returned 404 Not Found");
+        } else if ((int)wParam == HTTP_EVENT_DENIED) {
+            struct in_addr deniedAddress;
+            char addressText[INET_ADDRSTRLEN];
+            deniedAddress.s_addr = (ULONG)lParam;
+            if (!InetNtopA(AF_INET, &deniedAddress, addressText,
+                           sizeof(addressText))) {
+                strcpy(addressText, "unknown");
+            }
+            LogMessage("HTTP connection from %s rejected by the client allowlist",
+                       addressText);
         }
         return 0;
 
@@ -6999,6 +7182,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Load configuration */
     LoadConfigFromRegistry();
+    ApplyHttpAllowList();
     ParseKeywords();
 
     /* Load application icon */
