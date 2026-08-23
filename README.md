@@ -1,4 +1,4 @@
-# ImagePaster 1.0.24
+# ImagePaster 1.0.25
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -67,16 +67,19 @@ If the **Allowed Clients** list is non-empty, only connections from the listed I
 When **Enable interactive Print Screen capture** is enabled, ImagePaster replaces
 the normal Print Screen action with a multi-monitor capture workflow:
 
-1. Pressing `Print Screen` freezes and gently darkens the full Windows virtual
-   desktop. A compact Clip, Copy, and Cancel toolbar appears near the bottom of
-   every monitor.
+1. Pressing `Print Screen` (or choosing **Capture** from the tray menu, which
+   works even while Print Screen interception is disabled) freezes and gently
+   darkens the full Windows virtual desktop. A compact Clip, Copy, and Cancel
+   toolbar appears near the bottom of every monitor; it fades to half opacity
+   while a box is being drawn.
 2. The Clip tool is selected initially. Drag anywhere across the virtual desktop,
    including across monitor boundaries, to reveal a bright selection with a
    dashed outline and live dimensions. Hold `Shift` while dragging additional
    regions to retain the existing selections; dragging without `Shift` starts a
    new selection set. Existing boxes can be picked up and moved by dragging
-   inside them, and removed with the ✕ pill at their top-right corner;
-   `Shift`+drag inside a box draws a new region across it instead.
+   inside them, resized by dragging any of their four walls, and removed with
+   the ✕ pill at their top-right corner; `Shift`+drag inside a box draws a
+   new region across it instead.
 3. Copy places the selection on the Windows clipboard. If multiple regions are
    selected, their leftmost, topmost, rightmost, and bottommost edges define the
    output bounds. Selected pixels keep their exact relative positions. The

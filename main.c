@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.24"
-#define APP_VERSION_W     L"1.0.24"
+#define APP_VERSION_A     "1.0.25"
+#define APP_VERSION_W     L"1.0.25"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -208,6 +208,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define ID_TRAY_CONFIGURE 1002
 #define ID_TRAY_EXIT      1003
 #define ID_TRAY_HISTORY   1004
+#define ID_TRAY_CAPTURE   1005
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define ID_TIMER_HTTP_RECONCILE         1007
 #define ID_TIMER_CLIPBOARD_RETRY        1008
@@ -404,6 +405,16 @@ static BOOL g_captureCopyShowsSelection = FALSE;
 static int g_captureHoveredRemoval = -1; /* stored-selection index or -1 */
 static int g_captureMovingIndex = -1;    /* box being dragged around, or -1 */
 static POINT g_captureMoveGrabOffset = {0}; /* cursor minus box top-left */
+
+enum {
+    CAPTURE_EDGE_NONE = 0,
+    CAPTURE_EDGE_LEFT,
+    CAPTURE_EDGE_TOP,
+    CAPTURE_EDGE_RIGHT,
+    CAPTURE_EDGE_BOTTOM
+};
+static int g_captureResizingIndex = -1;  /* box being resized, or -1 */
+static int g_captureResizingEdge = CAPTURE_EDGE_NONE;
 static POINT g_captureDragStart = {0};
 static POINT g_captureDragCurrent = {0};
 static RECT *g_captureSelections = NULL;
@@ -3164,13 +3175,14 @@ static GpStringFormat *CreateCaptureCenteredTextFormat(void)
 
 static void DrawCaptureCenteredText(GpGraphics *graphics, const WCHAR *text,
                                     const RECT *rect, COLORREF color,
-                                    GpFont *font, GpStringFormat *format)
+                                    BYTE alpha, GpFont *font,
+                                    GpStringFormat *format)
 {
     GpSolidFill *brush = NULL;
     CaptureGpRectF layout;
 
     if (!graphics || !text || !font || !format) return;
-    if (GdipCreateSolidFill(CaptureArgb(255, color), &brush) != 0 || !brush) {
+    if (GdipCreateSolidFill(CaptureArgb(alpha, color), &brush) != 0 || !brush) {
         return;
     }
     layout.X = (float)rect->left;
@@ -3184,7 +3196,7 @@ static void DrawCaptureCenteredText(GpGraphics *graphics, const WCHAR *text,
 
 static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
                                 const RECT *buttonRect, COLORREF color,
-                                UINT dpi)
+                                BYTE alpha, UINT dpi)
 {
     float centerX = ((float)buttonRect->left + (float)buttonRect->right) / 2.0f;
     float top = (float)buttonRect->top + ScaleCaptureUiFloat(dpi, 7.0f);
@@ -3196,7 +3208,7 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
     GpPen *pen = NULL;
 
     if (penWidth < 1.0f) penWidth = 1.0f;
-    if (GdipCreatePen1(CaptureArgb(255, color), penWidth,
+    if (GdipCreatePen1(CaptureArgb(alpha, color), penWidth,
                        CAPTURE_GDIP_UNIT_PIXEL, &pen) != 0 || !pen) {
         return;
     }
@@ -3256,6 +3268,11 @@ static void DrawCaptureToolIcon(GpGraphics *graphics, int tool,
     GdipDeletePen(pen);
 }
 
+static BYTE ScaleCaptureAlpha(BYTE alpha, int percent)
+{
+    return (BYTE)(((int)alpha * percent) / 100);
+}
+
 static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
 {
     const WCHAR *labels[CAPTURE_TOOL_COUNT];
@@ -3264,6 +3281,8 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     float buttonRadius = ScaleCaptureUiFloat(panel->dpi, 8.0f);
     float hairline = ScaleCaptureUiFloat(panel->dpi, 1.0f);
     float borderWidth = ScaleCaptureUiFloat(panel->dpi, 0.65f);
+    /* Fade the whole toolbar out of the way while a box is being drawn. */
+    int opacity = g_captureDragging ? 50 : 100;
     GpFont *font;
     GpStringFormat *format;
 
@@ -3275,13 +3294,17 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
     if (hairline < 1.0f) hairline = 1.0f;
     if (borderWidth < 0.6f) borderWidth = 0.6f;
     DrawCaptureSoftShadow(graphics, &panel->panelRect, panelRadius,
-                          panel->dpi, 7, 1.9f, 3, 9);
-    FillCaptureRoundedRectGradient(graphics, &panel->panelRect,
-                                   CaptureArgb(246, RGB(43, 49, 60)),
-                                   CaptureArgb(246, RGB(24, 28, 35)),
-                                   panelRadius);
+                          panel->dpi, 7, 1.9f, 3,
+                          ScaleCaptureAlpha(9, opacity));
+    FillCaptureRoundedRectGradient(
+        graphics, &panel->panelRect,
+        CaptureArgb(ScaleCaptureAlpha(246, opacity), RGB(43, 49, 60)),
+        CaptureArgb(ScaleCaptureAlpha(246, opacity), RGB(24, 28, 35)),
+        panelRadius);
     StrokeCaptureRoundedRect(graphics, &panel->panelRect,
-                             RGB(255, 255, 255), 38, borderWidth, panelRadius);
+                             RGB(255, 255, 255),
+                             ScaleCaptureAlpha(38, opacity),
+                             borderWidth, panelRadius);
 
     /* Divider that sets the destructive Cancel apart from the action tools. */
     {
@@ -3291,7 +3314,8 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
             ((float)copyRect->right + (float)cancelRect->left) / 2.0f;
         float inset = ScaleCaptureUiFloat(panel->dpi, 9.0f);
         GpPen *separatorPen = NULL;
-        if (GdipCreatePen1(CaptureArgb(36, RGB(255, 255, 255)), hairline,
+        if (GdipCreatePen1(CaptureArgb(ScaleCaptureAlpha(36, opacity),
+                                       RGB(255, 255, 255)), hairline,
                            CAPTURE_GDIP_UNIT_PIXEL, &separatorPen) == 0 &&
             separatorPen) {
             GdipSetPenStartCap(separatorPen, CAPTURE_GDIP_LINE_CAP_ROUND);
@@ -3310,9 +3334,12 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
         RECT labelRect = buttonRect;
         BOOL isCancel = tool == CAPTURE_TOOL_CANCEL;
         BOOL selected = tool == g_captureSelectedTool;
-        BOOL hovered = panelIndex == g_captureHoveredPanel &&
+        /* While drawing a box the buttons ignore hover and press hints. */
+        BOOL hovered = !g_captureDragging &&
+                       panelIndex == g_captureHoveredPanel &&
                        tool == g_captureHoveredTool;
-        BOOL pressed = panelIndex == g_capturePressedPanel &&
+        BOOL pressed = !g_captureDragging &&
+                       panelIndex == g_capturePressedPanel &&
                        tool == g_capturePressedTool;
         BOOL active = selected || hovered || pressed;
         COLORREF accent = isCancel
@@ -3326,30 +3353,41 @@ static void DrawCapturePanel(GpGraphics *graphics, int panelIndex)
             FillCaptureRoundedRect(graphics, &buttonRect,
                                    isCancel ? RGB(232, 82, 82)
                                             : RGB(64, 156, 210),
-                                   pressed ? 84 : 58, buttonRadius);
+                                   ScaleCaptureAlpha(pressed ? 84 : 58,
+                                                     opacity),
+                                   buttonRadius);
             StrokeCaptureRoundedRect(graphics, &buttonRect, accent,
-                                     pressed ? 165 : 130, hairline,
-                                     buttonRadius);
+                                     ScaleCaptureAlpha(pressed ? 165 : 130,
+                                                       opacity),
+                                     hairline, buttonRadius);
             if (hovered && !pressed) {
                 FillCaptureRoundedRect(graphics, &buttonRect,
-                                       RGB(255, 255, 255), 14, buttonRadius);
+                                       RGB(255, 255, 255),
+                                       ScaleCaptureAlpha(14, opacity),
+                                       buttonRadius);
             }
         } else if (pressed) {
             FillCaptureRoundedRect(graphics, &buttonRect,
                                    isCancel ? RGB(226, 74, 74)
                                             : RGB(255, 255, 255),
-                                   isCancel ? 64 : 15, buttonRadius);
+                                   ScaleCaptureAlpha(isCancel ? 64 : 15,
+                                                     opacity),
+                                   buttonRadius);
         } else if (hovered) {
             FillCaptureRoundedRect(graphics, &buttonRect,
                                    isCancel ? RGB(238, 90, 90)
                                             : RGB(255, 255, 255),
-                                   isCancel ? 46 : 24, buttonRadius);
+                                   ScaleCaptureAlpha(isCancel ? 46 : 24,
+                                                     opacity),
+                                   buttonRadius);
         }
         DrawCaptureToolIcon(graphics, tool, &buttonRect,
-                            active ? accent : RGB(206, 215, 227), panel->dpi);
+                            active ? accent : RGB(206, 215, 227),
+                            ScaleCaptureAlpha(255, opacity), panel->dpi);
         labelRect.top = buttonRect.top + ScaleCaptureUiValue(panel->dpi, 31);
         DrawCaptureCenteredText(graphics, labels[tool], &labelRect,
-                                labelColor, font, format);
+                                labelColor, ScaleCaptureAlpha(255, opacity),
+                                font, format);
     }
     if (format) GdipDeleteStringFormat(format);
     if (font) GdipDeleteFont(font);
@@ -3524,7 +3562,7 @@ static void DrawCaptureSelection(GpGraphics *graphics, const RECT *selection,
         StrokeCaptureRoundedRect(graphics, &labelRect, RGB(255, 255, 255), 44,
                                  hairline, pillRadius);
         DrawCaptureCenteredText(graphics, dimensions, &labelRect,
-                                RGB(245, 249, 255), font, format);
+                                RGB(245, 249, 255), 255, font, format);
     }
     if (format) GdipDeleteStringFormat(format);
     if (font) GdipDeleteFont(font);
@@ -3694,6 +3732,13 @@ static void InvalidateCapturePanel(HWND hwnd, int panelIndex)
     InvalidateRect(hwnd, &area, FALSE);
 }
 
+static void InvalidateAllCapturePanels(HWND hwnd)
+{
+    for (int panel = 0; panel < g_capturePanelCount; panel++) {
+        InvalidateCapturePanel(hwnd, panel);
+    }
+}
+
 /* Repaints every toolbar when the Copy label needs to flip between
    "Copy All" and "Copy Selection". */
 static void RefreshCaptureCopyLabels(HWND hwnd)
@@ -3701,9 +3746,7 @@ static void RefreshCaptureCopyLabels(HWND hwnd)
     BOOL showsSelection = CaptureHasSelection();
     if (showsSelection == g_captureCopyShowsSelection) return;
     g_captureCopyShowsSelection = showsSelection;
-    for (int panel = 0; panel < g_capturePanelCount; panel++) {
-        InvalidateCapturePanel(hwnd, panel);
-    }
+    InvalidateAllCapturePanels(hwnd);
 }
 
 static void UnionCaptureSelectionDirtyRect(RECT *dirtyRect, BOOL *hasDirty,
@@ -3724,6 +3767,40 @@ static int HitTestCaptureSelections(POINT point)
 {
     for (size_t i = g_captureSelectionCount; i > 0; i--) {
         if (PtInRect(&g_captureSelections[i - 1], point)) {
+            return (int)(i - 1);
+        }
+    }
+    return -1;
+}
+
+/* Finds a box wall under the cursor for resizing. The grab band straddles
+   each edge; the newest box wins. Returns the index or -1; *edge receives
+   the CAPTURE_EDGE_* value. */
+static int HitTestCaptureSelectionEdges(POINT point, int *edge)
+{
+    int margin = ScaleCaptureUiValue(GetCaptureDpiAtPoint(point), 5);
+
+    *edge = CAPTURE_EDGE_NONE;
+    for (size_t i = g_captureSelectionCount; i > 0; i--) {
+        const RECT *box = &g_captureSelections[i - 1];
+        BOOL inVerticalSpan = point.y >= box->top - margin &&
+                              point.y <= box->bottom + margin;
+        BOOL inHorizontalSpan = point.x >= box->left - margin &&
+                                point.x <= box->right + margin;
+        if (inVerticalSpan && abs(point.x - box->left) <= margin) {
+            *edge = CAPTURE_EDGE_LEFT;
+            return (int)(i - 1);
+        }
+        if (inVerticalSpan && abs(point.x - box->right) <= margin) {
+            *edge = CAPTURE_EDGE_RIGHT;
+            return (int)(i - 1);
+        }
+        if (inHorizontalSpan && abs(point.y - box->top) <= margin) {
+            *edge = CAPTURE_EDGE_TOP;
+            return (int)(i - 1);
+        }
+        if (inHorizontalSpan && abs(point.y - box->bottom) <= margin) {
+            *edge = CAPTURE_EDGE_BOTTOM;
             return (int)(i - 1);
         }
     }
@@ -3833,6 +3910,8 @@ static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
         if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
     }
     RefreshCaptureCopyLabels(hwnd);
+    /* Toolbars return to full opacity now that drawing has ended. */
+    InvalidateAllCapturePanels(hwnd);
 }
 
 static CaptureBlurSample GetCaptureBlurSample(int coordinate, int blockSize,
@@ -4135,6 +4214,8 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             int panelIndex = -1;
             int removeIndex = -1;
             int moveIndex = -1;
+            int resizeIndex = -1;
+            int resizeEdge = CAPTURE_EDGE_NONE;
             int tool = HitTestCaptureToolbar(point, &panelIndex);
             if (tool >= 0) {
                 g_capturePressedPanel = panelIndex;
@@ -4143,6 +4224,13 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 InvalidateCapturePanel(hwnd, panelIndex);
             } else if ((removeIndex = HitTestCaptureRemovePills(point)) >= 0) {
                 RemoveCaptureSelectionAt(hwnd, (size_t)removeIndex);
+            } else if ((wParam & MK_SHIFT) == 0 &&
+                       (resizeIndex =
+                            HitTestCaptureSelectionEdges(point,
+                                                         &resizeEdge)) >= 0) {
+                g_captureResizingIndex = resizeIndex;
+                g_captureResizingEdge = resizeEdge;
+                SetCapture(hwnd);
             } else if ((wParam & MK_SHIFT) == 0 &&
                        (moveIndex = HitTestCaptureSelections(point)) >= 0) {
                 /* Plain click inside a box picks it up; Shift+drag still
@@ -4165,6 +4253,8 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                 g_captureDragCurrent = point;
                 SetCapture(hwnd);
                 RefreshCaptureCopyLabels(hwnd);
+                /* Toolbars fade to half opacity while drawing. */
+                InvalidateAllCapturePanels(hwnd);
             }
         }
         return 0;
@@ -4184,13 +4274,46 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
                     InvalidateCapturePanel(hwnd, panelIndex);
                 }
             }
-            if (!g_captureDragging && g_captureMovingIndex < 0) {
+            if (!g_captureDragging && g_captureMovingIndex < 0 &&
+                g_captureResizingIndex < 0) {
                 int hoveredRemoval = HitTestCaptureRemovePills(point);
                 if (hoveredRemoval != g_captureHoveredRemoval) {
                     int oldRemoval = g_captureHoveredRemoval;
                     g_captureHoveredRemoval = hoveredRemoval;
                     InvalidateCaptureRemovePill(hwnd, oldRemoval);
                     InvalidateCaptureRemovePill(hwnd, hoveredRemoval);
+                }
+            }
+            if (g_captureResizingIndex >= 0 &&
+                (size_t)g_captureResizingIndex < g_captureSelectionCount) {
+                RECT *box = &g_captureSelections[g_captureResizingIndex];
+                RECT oldBox = *box;
+                switch (g_captureResizingEdge) {
+                case CAPTURE_EDGE_LEFT:
+                    box->left = point.x > box->right - 2
+                        ? box->right - 2 : point.x;
+                    break;
+                case CAPTURE_EDGE_RIGHT:
+                    box->right = point.x < box->left + 2
+                        ? box->left + 2 : point.x;
+                    break;
+                case CAPTURE_EDGE_TOP:
+                    box->top = point.y > box->bottom - 2
+                        ? box->bottom - 2 : point.y;
+                    break;
+                case CAPTURE_EDGE_BOTTOM:
+                    box->bottom = point.y < box->top + 2
+                        ? box->top + 2 : point.y;
+                    break;
+                }
+                if (!EqualRect(&oldBox, box)) {
+                    RECT dirtyRect = {0};
+                    BOOL hasDirty = FALSE;
+                    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty,
+                                                   &oldBox);
+                    UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty,
+                                                   box);
+                    if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
                 }
             }
             if (g_captureMovingIndex >= 0 &&
@@ -4265,8 +4388,10 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             }
             return 0;
         }
-        if (g_captureMovingIndex >= 0) {
+        if (g_captureMovingIndex >= 0 || g_captureResizingIndex >= 0) {
             g_captureMovingIndex = -1;
+            g_captureResizingIndex = -1;
+            g_captureResizingEdge = CAPTURE_EDGE_NONE;
             if (GetCapture() == hwnd) ReleaseCapture();
             return 0;
         }
@@ -4285,6 +4410,8 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
             InvalidateCapturePanel(hwnd, oldPanel);
         }
         g_captureMovingIndex = -1;
+        g_captureResizingIndex = -1;
+        g_captureResizingEdge = CAPTURE_EDGE_NONE;
         if (g_captureDragging) {
             POINT point = GetCaptureCursorPoint(hwnd);
             FinishCaptureSelectionDrag(hwnd, point);
@@ -4294,15 +4421,24 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             POINT point = GetCaptureCursorPoint(hwnd);
+            int hoverEdge = CAPTURE_EDGE_NONE;
             LPCWSTR cursorName;
             if (g_captureDragging) {
                 cursorName = IDC_CROSS;
+            } else if (g_captureResizingIndex >= 0) {
+                cursorName = (g_captureResizingEdge == CAPTURE_EDGE_LEFT ||
+                              g_captureResizingEdge == CAPTURE_EDGE_RIGHT)
+                    ? IDC_SIZEWE : IDC_SIZENS;
             } else if (g_captureMovingIndex >= 0 ||
                        HitTestCaptureToolbar(point, NULL) >= 0 ||
                        HitTestCaptureRemovePills(point) >= 0) {
                 cursorName = IDC_HAND;
             } else if (IsPointInCapturePanel(point)) {
                 cursorName = IDC_ARROW;
+            } else if (HitTestCaptureSelectionEdges(point, &hoverEdge) >= 0) {
+                cursorName = (hoverEdge == CAPTURE_EDGE_LEFT ||
+                              hoverEdge == CAPTURE_EDGE_RIGHT)
+                    ? IDC_SIZEWE : IDC_SIZENS;
             } else if (HitTestCaptureSelections(point) >= 0) {
                 cursorName = IDC_HAND;
             } else {
@@ -4339,6 +4475,8 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         g_captureHoveredTool = -1;
         g_captureHoveredRemoval = -1;
         g_captureMovingIndex = -1;
+        g_captureResizingIndex = -1;
+        g_captureResizingEdge = CAPTURE_EDGE_NONE;
         ReleaseCaptureSelections();
         ReleaseScreenCaptureBitmaps();
         return 0;
@@ -4351,7 +4489,8 @@ static BOOL BeginScreenCapture(void)
     static BOOL classRegistered = FALSE;
     WNDCLASSEXW windowClass;
 
-    if (!g_configScreenCaptureEnabled) return FALSE;
+    /* The Print Screen hook checks g_configScreenCaptureEnabled before
+       posting; the tray menu's Capture entry works regardless. */
     if (g_captureOverlayHwnd) return TRUE;
     EnterScreenCaptureDpiMode();
     if (!CaptureVirtualDesktopSnapshot()) {
@@ -4390,6 +4529,8 @@ static BOOL BeginScreenCapture(void)
     g_captureCopyShowsSelection = FALSE;
     g_captureHoveredRemoval = -1;
     g_captureMovingIndex = -1;
+    g_captureResizingIndex = -1;
+    g_captureResizingEdge = CAPTURE_EDGE_NONE;
     ReleaseCaptureSelections();
     g_captureOverlayHwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -4629,10 +4770,11 @@ static void UpdateTooltip(void)
 static void CreateContextMenu(void)
 {
     g_hMenu = CreatePopupMenu();
+    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CAPTURE, L"Capture");
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_HISTORY, L"History");
-    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_LOG, L"Activity Log");
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CONFIGURE, L"Configuration");
+    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_LOG, L"Activity Log");
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
 }
@@ -7458,6 +7600,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
+            EnableMenuItem(g_hMenu, ID_TRAY_CAPTURE,
+                           g_captureOverlayHwnd ? MF_GRAYED : MF_ENABLED);
             EnableMenuItem(g_hMenu, ID_TRAY_HISTORY,
                            (g_webviewHwnd || !AnyRetainedImages())
                                ? MF_GRAYED : MF_ENABLED);
@@ -7469,6 +7613,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
+        case ID_TRAY_CAPTURE:
+            LogMessage("Screen capture requested from the tray menu");
+            PostMessage(hWnd, WM_SCREEN_CAPTURE_BEGIN, 0, 0);
+            break;
         case ID_TRAY_HISTORY:
             LogMessage("Opening History dialog");
             ShowWebViewDialog("history", 640, 560);
