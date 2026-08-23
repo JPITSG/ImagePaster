@@ -193,8 +193,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.22"
-#define APP_VERSION_W     L"1.0.22"
+#define APP_VERSION_A     "1.0.23"
+#define APP_VERSION_W     L"1.0.23"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -3811,7 +3811,10 @@ static void FinishCaptureSelectionDrag(HWND hwnd, POINT endPoint)
         }
     }
 
-    if (!EqualRect(&oldRect, &newRect) || (valid && !added)) {
+    /* Repaint whenever the rectangle moved OR a selection was committed:
+       the remove pill only exists once the drag commits, so the area must
+       redraw even when the final rect equals the last previewed one. */
+    if (!EqualRect(&oldRect, &newRect) || valid) {
         UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &oldRect);
         UnionCaptureSelectionDirtyRect(&dirtyRect, &hasDirty, &newRect);
         if (hasDirty) InvalidateRect(hwnd, &dirtyRect, FALSE);
