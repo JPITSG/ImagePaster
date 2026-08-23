@@ -34,7 +34,6 @@ export default function App() {
       {initData.view === "config" ? (
         <ConfigView
           config={initData.config!}
-          webView2Version={initData.webView2Version ?? "Unknown"}
           updateCompletedVersion={initData.updateCompletedVersion ?? ""}
         />
       ) : (

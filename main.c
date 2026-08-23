@@ -6,7 +6,7 @@
  * PNG string or a short URL served by the built-in HTTP image server.
  *
  * Features:
- *   - Shared in-memory clipboard image cache (PNG/base64 and configurable JPEG)
+ *   - Shared in-memory clipboard image cache with configurable JPEG history
  *   - Configurable base64 or HTTP URL paste mode
  *   - Configurable title matching and HTTP bind settings (registry-persisted)
  *   - WebView2-based configuration and activity log modals
@@ -100,8 +100,8 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.2"
-#define APP_VERSION_W     L"1.0.2"
+#define APP_VERSION_A     "1.0.3"
+#define APP_VERSION_W     L"1.0.3"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -132,7 +132,9 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define REG_VALUE_BIND_IP  "BindIp"
 #define REG_VALUE_PORT     "HttpPort"
 #define REG_VALUE_QUALITY  "JpegQuality"
-#define REG_VALUE_SHIFT_INSERT "ShiftInsertPaste"
+#define REG_VALUE_HISTORY_LIMIT "ImageHistoryLimit"
+#define REG_VALUE_COMPATIBILITY_PASTE "CompatibilityPaste"
+#define REG_VALUE_LEGACY_COMPATIBILITY_PASTE "ShiftInsertPaste"
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 
 #define LOG_RING_CAPACITY  500
@@ -142,6 +144,8 @@ GpStatus __stdcall GdipGetImageHeight(GpImage *image, UINT *height);
 #define IMAGE_TOKEN_HEX_LEN (IMAGE_TOKEN_BYTES * 2)
 #define DEFAULT_HTTP_PORT   10444
 #define DEFAULT_JPEG_QUALITY 80
+#define DEFAULT_IMAGE_HISTORY_LIMIT 1
+#define MAX_IMAGE_HISTORY_LIMIT 1000
 #define PASTE_METHOD_BASE64 0
 #define PASTE_METHOD_HTTP   1
 #define HTTP_EVENT_SERVED   200
@@ -185,7 +189,9 @@ static int  g_configPasteMethod = PASTE_METHOD_BASE64;
 static char g_configBindIp[INET_ADDRSTRLEN] = "127.0.0.1";
 static int  g_configHttpPort = DEFAULT_HTTP_PORT;
 static int  g_configJpegQuality = DEFAULT_JPEG_QUALITY;
-static BOOL g_configShiftInsertPaste = TRUE;
+/* Zero means unlimited; finite limits include the current image. */
+static int  g_configImageHistoryLimit = DEFAULT_IMAGE_HISTORY_LIMIT;
+static BOOL g_configCompatibilityPaste = TRUE;
 static BOOL g_configAutoCheckForUpdates = TRUE;
 static BOOL g_pasteDeferred = FALSE;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
@@ -203,6 +209,9 @@ typedef struct {
 } CachedImage;
 
 static CachedImage g_cachedImage = {0};
+static CachedImage *g_imageHistory = NULL; /* oldest to newest */
+static size_t g_imageHistoryCount = 0;
+static size_t g_imageHistoryCapacity = 0;
 static SRWLOCK g_imageLock = SRWLOCK_INIT;
 static char (*g_goneTokens)[IMAGE_TOKEN_HEX_LEN + 1] = NULL;
 static size_t g_goneTokenCount = 0;
@@ -430,7 +439,6 @@ static ICoreWebView2Controller *g_webviewController = NULL;
 static ICoreWebView2 *g_webviewView = NULL;
 static char g_pendingView[16] = "";
 static BOOL g_webviewWindowShown = FALSE;
-static wchar_t g_webView2Version[128] = L"Unknown";
 static BOOL g_updateConfirmationPending = FALSE;
 static volatile LONG g_updateCheckPending = FALSE;
 static BOOL g_updateInstallReady = FALSE;
@@ -485,7 +493,8 @@ static void ShowWebViewDialog(const char* view, int width, int height);
 static void ReconcileHttpServer(void);
 static void StopHttpServer(void);
 static BOOL RefreshClipboardImageCache(void);
-static void ClearCachedImage(const char *reason);
+static void ClearCurrentImage(const char *reason);
+static void DestroyImageCache(void);
 static void StartUpdateCheck(void);
 static void CancelUpdateCheck(void);
 static void InstallPreparedUpdate(void);
@@ -717,15 +726,101 @@ static void RememberGoneTokenLocked(const char *token)
     g_goneTokenCount++;
 }
 
-static void ReplaceCachedImage(BYTE *jpegData, DWORD jpegSize,
-                               char *base64Data, DWORD base64Len,
-                               const char *token, UINT width, UINT height)
+static void FreeCachedImageData(CachedImage *image)
 {
-    AcquireSRWLockExclusive(&g_imageLock);
-    RememberGoneTokenLocked(g_cachedImage.token);
-    free(g_cachedImage.jpegData);
+    free(image->jpegData);
+    free(image->base64Data);
+    ZeroMemory(image, sizeof(*image));
+}
+
+/* Caller must hold g_imageLock exclusively. A finite setting reserves one
+   slot for the current image, so 1 intentionally disables history. */
+static size_t HistoricalImageLimitLocked(void)
+{
+    if (g_configImageHistoryLimit == 0) return (size_t)-1;
+    return (size_t)(g_configImageHistoryLimit - 1);
+}
+
+/* Caller must hold g_imageLock exclusively. */
+static void EvictOldestHistoricalImageLocked(void)
+{
+    if (g_imageHistoryCount == 0) return;
+    RememberGoneTokenLocked(g_imageHistory[0].token);
+    FreeCachedImageData(&g_imageHistory[0]);
+    g_imageHistoryCount--;
+    if (g_imageHistoryCount > 0) {
+        memmove(&g_imageHistory[0], &g_imageHistory[1],
+                g_imageHistoryCount * sizeof(*g_imageHistory));
+    }
+    ZeroMemory(&g_imageHistory[g_imageHistoryCount], sizeof(*g_imageHistory));
+}
+
+/* Caller must hold g_imageLock exclusively. */
+static size_t EnforceImageHistoryLimitLocked(void)
+{
+    size_t evicted = 0;
+    size_t limit = HistoricalImageLimitLocked();
+    while (g_imageHistoryCount > limit) {
+        EvictOldestHistoricalImageLocked();
+        evicted++;
+    }
+    return evicted;
+}
+
+/* Caller must hold g_imageLock exclusively. Transfers the current JPEG into
+   history without retaining its base64 representation. */
+static void ArchiveCurrentImageLocked(void)
+{
+    CachedImage archived;
+    size_t newCapacity;
+    void *expanded;
+
+    if (!g_cachedImage.token[0]) {
+        FreeCachedImageData(&g_cachedImage);
+        return;
+    }
+
+    archived = g_cachedImage;
+    archived.base64Data = NULL;
+    archived.base64Len = 0;
     free(g_cachedImage.base64Data);
     ZeroMemory(&g_cachedImage, sizeof(g_cachedImage));
+
+    if (HistoricalImageLimitLocked() == 0 || !archived.jpegData) {
+        RememberGoneTokenLocked(archived.token);
+        FreeCachedImageData(&archived);
+        return;
+    }
+
+    if (g_imageHistoryCount == g_imageHistoryCapacity) {
+        newCapacity = g_imageHistoryCapacity ? g_imageHistoryCapacity * 2 : 8;
+        if (newCapacity < g_imageHistoryCapacity ||
+            newCapacity > (size_t)-1 / sizeof(*g_imageHistory)) {
+            RememberGoneTokenLocked(archived.token);
+            FreeCachedImageData(&archived);
+            return;
+        }
+        expanded = realloc(g_imageHistory,
+                           newCapacity * sizeof(*g_imageHistory));
+        if (!expanded) {
+            RememberGoneTokenLocked(archived.token);
+            FreeCachedImageData(&archived);
+            return;
+        }
+        g_imageHistory = expanded;
+        g_imageHistoryCapacity = newCapacity;
+    }
+
+    g_imageHistory[g_imageHistoryCount++] = archived;
+    EnforceImageHistoryLimitLocked();
+}
+
+static void ReplaceCurrentImage(BYTE *jpegData, DWORD jpegSize,
+                                char *base64Data, DWORD base64Len,
+                                const char *token, UINT width, UINT height)
+{
+    AcquireSRWLockExclusive(&g_imageLock);
+    ArchiveCurrentImageLocked();
     g_cachedImage.jpegData = jpegData;
     g_cachedImage.jpegSize = jpegSize;
     g_cachedImage.base64Data = base64Data;
@@ -736,19 +831,49 @@ static void ReplaceCachedImage(BYTE *jpegData, DWORD jpegSize,
     ReleaseSRWLockExclusive(&g_imageLock);
 }
 
-static void ClearCachedImage(const char *reason)
+static void ClearCurrentImage(const char *reason)
 {
     BOOL hadImage;
+    size_t retainedCount;
 
     AcquireSRWLockExclusive(&g_imageLock);
     hadImage = g_cachedImage.token[0] != '\0';
-    RememberGoneTokenLocked(g_cachedImage.token);
-    free(g_cachedImage.jpegData);
-    free(g_cachedImage.base64Data);
-    ZeroMemory(&g_cachedImage, sizeof(g_cachedImage));
+    ArchiveCurrentImageLocked();
+    retainedCount = g_imageHistoryCount;
     ReleaseSRWLockExclusive(&g_imageLock);
 
-    if (hadImage) LogMessage("Clipboard image cache cleared: %s", reason);
+    if (hadImage) {
+        LogMessage("Current clipboard image cleared: %s (%llu historical retained)",
+                   reason, (unsigned long long)retainedCount);
+    }
+}
+
+static size_t SetImageHistoryLimit(int limit)
+{
+    size_t evicted;
+    AcquireSRWLockExclusive(&g_imageLock);
+    g_configImageHistoryLimit = limit;
+    evicted = EnforceImageHistoryLimitLocked();
+    ReleaseSRWLockExclusive(&g_imageLock);
+    return evicted;
+}
+
+static void DestroyImageCache(void)
+{
+    AcquireSRWLockExclusive(&g_imageLock);
+    FreeCachedImageData(&g_cachedImage);
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        FreeCachedImageData(&g_imageHistory[i]);
+    }
+    free(g_imageHistory);
+    g_imageHistory = NULL;
+    g_imageHistoryCount = 0;
+    g_imageHistoryCapacity = 0;
+    free(g_goneTokens);
+    g_goneTokens = NULL;
+    g_goneTokenCount = 0;
+    g_goneTokenCapacity = 0;
+    ReleaseSRWLockExclusive(&g_imageLock);
 }
 
 static BOOL HasCachedImage(void)
@@ -781,7 +906,7 @@ static BOOL RefreshClipboardImageCache(void)
     if (!IsClipboardFormatAvailable(CF_DIB)) {
         g_lastClipboardSequence = sequence;
         KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
-        ClearCachedImage("clipboard now contains non-image data");
+        ClearCurrentImage("clipboard now contains non-image data");
         return TRUE;
     }
 
@@ -830,7 +955,7 @@ cleanup_clipboard:
 
     /* Once the replacement image is readable, the previous URL is no longer
        current even while the new encodings are being prepared. */
-    ClearCachedImage("a newer clipboard image is being prepared");
+    ClearCurrentImage("a newer clipboard image is being prepared");
 
     if (!EncodeImageToMemory((GpImage *)bitmap, L"image/png", 0, &pngData, &pngSize)) {
         LogMessage("ERROR: Failed to encode clipboard image as PNG");
@@ -854,8 +979,8 @@ cleanup_clipboard:
         goto cleanup;
     }
 
-    ReplaceCachedImage(jpegData, jpegSize, base64Data, base64Len,
-                       token, width, height);
+    ReplaceCurrentImage(jpegData, jpegSize, base64Data, base64Len,
+                        token, width, height);
     jpegData = NULL;
     base64Data = NULL;
     g_lastClipboardSequence = sequence;
@@ -988,10 +1113,27 @@ static int FindImageForToken(const char *token, BYTE **jpegCopy, DWORD *jpegSize
             status = 500;
         }
     } else {
-        for (size_t i = 0; i < g_goneTokenCount; i++) {
-            if (strcmp(g_goneTokens[i], token) == 0) {
-                status = HTTP_EVENT_GONE;
+        for (size_t i = g_imageHistoryCount; i > 0; i--) {
+            CachedImage *historical = &g_imageHistory[i - 1];
+            if (strcmp(historical->token, token) == 0) {
+                BYTE *copy = (BYTE *)malloc(historical->jpegSize);
+                if (copy) {
+                    memcpy(copy, historical->jpegData, historical->jpegSize);
+                    *jpegCopy = copy;
+                    *jpegSize = historical->jpegSize;
+                    status = HTTP_EVENT_SERVED;
+                } else {
+                    status = 500;
+                }
                 break;
+            }
+        }
+        if (status == HTTP_EVENT_NOT_FOUND) {
+            for (size_t i = 0; i < g_goneTokenCount; i++) {
+                if (strcmp(g_goneTokens[i], token) == 0) {
+                    status = HTTP_EVENT_GONE;
+                    break;
+                }
             }
         }
     }
@@ -1033,15 +1175,15 @@ static void SendHttpResponse(SOCKET client, int status, BOOL headOnly,
     case HTTP_EVENT_SERVED:
         reason = "OK";
         contentType = "image/jpeg";
-        messageHeader = "Current clipboard image";
+        messageHeader = "Retained clipboard image";
         body = NULL;
         bodySize = imageSize;
         break;
     case HTTP_EVENT_GONE:
         reason = "Gone";
         contentType = "text/plain; charset=utf-8";
-        messageHeader = "This image is no longer available because the clipboard image changed";
-        body = "This image is no longer available. A newer clipboard image replaced it, or the clipboard no longer contains an image.\n";
+        messageHeader = "This image was evicted from the in-memory image history";
+        body = "This image is no longer available because it was evicted from ImagePaster's in-memory image history.\n";
         bodySize = (DWORD)strlen(body);
         break;
     case 405:
@@ -1292,7 +1434,7 @@ static void ReconcileHttpServer(void)
 
 /* ── Paste re-injection ─────────────────────────────────────────────────── */
 
-static void SimulateCtrlV(void)
+static void SimulateStandardTextPaste(void)
 {
     INPUT inputs[4];
     UINT sent;
@@ -1328,7 +1470,7 @@ static void SimulateCtrlV(void)
     }
 }
 
-static void SimulateShiftInsert(void)
+static void SimulateCompatibilityTextPaste(void)
 {
     INPUT inputs[4];
     UINT sent;
@@ -1351,19 +1493,19 @@ static void SimulateShiftInsert(void)
 
     sent = SendInput(4, inputs, sizeof(INPUT));
     if (sent == 4) {
-        LogMessage("Simulated Shift+Insert (terminal compatibility text paste)");
+        LogMessage("Simulated Shift+Insert (compatibility text paste)");
     } else {
         LogMessage("ERROR: Shift+Insert re-injection sent %u of 4 events (%lu)",
                    sent, GetLastError());
     }
 }
 
-static void SimulateConfiguredPasteShortcut(void)
+static void SimulateConfiguredTextPaste(void)
 {
-    if (g_configShiftInsertPaste) {
-        SimulateShiftInsert();
+    if (g_configCompatibilityPaste) {
+        SimulateCompatibilityTextPaste();
     } else {
-        SimulateCtrlV();
+        SimulateStandardTextPaste();
     }
 }
 
@@ -1406,7 +1548,7 @@ static BOOL PlaceUtf8TextOnClipboard(const char *text, BOOL preserveCachedImage)
     g_ownClipboardSequence = preserveCachedImage ? g_lastClipboardSequence : 0;
     g_writingClipboardText = FALSE;
     if (!preserveCachedImage) {
-        ClearCachedImage("activity log was copied as text");
+        ClearCurrentImage("activity log was copied as text");
     }
     return TRUE;
 }
@@ -1498,7 +1640,7 @@ static BOOL PasteCachedImage(void)
         LogMessage("Prepared %s paste (%lu characters, image id %.12s...)",
                    g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP URL" : "base64",
                    textLen, token);
-        SimulateConfiguredPasteShortcut();
+        SimulateConfiguredTextPaste();
         success = TRUE;
     }
     free(pasteText);
@@ -1583,10 +1725,23 @@ static BOOL LoadConfigFromRegistry(void)
     }
 
     size = sizeof(value);
-    if (RegQueryValueExA(hKey, REG_VALUE_SHIFT_INSERT, NULL, &type,
+    if (RegQueryValueExA(hKey, REG_VALUE_HISTORY_LIMIT, NULL, &type,
                          (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value <= MAX_IMAGE_HISTORY_LIMIT) {
+        g_configImageHistoryLimit = (int)value;
+    }
+
+    size = sizeof(value);
+    result = RegQueryValueExA(hKey, REG_VALUE_COMPATIBILITY_PASTE, NULL, &type,
+                              (LPBYTE)&value, &size);
+    if (result != ERROR_SUCCESS) {
+        size = sizeof(value);
+        result = RegQueryValueExA(hKey, REG_VALUE_LEGACY_COMPATIBILITY_PASTE,
+                                  NULL, &type, (LPBYTE)&value, &size);
+    }
+    if (result == ERROR_SUCCESS &&
         type == REG_DWORD && value <= 1) {
-        g_configShiftInsertPaste = value != 0;
+        g_configCompatibilityPaste = value != 0;
     }
 
     size = sizeof(value);
@@ -1604,6 +1759,7 @@ static void SaveConfigToRegistry(void)
 {
     HKEY hKey;
     DWORD disposition;
+    char historyText[32];
     LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
                                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL,
                                   &hKey, &disposition);
@@ -1625,20 +1781,30 @@ static void SaveConfigToRegistry(void)
         value = (DWORD)g_configJpegQuality;
         RegSetValueExA(hKey, REG_VALUE_QUALITY, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
-        value = (DWORD)g_configShiftInsertPaste;
-        RegSetValueExA(hKey, REG_VALUE_SHIFT_INSERT, 0, REG_DWORD,
+        value = (DWORD)g_configImageHistoryLimit;
+        RegSetValueExA(hKey, REG_VALUE_HISTORY_LIMIT, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
+        value = (DWORD)g_configCompatibilityPaste;
+        RegSetValueExA(hKey, REG_VALUE_COMPATIBILITY_PASTE, 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
+        RegDeleteValueA(hKey, REG_VALUE_LEGACY_COMPATIBILITY_PASTE);
         value = (DWORD)g_configAutoCheckForUpdates;
         RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
                        (const BYTE *)&value, sizeof(value));
     }
 
     RegCloseKey(hKey);
-    LogMessage("Configuration saved: method=%s, shortcut=%s, bind=%s:%d, JPEG=%d%%, titles=%s",
+    if (g_configImageHistoryLimit == 0) {
+        strcpy(historyText, "unlimited");
+    } else {
+        snprintf(historyText, sizeof(historyText), "%d",
+                 g_configImageHistoryLimit);
+    }
+    LogMessage("Configuration saved: method=%s, shortcut=%s, bind=%s:%d, JPEG=%d%%, history=%s, titles=%s",
                g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64",
-               g_configShiftInsertPaste ? "Shift+Insert" : "Ctrl+V",
+               g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V",
                g_configBindIp, g_configHttpPort, g_configJpegQuality,
-               g_configTitleMatch);
+               historyText, g_configTitleMatch);
 }
 
 /* ── Low-level keyboard hook ────────────────────────────────────────────── */
@@ -3110,7 +3276,6 @@ static void webview_push_init_config(void)
     wchar_t wTitleMatch[4096];
     wchar_t wBindIp[128];
     wchar_t wHttpStatus[512];
-    wchar_t wWebView2Version[256];
     wchar_t wUpdateCompletedVersion[64];
     wchar_t ipsJson[4096];
     char ips[MAX_DETECTED_IPS][INET_ADDRSTRLEN];
@@ -3119,7 +3284,6 @@ static void webview_push_init_config(void)
     json_escape_string(g_configTitleMatch, wTitleMatch, 4096);
     json_escape_string(g_configBindIp, wBindIp, 128);
     json_escape_string(g_httpStatus, wHttpStatus, 512);
-    json_escape_wstring(g_webView2Version, wWebView2Version, 256);
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_W : L"",
                         wUpdateCompletedVersion, 64);
 
@@ -3140,22 +3304,22 @@ static void webview_push_init_config(void)
         L"\"bindIp\":\"%s\","
         L"\"httpPort\":%d,"
         L"\"jpegQuality\":%d,"
-        L"\"shiftInsertPaste\":%s,"
+        L"\"imageHistoryLimit\":%d,"
+        L"\"compatibilityPaste\":%s,"
         L"\"autoCheckForUpdates\":%s,"
         L"\"availableIps\":%s,"
         L"\"bindIpAvailable\":%s,"
         L"\"serverStatus\":\"%s\","
         L"\"version\":\"%s\"},"
-        L"\"webView2Version\":\"%s\","
         L"\"updateCompletedVersion\":\"%s\"})",
         wTitleMatch,
         g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
         wBindIp, g_configHttpPort, g_configJpegQuality,
-        g_configShiftInsertPaste ? L"true" : L"false",
+        g_configImageHistoryLimit,
+        g_configCompatibilityPaste ? L"true" : L"false",
         g_configAutoCheckForUpdates ? L"true" : L"false", ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
-        wHttpStatus, APP_VERSION_W, wWebView2Version,
-        wUpdateCompletedVersion);
+        wHttpStatus, APP_VERSION_W, wUpdateCompletedVersion);
     webview_execute_script(script);
 }
 
@@ -3227,16 +3391,6 @@ static HRESULT STDMETHODCALLTYPE EnvCompleted_Invoke(ICoreWebView2CreateCoreWebV
     if (FAILED(result) || !env) return result;
     g_webviewEnv = env;
     env->lpVtbl->AddRef(env);
-
-    LPWSTR browserVersion = NULL;
-    if (SUCCEEDED(env->lpVtbl->get_BrowserVersionString(env, &browserVersion)) &&
-        browserVersion && browserVersion[0]) {
-        wcsncpy(g_webView2Version, browserVersion,
-                (sizeof(g_webView2Version) / sizeof(g_webView2Version[0])) - 1);
-        g_webView2Version[(sizeof(g_webView2Version) /
-                           sizeof(g_webView2Version[0])) - 1] = L'\0';
-    }
-    CoTaskMemFree(browserVersion);
 
     static ControllerCompletedHandlerVtbl ctrlVtbl = {0};
     static BOOL ctrlVtblInit = FALSE;
@@ -3369,7 +3523,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char bindIp[INET_ADDRSTRLEN] = {0};
         int httpPort = 0;
         int jpegQuality = -1;
-        int shiftInsertPaste = -1;
+        int imageHistoryLimit = -1;
+        int compatibilityPaste = -1;
         int autoCheckForUpdates = -1;
         IN_ADDR parsedAddress;
 
@@ -3378,7 +3533,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_string(msg, "bindIp", bindIp, sizeof(bindIp));
         json_get_int(msg, "httpPort", &httpPort);
         json_get_int(msg, "jpegQuality", &jpegQuality);
-        json_get_int(msg, "shiftInsertPaste", &shiftInsertPaste);
+        json_get_int(msg, "imageHistoryLimit", &imageHistoryLimit);
+        json_get_int(msg, "compatibilityPaste", &compatibilityPaste);
         json_get_int(msg, "autoCheckForUpdates", &autoCheckForUpdates);
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
@@ -3401,7 +3557,12 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             free(msg);
             return S_OK;
         }
-        if (shiftInsertPaste < 0 || shiftInsertPaste > 1) {
+        if (imageHistoryLimit < 0 || imageHistoryLimit > MAX_IMAGE_HISTORY_LIMIT) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Image history must be Unlimited or between 1 and 1000.'})");
+            free(msg);
+            return S_OK;
+        }
+        if (compatibilityPaste < 0 || compatibilityPaste > 1) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid text-paste shortcut.'})");
             free(msg);
             return S_OK;
@@ -3425,7 +3586,14 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         g_configBindIp[sizeof(g_configBindIp) - 1] = '\0';
         g_configHttpPort = httpPort;
         g_configJpegQuality = jpegQuality;
-        g_configShiftInsertPaste = shiftInsertPaste != 0;
+        {
+            size_t evicted = SetImageHistoryLimit(imageHistoryLimit);
+            if (evicted > 0) {
+                LogMessage("Image history limit evicted %llu image(s)",
+                           (unsigned long long)evicted);
+            }
+        }
+        g_configCompatibilityPaste = compatibilityPaste != 0;
         g_configAutoCheckForUpdates = autoCheckForUpdates != 0;
         SaveConfigToRegistry();
         ParseKeywords();
@@ -3717,13 +3885,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_hAppIcon) DestroyIcon(g_hAppIcon);
             if (g_hMenu) DestroyMenu(g_hMenu);
             if (g_hHook) UnhookWindowsHookEx(g_hHook);
-            ClearCachedImage("application is exiting");
-            AcquireSRWLockExclusive(&g_imageLock);
-            free(g_goneTokens);
-            g_goneTokens = NULL;
-            g_goneTokenCount = 0;
-            g_goneTokenCapacity = 0;
-            ReleaseSRWLockExclusive(&g_imageLock);
+            DestroyImageCache();
             if (g_httpSocketLockReady && !g_httpThread) {
                 DeleteCriticalSection(&g_httpSocketLock);
                 g_httpSocketLockReady = FALSE;
@@ -3745,7 +3907,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DO_PASTE:
         {
-            if (g_configShiftInsertPaste &&
+            if (g_configCompatibilityPaste &&
                 (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) {
                 if (!g_pasteDeferred) {
                     LogMessage("Waiting for Ctrl release before Shift+Insert paste");
@@ -3801,7 +3963,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if ((int)wParam == HTTP_EVENT_SERVED) {
             LogMessage("HTTP image request served (200 OK)");
         } else if ((int)wParam == HTTP_EVENT_GONE) {
-            LogMessage("HTTP request for superseded image returned 410 Gone");
+            LogMessage("HTTP request for evicted image returned 410 Gone");
         } else if ((int)wParam == HTTP_EVENT_NOT_FOUND) {
             LogMessage("HTTP request for unknown image returned 404 Not Found");
         }
@@ -3901,7 +4063,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     LogMessage("Title match keywords: %s", g_configTitleMatch);
     LogMessage("Paste method: %s", g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
     LogMessage("Text paste shortcut: %s",
-               g_configShiftInsertPaste ? "Shift+Insert" : "Ctrl+V");
+               g_configCompatibilityPaste ? "Shift+Insert" : "Ctrl+V");
+    if (g_configImageHistoryLimit == 0) {
+        LogMessage("In-memory image history: unlimited");
+    } else {
+        LogMessage("In-memory image history: %d image(s)",
+                   g_configImageHistoryLimit);
+    }
 
     /* Clipboard monitoring keeps both paste modes synchronized with the user's
        latest clipboard image, independent of which mode is currently selected. */

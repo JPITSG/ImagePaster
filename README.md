@@ -1,4 +1,4 @@
-# ImagePaster 1.0.2
+# ImagePaster 1.0.3
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -9,13 +9,14 @@ A Windows system tray utility that makes clipboard images usable in terminal app
   - raw base64-encoded PNG text (legacy behavior)
   - a short instruction containing a temporary HTTP JPEG URL
 - Watches the clipboard continuously and keeps the latest image encoded in memory for both methods
-- Clears the cached image when the user copies non-image content
+- Retains configurable in-memory JPEG history: 1–1000 total images or Unlimited until exit
+- Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
 - Detects active local IPv4 addresses for selection in the configuration dialog
 - Keeps an unavailable saved address and automatically starts listening if that address returns
-- Uses a random 256-bit image identifier; superseded URLs return `410 Gone`
+- Uses a random 256-bit image identifier; retained URLs stay available and evicted URLs return `410 Gone`
 - Configurable window title matching (comma-separated keywords)
-- Optional Shift+Insert text-paste compatibility mode for terminals such as Xshell
+- Optional, application-neutral compatibility paste mode using Shift+Insert
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
@@ -43,9 +44,9 @@ A Windows system tray utility that makes clipboard images usable in terminal app
      [ image available at http://192.168.1.100:10444/<random-id>.jpg - if you feel this image will be useful later on be sure to save it to /tmp or a temp location for later use ]
      ```
 
-5. The configured text-paste shortcut is injected so the target application receives the selected representation. The default Shift+Insert compatibility mode avoids forwarding a second Ctrl+V into Xshell; it can be disabled to use generic Ctrl+V re-injection.
+5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
 
-The HTTP server runs in both modes. A URL for the current image returns `200 OK` with `image/jpeg`. A previously issued URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`.
+The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. History is memory-only and is discarded when ImagePaster exits.
 
 ## Building
 
@@ -80,7 +81,8 @@ Right-click the tray icon and select **Configuration** to open the settings dial
 | HTTP Bind Address | `BindIp` | REG_SZ | `127.0.0.1` |
 | HTTP Port | `HttpPort` | REG_DWORD | `10444` |
 | JPEG Quality | `JpegQuality` | REG_DWORD | `80` |
-| Shift+Insert Paste | `ShiftInsertPaste` | REG_DWORD | Enabled |
+| Image History Limit | `ImageHistoryLimit` | REG_DWORD | `1` |
+| Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 
 The title match field accepts comma-separated keywords (e.g. `xshell, putty, terminal`). Matching is case-insensitive and checks for substring presence in the focused window's title.
@@ -89,8 +91,12 @@ The bind-address menu lists IPv4 addresses on active adapters and includes an **
 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`.
 
-The footer displays the application and WebView2 runtime versions together as
-`v<application version> / <WebView2 version>`.
+The history limit counts the current image: `1` keeps only the current image,
+`2` keeps it plus one historical image, and so on through `1000`. Selecting
+**Unlimited** stores `0` in the registry and retains every image until the
+application exits.
+
+The footer displays the application version as `v<application version>`.
 
 When **Automatically check for updates** is enabled, opening the Configuration
 dialog makes a fresh request for the repository's

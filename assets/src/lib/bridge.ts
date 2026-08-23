@@ -6,7 +6,8 @@ export interface ConfigData {
   bindIp: string;
   httpPort: number;
   jpegQuality: number;
-  shiftInsertPaste: boolean;
+  imageHistoryLimit: number;
+  compatibilityPaste: boolean;
   autoCheckForUpdates: boolean;
   availableIps: string[];
   bindIpAvailable: boolean;
@@ -23,7 +24,6 @@ export interface InitData {
   view: "config" | "log";
   config?: ConfigData;
   log?: LogEntry[];
-  webView2Version?: string;
   updateCompletedVersion?: string;
 }
 
@@ -136,7 +136,8 @@ export function saveSettings(config: ConfigData) {
     bindIp: config.bindIp,
     httpPort: config.httpPort,
     jpegQuality: config.jpegQuality,
-    shiftInsertPaste: config.shiftInsertPaste ? 1 : 0,
+    imageHistoryLimit: config.imageHistoryLimit,
+    compatibilityPaste: config.compatibilityPaste ? 1 : 0,
     autoCheckForUpdates: config.autoCheckForUpdates ? 1 : 0,
   });
 }

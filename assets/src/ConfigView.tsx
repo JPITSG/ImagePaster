@@ -21,7 +21,6 @@ import { Label } from "./components/ui/label";
 
 interface Props {
   config: ConfigData;
-  webView2Version: string;
   updateCompletedVersion: string;
 }
 
@@ -42,7 +41,6 @@ function isValidIpv4(value: string) {
 
 export default function ConfigView({
   config,
-  webView2Version,
   updateCompletedVersion,
 }: Props) {
   const configuredIpIsDetected = config.availableIps.includes(config.bindIp);
@@ -56,8 +54,14 @@ export default function ConfigView({
   );
   const [httpPort, setHttpPort] = useState(String(config.httpPort));
   const [jpegQuality, setJpegQuality] = useState(String(config.jpegQuality));
-  const [shiftInsertPaste, setShiftInsertPaste] = useState(
-    config.shiftInsertPaste,
+  const [imageHistoryLimit, setImageHistoryLimit] = useState(
+    String(config.imageHistoryLimit === 0 ? 1 : config.imageHistoryLimit),
+  );
+  const [unlimitedImageHistory, setUnlimitedImageHistory] = useState(
+    config.imageHistoryLimit === 0,
+  );
+  const [compatibilityPaste, setCompatibilityPaste] = useState(
+    config.compatibilityPaste,
   );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true,
@@ -161,6 +165,7 @@ export default function ConfigView({
   const handleSave = () => {
     const port = Number(httpPort);
     const quality = Number(jpegQuality);
+    const historyLimit = unlimitedImageHistory ? 0 : Number(imageHistoryLimit);
     setError("");
 
     if (!isValidIpv4(selectedBindIp)) {
@@ -175,6 +180,13 @@ export default function ConfigView({
       setError("JPEG quality must be between 0 and 100.");
       return;
     }
+    if (
+      !unlimitedImageHistory &&
+      (!Number.isInteger(historyLimit) || historyLimit < 1 || historyLimit > 1000)
+    ) {
+      setError("Image history must be Unlimited or between 1 and 1000.");
+      return;
+    }
 
     saveSettings({
       ...config,
@@ -183,7 +195,8 @@ export default function ConfigView({
       bindIp: selectedBindIp,
       httpPort: port,
       jpegQuality: quality,
-      shiftInsertPaste,
+      imageHistoryLimit: historyLimit,
+      compatibilityPaste,
       autoCheckForUpdates,
     });
   };
@@ -221,19 +234,19 @@ export default function ConfigView({
 
       <div className="rounded-md border border-neutral-200 px-3 py-2.5">
         <label
-          htmlFor="shiftInsertPaste"
+          htmlFor="compatibilityPaste"
           className="flex cursor-pointer items-center gap-2 text-xs font-medium"
         >
           <Checkbox
-            id="shiftInsertPaste"
-            checked={shiftInsertPaste}
-            onChange={(event) => setShiftInsertPaste(event.target.checked)}
+            id="compatibilityPaste"
+            checked={compatibilityPaste}
+            onChange={(event) => setCompatibilityPaste(event.target.checked)}
           />
-          Use Shift+Insert for generated text
+          Use compatibility paste shortcut
         </label>
         <p className="mt-1.5 pl-6 text-[11px] text-neutral-500">
-          Xshell compatibility workaround. Disable it for applications that expect
-          the generic Ctrl+V shortcut.
+          Uses Shift+Insert instead of Ctrl+V when inserting generated text. Enable
+          it for applications that handle Ctrl+V themselves.
         </p>
       </div>
 
@@ -307,6 +320,39 @@ export default function ConfigView({
           />
         </div>
 
+        <div className="space-y-1.5">
+          <Label htmlFor="imageHistoryLimit">In-memory Image History</Label>
+          <div className="grid grid-cols-[1fr_auto] items-center gap-3">
+            <Input
+              id="imageHistoryLimit"
+              type="number"
+              min={1}
+              max={1000}
+              disabled={unlimitedImageHistory}
+              value={unlimitedImageHistory ? "" : imageHistoryLimit}
+              placeholder={unlimitedImageHistory ? "Unlimited" : undefined}
+              onChange={(event) => setImageHistoryLimit(event.target.value)}
+            />
+            <label
+              htmlFor="unlimitedImageHistory"
+              className="flex cursor-pointer items-center gap-2 whitespace-nowrap text-xs"
+            >
+              <Checkbox
+                id="unlimitedImageHistory"
+                checked={unlimitedImageHistory}
+                onChange={(event) =>
+                  setUnlimitedImageHistory(event.target.checked)
+                }
+              />
+              Unlimited
+            </label>
+          </div>
+          <p className="text-[11px] text-neutral-500">
+            Maximum images retained until exit, including the current image. A limit
+            of 1 keeps only the current image.
+          </p>
+        </div>
+
         <div className="rounded-md bg-neutral-50 px-3 py-2 text-[11px] text-neutral-600">
           Server status: {config.serverStatus}
         </div>
@@ -339,9 +385,9 @@ export default function ConfigView({
       <div className="flex items-center justify-between gap-3 pt-1">
         <span
           className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
-          title="Application version / WebView2 version"
+          title="Application version"
         >
-          v{config.version} / {webView2Version}
+          v{config.version}
         </span>
         <div className="flex items-center gap-2">
           <Button
