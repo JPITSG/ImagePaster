@@ -172,8 +172,8 @@ GpStatus __stdcall GdipDrawString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.11"
-#define APP_VERSION_W     L"1.0.11"
+#define APP_VERSION_A     "1.0.12"
+#define APP_VERSION_W     L"1.0.12"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -4076,6 +4076,21 @@ static void FormatExecutableVersion(const ExecutableVersion* version,
     }
 }
 
+static void FormatExecutableVersionForDisplay(const ExecutableVersion* version,
+                                              wchar_t* text, size_t textCch) {
+    if (!version || !text || textCch == 0) return;
+    if (version->build == 0) {
+        if (swprintf_s(text, textCch, L"%u.%u.%u",
+                       (unsigned int)version->major,
+                       (unsigned int)version->minor,
+                       (unsigned int)version->patch) <= 0) {
+            text[0] = L'\0';
+        }
+        return;
+    }
+    FormatExecutableVersion(version, text, textCch);
+}
+
 static BOOL BuildUpdateTempPath(wchar_t path[MAX_PATH], LPCWSTR role,
                                 DWORD processId) {
     if (!path || !role || !*role || processId == 0) {
@@ -5155,10 +5170,12 @@ static void PresentPendingUpdateNotice(void) {
         title = L"Update failed";
         message = task->message;
     } else {
-        FormatExecutableVersion(&task->runningVersion, currentVersion,
-                                sizeof(currentVersion) / sizeof(wchar_t));
-        FormatExecutableVersion(&task->availableVersion, remoteVersion,
-                                sizeof(remoteVersion) / sizeof(wchar_t));
+        FormatExecutableVersionForDisplay(
+            &task->runningVersion, currentVersion,
+            sizeof(currentVersion) / sizeof(wchar_t));
+        FormatExecutableVersionForDisplay(
+            &task->availableVersion, remoteVersion,
+            sizeof(remoteVersion) / sizeof(wchar_t));
         if (task->kind == UPDATE_CHECK_NEWER) {
             status = L"newer";
             title = L"Update available";
