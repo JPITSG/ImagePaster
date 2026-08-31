@@ -194,8 +194,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.31"
-#define APP_VERSION_W     L"1.0.31"
+#define APP_VERSION_A     "1.0.32"
+#define APP_VERSION_W     L"1.0.32"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -751,6 +751,7 @@ static void ParseKeywords(void);
 static BOOL LoadConfigFromRegistry(void);
 static void SaveConfigToRegistry(void);
 static void ShowWebViewDialog(const char* view, int width, int height);
+static void UpdateTooltip(void);
 static void ReconcileHttpServer(void);
 static void StopHttpServer(void);
 static BOOL RefreshClipboardImageCache(void);
@@ -2251,6 +2252,7 @@ static void SetHttpStatus(int state, const char *fmt, ...)
         strncpy(g_httpStatus, status, sizeof(g_httpStatus) - 1);
         g_httpStatus[sizeof(g_httpStatus) - 1] = '\0';
         LogMessage("HTTP server: %s", g_httpStatus);
+        UpdateTooltip();
     }
 }
 
@@ -5501,19 +5503,67 @@ static void InitTrayIcon(HWND hwnd)
 
 static void UpdateTooltip(void)
 {
-    if (g_configTitleMatch[0] == '\0' || g_keywordCount == 0) {
-        wcscpy(g_nid.szTip, L"Image pasting is inactive");
-    } else {
-        WCHAR wMatch[2048] = {0};
-        WCHAR tip[128] = L"Image pasting active for \"";
-        size_t remaining;
-        MultiByteToWideChar(CP_UTF8, 0, g_configTitleMatch, -1,
-                            wMatch, sizeof(wMatch) / sizeof(wMatch[0]));
-        remaining = (sizeof(tip) / sizeof(tip[0])) - wcslen(tip) - 2;
-        wcsncat(tip, wMatch, remaining);
-        wcscat(tip, L"\"");
-        wcscpy(g_nid.szTip, tip);
+    WCHAR titleMatch[sizeof(g_configTitleMatch)] = L"None";
+    WCHAR httpServer[32] = L"Disabled";
+    WCHAR prefix[64];
+    WCHAR suffix[96];
+    size_t tipCapacity = sizeof(g_nid.szTip) / sizeof(g_nid.szTip[0]);
+    size_t fixedLength;
+    size_t titleCapacity;
+    size_t titleLength;
+
+    if (!g_nid.hWnd) return;
+
+    if (g_configTitleMatch[0] != '\0' && g_keywordCount > 0) {
+        if (MultiByteToWideChar(
+                CP_UTF8, 0, g_configTitleMatch, -1, titleMatch,
+                sizeof(titleMatch) / sizeof(titleMatch[0])) <= 0) {
+            wcscpy(titleMatch, L"None");
+        }
     }
+    for (WCHAR *character = titleMatch; *character; character++) {
+        if (*character == L'\r' || *character == L'\n') {
+            *character = L' ';
+        }
+    }
+    if (g_httpState == 1) {
+        swprintf(httpServer,
+                 sizeof(httpServer) / sizeof(httpServer[0]),
+                 L"%hs:%d", g_configBindIp, g_configHttpPort);
+    }
+
+    swprintf(prefix, sizeof(prefix) / sizeof(prefix[0]),
+             L"Paste Method: %s\nTitle Match: ",
+             g_configPasteMethod == PASTE_METHOD_HTTP ? L"HTTP" : L"Base64");
+    swprintf(suffix, sizeof(suffix) / sizeof(suffix[0]),
+             L"\nScreen Capture: %s\nHTTP Server: %s",
+             g_configScreenCaptureEnabled ? L"Enabled" : L"Disabled",
+             httpServer);
+
+    fixedLength = wcslen(prefix) + wcslen(suffix);
+    titleCapacity = fixedLength < tipCapacity - 1
+        ? tipCapacity - 1 - fixedLength : 0;
+    titleLength = wcslen(titleMatch);
+    if (titleLength > titleCapacity) {
+        if (titleCapacity >= 3) {
+            size_t ellipsisAt = titleCapacity - 3;
+            if (ellipsisAt > 0 &&
+                titleMatch[ellipsisAt - 1] >= 0xd800 &&
+                titleMatch[ellipsisAt - 1] <= 0xdbff) {
+                ellipsisAt--;
+            }
+            titleMatch[ellipsisAt] = L'.';
+            titleMatch[ellipsisAt + 1] = L'.';
+            titleMatch[ellipsisAt + 2] = L'.';
+            titleMatch[ellipsisAt + 3] = L'\0';
+        } else {
+            titleMatch[titleCapacity] = L'\0';
+        }
+    }
+
+    swprintf(g_nid.szTip, tipCapacity, L"%s%s%s",
+             prefix, titleMatch, suffix);
+    g_nid.szTip[tipCapacity - 1] = L'\0';
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
