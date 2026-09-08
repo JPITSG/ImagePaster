@@ -194,8 +194,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.32"
-#define APP_VERSION_W     L"1.0.32"
+#define APP_VERSION_A     "1.0.33"
+#define APP_VERSION_W     L"1.0.33"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -5574,8 +5574,8 @@ static void CreateContextMenu(void)
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CAPTURE, L"Capture");
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_HISTORY, L"History");
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CONFIGURE, L"Configuration");
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_LOG, L"Activity Log");
+    AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_CONFIGURE, L"Configure");
     AppendMenuW(g_hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
 }
