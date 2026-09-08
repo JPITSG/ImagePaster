@@ -175,17 +175,29 @@ every result and can install an ignored version. Checks use the repository's
 
 The update check downloads the executable to the user's temporary directory
 and compares its embedded Windows file version with the running executable's
-version. While downloading, the button displays the current transfer speed and
+version. While downloading, the red button displays the measured transfer speed
+rounded to whole kilobytes per second, for example **Checking (100kb/s)...**, and
 can be clicked again to stop the check and remove the partial download. The
-result dialog displays both version numbers. A newer build can be installed
+result dialog displays both version numbers. Installable results also offer an
+unchecked-by-default
+**Reopen settings after update** checkbox. This choice applies only to that
+installation and is not saved as a preference. A newer build can be installed
 normally, while a matching build offers a **Force update** action to reinstall
 it; an older repository build is never installed. Installation requests
 standard Windows UAC approval, safely replaces the current executable, and
-restarts ImagePaster. After a successful update, the restarted application
-opens an HTML confirmation with the newly installed version. Dismissing that
-confirmation leaves the configuration dialog open. Cancelling the download,
+restarts ImagePaster. After a successful update, settings stay closed unless
+the checkbox was checked. If checked, the restarted application opens settings
+with an HTML confirmation of the newly installed version; dismissing the
+confirmation leaves settings open. Cancelling the download,
 result dialog, or UAC prompt leaves the current version running. File size is
 used only to validate the download and enforce its safety limit.
+
+Updater regression checks can run without launching the Windows application:
+`python3 -B -m unittest discover -s tests -v` compiles the production speed and
+command-line parsing functions with inert operating-system boundaries (requires
+a host C compiler). After `make`, `python3 tests/check_update_ui.py` checks the
+built UI with a recording WebView bridge (requires Python Playwright and
+Chromium). These checks do not exercise Windows UAC, replacement, or relaunch.
 
 ## Project Structure
 

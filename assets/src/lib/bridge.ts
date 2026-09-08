@@ -209,8 +209,11 @@ export function cancelUpdateCheck() {
   postMessage({ action: "cancelUpdateCheck" });
 }
 
-export function installUpdate() {
-  postMessage({ action: "installUpdate" });
+export function installUpdate(reopenSettingsAfterUpdate: boolean) {
+  postMessage({
+    action: "installUpdate",
+    reopenSettingsAfterUpdate: reopenSettingsAfterUpdate ? 1 : 0,
+  });
 }
 
 export function dismissUpdate() {
