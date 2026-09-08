@@ -194,8 +194,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.33"
-#define APP_VERSION_W     L"1.0.33"
+#define APP_VERSION_A     "1.0.34"
+#define APP_VERSION_W     L"1.0.34"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -8320,6 +8320,8 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     if (g_webviewHwnd != NULL) {
         if (IsIconic(g_webviewHwnd)) ShowWindow(g_webviewHwnd, SW_RESTORE);
         else ShowWindow(g_webviewHwnd, SW_SHOW);
+        SetWindowPos(g_webviewHwnd, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(g_webviewHwnd);
         return;
     }
@@ -8422,7 +8424,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                            (g_webviewHwnd || !AnyRetainedImages())
                                ? MF_GRAYED : MF_ENABLED);
             EnableMenuItem(g_hMenu, ID_TRAY_LOG, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
-            EnableMenuItem(g_hMenu, ID_TRAY_CONFIGURE, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
+            EnableMenuItem(g_hMenu, ID_TRAY_CONFIGURE,
+                           (!g_webviewHwnd || IsConfigurationViewOpen())
+                               ? MF_ENABLED : MF_GRAYED);
             TrackPopupMenu(g_hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
         }
         return 0;
