@@ -1,4 +1,4 @@
-# ImagePaster 1.0.34
+# ImagePaster 1.0.36
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -123,6 +123,8 @@ make clean
 
 Right-click the tray icon and select **Configure** to open the settings dialog.
 Selecting **Configure** again restores and focuses the existing dialog.
+Double-clicking the tray icon starts interactive capture when that feature is
+enabled; otherwise it opens or refocuses **Configure**.
 
 | Setting | Registry Value | Type | Default |
 |---------|---------------|------|---------|

@@ -194,8 +194,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.35"
-#define APP_VERSION_W     L"1.0.35"
+#define APP_VERSION_A     "1.0.36"
+#define APP_VERSION_W     L"1.0.36"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -8438,7 +8438,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP) {
+        if (lParam == WM_LBUTTONDBLCLK) {
+            if (g_configScreenCaptureEnabled) {
+                LogMessage("Screen capture requested by tray icon double-click");
+                PostMessage(hWnd, WM_SCREEN_CAPTURE_BEGIN, 0, 0);
+            } else {
+                LogMessage("Opening Configuration dialog from tray icon double-click");
+                if (g_webviewHwnd && !IsConfigurationViewOpen()) {
+                    SendMessageW(g_webviewHwnd, WM_CLOSE, 0, 0);
+                }
+                ShowWebViewDialog("config", 560, 520);
+            }
+        } else if (lParam == WM_RBUTTONUP) {
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
