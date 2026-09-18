@@ -1,4 +1,4 @@
-# ImagePaster 1.0.36
+# ImagePaster 1.0.37
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -55,6 +55,33 @@ A Windows system tray utility that makes clipboard images usable in terminal app
      ```
 
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
+
+The keyboard hook runs on a dedicated, above-normal-priority input thread,
+separate from image encoding, disk storage, and dialogs. Ordinary keys return
+immediately; Print Screen/Esc only read atomic capture state and enqueue work.
+They never inspect window titles, query the clipboard, allocate, log, or acquire
+application locks. At most one Print Screen action and one cancel action can be
+pending until the UI finishes them, so repeated taps cannot flood a busy UI.
+Identical pending image-paste requests are also coalesced; if the target or
+clipboard changes while that slot is busy, a new paste passes through normally.
+The Ctrl+V path uses non-waiting lock attempts, skips title checks for non-image
+pastes, and bypasses the app's own injected paste events. ImagePaster's own
+dialogs use normal clipboard handling.
+
+The input thread renews the hook every 5 seconds and retries failed installations
+without discarding an existing hook. While interactive capture is enabled (or a
+manually opened overlay is active), it also attempts to register an unmodified
+Print Screen hotkey. This independent backup handles Print Screen if Windows
+removes the low-level hook and requests immediate reinstallation. Hotkey
+conflicts are logged and retried; they do not disable hook-based capture. The
+registration is released when capture is disabled and no overlay is active.
+
+Windows can still remove a timed-out hook, and OS scheduling, another app's hook,
+or an unavailable hotkey cannot be controlled by ImagePaster. These measures
+minimize application-side stalls and provide recovery, not an absolute delivery
+guarantee. A blocked UI can still delay the overlay even while input handling
+remains responsive. No system timeout registry changes or realtime priority are
+used.
 
 The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. Memory-backed history is discarded when ImagePaster exits; disk-backed history, metadata, ordering, and URLs are restored on the next launch when Disk storage is selected.
 
@@ -194,10 +221,19 @@ confirmation leaves settings open. Cancelling the download,
 result dialog, or UAC prompt leaves the current version running. File size is
 used only to validate the download and enforce its safety limit.
 
-Updater regression checks can run without launching the Windows application:
-`python3 -B -m unittest discover -s tests -v` compiles the production speed and
-command-line parsing functions with inert operating-system boundaries (requires
-a host C compiler). After `make`, `python3 tests/check_update_ui.py` checks the
+Native regression checks can run without launching the Windows application:
+`python3 -B -m unittest discover -s tests -v` compiles production hook, updater
+speed, and command-line parsing functions with inert operating-system boundaries
+(requires a host C compiler). Hook tests cover blocked UI/contended locks, millions
+of unrelated key events, bounded capture queues, held keys across renewal,
+hotkey conflicts/fallback, silent removal, installation failures, and shutdown.
+These are deterministic fault-injection tests, not Windows latency measurements.
+On Windows, smoke-test capture on/off, manual tray capture, holding Print Screen
+across a renewal, rapid taps during large image processing, Ctrl+V in a matching
+window, hotkey conflicts, and sleep/resume. Actual input delivery and long-running
+reliability still require a Windows desktop.
+
+After `make`, `python3 tests/check_update_ui.py` checks the
 built UI with a recording WebView bridge (requires Python Playwright and
 Chromium). These checks do not exercise Windows UAC, replacement, or relaunch.
 

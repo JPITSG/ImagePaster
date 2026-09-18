@@ -44,6 +44,9 @@
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,8 +197,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.36"
-#define APP_VERSION_W     L"1.0.36"
+#define APP_VERSION_A     "1.0.37"
+#define APP_VERSION_W     L"1.0.37"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -205,6 +208,14 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define WM_SCREEN_CAPTURE_BEGIN  (WM_APP + 5)
 #define WM_SCREEN_CAPTURE_COPY   (WM_APP + 6)
 #define WM_SCREEN_CAPTURE_CANCEL (WM_APP + 7)
+#define WM_KEYBOARD_HOOK_STATUS   (WM_APP + 8)
+#define WM_KEYBOARD_HOTKEY_STATUS (WM_APP + 9)
+#define KEYBOARD_HOOK_RENEW_MS    5000u
+#define ID_HOTKEY_PRINT_SCREEN   1
+#define HOOK_CAPTURE_ENABLED     1
+#define HOOK_CAPTURE_ACTIVE      2
+#define HOOK_CAPTURE_MESSAGE     1
+#define PASTE_INPUT_TAG          ((ULONG_PTR)0x49505053u)
 #define ID_TRAY_LOG       1001
 #define ID_TRAY_CONFIGURE 1002
 #define ID_TRAY_EXIT      1003
@@ -316,17 +327,31 @@ static int g_logCount = 0;   /* total entries (capped at capacity) */
 
 static HINSTANCE g_hInstance;
 static HWND      g_hWndMain;
+/* Only the dedicated hook thread owns the hook handle and key-down state. */
 static HHOOK     g_hHook;
+static HANDLE   g_keyboardHookThread;
+static HANDLE   g_keyboardHookStopEvent;
+static HANDLE   g_keyboardHookWakeEvent;
+static volatile LONG g_hookCaptureState = 0;
+static volatile LONG g_hookHasKeywords = FALSE;
+static volatile LONG g_hookPrintPending = FALSE;
+static volatile LONG g_hookCancelPending = FALSE;
+static volatile LONG g_hookPastePending = FALSE;
+static HWND g_hookPasteTarget = NULL; /* input thread only */
+static DWORD g_hookPasteSequence = 0;
+static volatile LONG g_hookRenewRequested = FALSE;
+static BOOL g_printHotkeyRegistered = FALSE; /* input thread only */
+static DWORD g_printHotkeyError = 0;
+static DWORD g_hookInstallError = 0;
 static ULONG_PTR g_gdipToken;
 static HANDLE    g_hMutex;
 static HICON     g_hAppIcon;
 static NOTIFYICONDATAW g_nid;
 static HMENU     g_hMenu;
 
-static volatile BOOL g_bSkipNextPaste = FALSE;
 static BOOL g_writingClipboardText = FALSE;
 static DWORD g_ownClipboardSequence = 0;
-static DWORD g_lastClipboardSequence = 0;
+static volatile LONG g_lastClipboardSequence = 0;
 typedef BOOL (WINAPI *PFN_AddClipboardFormatListener)(HWND);
 typedef BOOL (WINAPI *PFN_RemoveClipboardFormatListener)(HWND);
 static PFN_AddClipboardFormatListener fnAddClipboardFormatListener = NULL;
@@ -350,8 +375,11 @@ static int  g_configCaptureGapFill = CAPTURE_GAP_FILL_WHITE;
 static BOOL g_configAutoCheckForUpdates = TRUE;
 static char g_ignoredUpdateVersion[32] = "";
 static BOOL g_pasteDeferred = FALSE;
+static HWND g_deferredPasteTarget = NULL;
+static DWORD g_deferredPasteSequence = 0;
 static WCHAR g_keywords[MAX_KEYWORDS][128];
 static int   g_keywordCount = 0;
+static SRWLOCK g_keywordLock = SRWLOCK_INIT;
 
 /* Clipboard image cache shared with the HTTP worker thread. */
 typedef struct {
@@ -1902,10 +1930,21 @@ static void DestroyImageCache(void)
     ReleaseSRWLockExclusive(&g_imageLock);
 }
 
-static BOOL HasCachedImage(void)
+static DWORD GetCachedClipboardSequence(void)
+{
+    return (DWORD)InterlockedCompareExchange(&g_lastClipboardSequence, 0, 0);
+}
+
+static void SetCachedClipboardSequence(DWORD sequence)
+{
+    InterlockedExchange(&g_lastClipboardSequence, (LONG)sequence);
+}
+
+/* The hook must never wait for image encoding, disk I/O, or HTTP readers. */
+static BOOL TryHasCachedImage(void)
 {
     BOOL available;
-    AcquireSRWLockShared(&g_imageLock);
+    if (!TryAcquireSRWLockShared(&g_imageLock)) return FALSE;
     available = g_cachedImage.token[0] != '\0' &&
                 (g_cachedImage.jpegData != NULL ||
                  g_cachedImage.diskPath != NULL) &&
@@ -2058,7 +2097,7 @@ static BOOL RefreshClipboardImageCache(void)
 
     if (!IsClipboardFormatAvailable(CF_DIB)) {
         g_restoredDiskCurrentNeedsClipboardCheck = FALSE;
-        g_lastClipboardSequence = sequence;
+        SetCachedClipboardSequence(sequence);
         KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
         ClearCurrentImage("clipboard now contains non-image data");
         return TRUE;
@@ -2158,7 +2197,7 @@ cleanup_clipboard:
     }
     jpegData = NULL;
     base64Data = NULL;
-    g_lastClipboardSequence = sequence;
+    SetCachedClipboardSequence(sequence);
     KillTimer(g_hWndMain, ID_TIMER_CLIPBOARD_RETRY);
     success = TRUE;
 
@@ -2722,8 +2761,6 @@ static void SimulateStandardTextPaste(void)
     UINT sent;
     ZeroMemory(inputs, sizeof(inputs));
 
-    g_bSkipNextPaste = TRUE;
-
     /* Ctrl key down */
     inputs[0].type = INPUT_KEYBOARD;
     inputs[0].ki.wVk = VK_CONTROL;
@@ -2742,11 +2779,15 @@ static void SimulateStandardTextPaste(void)
     inputs[3].ki.wVk = VK_CONTROL;
     inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
 
+    /* Identify our injected paste without a cross-thread skip-next flag. */
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+        inputs[i].ki.dwExtraInfo = PASTE_INPUT_TAG;
+    }
+
     sent = SendInput(4, inputs, sizeof(INPUT));
     if (sent == 4) {
         LogMessage("Simulated Ctrl+V (generic text paste)");
     } else {
-        g_bSkipNextPaste = FALSE;
         LogMessage("ERROR: Ctrl+V re-injection sent %u of 4 events (%lu)",
                    sent, GetLastError());
     }
@@ -2826,8 +2867,8 @@ static BOOL PlaceUtf8TextOnClipboard(const char *text, BOOL preserveCachedImage)
     }
     CloseClipboard();
 
-    g_lastClipboardSequence = GetClipboardSequenceNumber();
-    g_ownClipboardSequence = preserveCachedImage ? g_lastClipboardSequence : 0;
+    SetCachedClipboardSequence(GetClipboardSequenceNumber());
+    g_ownClipboardSequence = preserveCachedImage ? GetCachedClipboardSequence() : 0;
     g_writingClipboardText = FALSE;
     if (!preserveCachedImage) {
         ClearCurrentImage("activity log was copied as text");
@@ -2975,8 +3016,18 @@ static BOOL PasteCachedImage(void)
 
 /* ── Keyword parsing ───────────────────────────────────────────────────── */
 
+/* The callback reads a single atomic word, never UI-owned window/config data.
+   Wake the input thread to reconcile the independent hotkey immediately. */
+static void SetHookCaptureFlag(LONG flag, BOOL enabled)
+{
+    if (enabled) InterlockedOr(&g_hookCaptureState, flag);
+    else InterlockedAnd(&g_hookCaptureState, ~flag);
+    if (g_keyboardHookWakeEvent) SetEvent(g_keyboardHookWakeEvent);
+}
+
 static void ParseKeywords(void)
 {
+    AcquireSRWLockExclusive(&g_keywordLock);
     g_keywordCount = 0;
     char copy[2048];
     strncpy(copy, g_configTitleMatch, sizeof(copy) - 1);
@@ -3002,6 +3053,9 @@ static void ParseKeywords(void)
         }
         token = strtok(NULL, ",");
     }
+    InterlockedExchange(&g_hookHasKeywords, g_keywordCount != 0);
+    ReleaseSRWLockExclusive(&g_keywordLock);
+    SetHookCaptureFlag(HOOK_CAPTURE_ENABLED, g_configScreenCaptureEnabled);
 }
 
 /* ── Registry configuration ──────────────────────────────────────────── */
@@ -5220,7 +5274,10 @@ static LRESULT CALLBACK ScreenCaptureWndProc(HWND hwnd, UINT message,
         g_capturePressedPanel = -1;
         g_capturePressedTool = -1;
         if (GetCapture() == hwnd) ReleaseCapture();
-        if (g_captureOverlayHwnd == hwnd) g_captureOverlayHwnd = NULL;
+        if (g_captureOverlayHwnd == hwnd) {
+            g_captureOverlayHwnd = NULL;
+            SetHookCaptureFlag(HOOK_CAPTURE_ACTIVE, FALSE);
+        }
         g_captureHoveredPanel = -1;
         g_captureHoveredTool = -1;
         g_captureHoveredRemoval = -1;
@@ -5299,6 +5356,7 @@ static BOOL BeginScreenCapture(void)
         return FALSE;
     }
 
+    SetHookCaptureFlag(HOOK_CAPTURE_ACTIVE, TRUE);
     ShowWindow(g_captureOverlayHwnd, SW_SHOW);
     SetWindowPos(g_captureOverlayHwnd, HWND_TOPMOST,
                  g_captureVirtualX, g_captureVirtualY,
@@ -5365,7 +5423,7 @@ static BOOL CompleteScreenCapture(BOOL forceFullDesktop)
         LogMessage("Screen capture copied: %dx%d (full desktop)",
                    width, height);
     }
-    g_lastClipboardSequence = 0;
+    SetCachedClipboardSequence(0);
     RefreshClipboardImageCache();
     return TRUE;
 }
@@ -5379,111 +5437,305 @@ static void CancelScreenCapture(const char *reason)
 
 /* ── Low-level keyboard hook ────────────────────────────────────────────── */
 
+/* GetWindowText does not send messages across processes, but it can wait on
+   our own UI thread. Our settings/log/history windows are never paste targets. */
+static BOOL HookForegroundTitleMatches(HWND foreground)
+{
+    DWORD processId = 0;
+    WCHAR title[512];
+    BOOL matchFound = FALSE;
+
+    if (!foreground ||
+        !GetWindowThreadProcessId(foreground, &processId) ||
+        processId == GetCurrentProcessId()) {
+        return FALSE;
+    }
+    if (GetWindowTextW(foreground, title, 512) <= 0) return FALSE;
+    for (WCHAR *p = title; *p; p++) {
+        if (*p >= L'A' && *p <= L'Z') *p = *p - L'A' + L'a';
+    }
+    if (!TryAcquireSRWLockShared(&g_keywordLock)) return FALSE;
+    for (int i = 0; i < g_keywordCount; i++) {
+        if (wcsstr(title, g_keywords[i]) != NULL) {
+            matchFound = TRUE;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_keywordLock);
+    return matchFound;
+}
+
+/* At most one Print Screen and one cancel action may be outstanding. Keep the
+   slot until UI work finishes, including capture/encoding: repeated taps must
+   not flood a busy queue or unexpectedly copy the whole screen on recovery. */
+static BOOL QueueHookCapture(UINT message, WPARAM argument)
+{
+    volatile LONG *pending = message == WM_SCREEN_CAPTURE_CANCEL
+        ? &g_hookCancelPending : &g_hookPrintPending;
+    if (InterlockedCompareExchange(pending, TRUE, FALSE)) return TRUE;
+    if (PostMessageW(g_hWndMain, message, argument, HOOK_CAPTURE_MESSAGE)) return TRUE;
+    InterlockedExchange(pending, FALSE);
+    return FALSE;
+}
+
+static BOOL QueueHookPrintScreen(LONG captureState)
+{
+    if (!(captureState & (HOOK_CAPTURE_ENABLED | HOOK_CAPTURE_ACTIVE))) return FALSE;
+    return QueueHookCapture((captureState & HOOK_CAPTURE_ACTIVE)
+                            ? WM_SCREEN_CAPTURE_COPY : WM_SCREEN_CAPTURE_BEGIN,
+                            (captureState & HOOK_CAPTURE_ACTIVE) ? TRUE : FALSE);
+}
+
+/* Bound paste traffic as well: even a held Ctrl+V must not crowd capture out of
+   a stalled UI queue. Coalesce only the same target/clipboard request; a new
+   target or clipboard passes through normally instead of using stale data. */
+static BOOL QueueHookPaste(HWND target, DWORD sequence)
+{
+    if (InterlockedCompareExchange(&g_hookPastePending, TRUE, FALSE)) {
+        return target == g_hookPasteTarget && sequence == g_hookPasteSequence;
+    }
+    g_hookPasteTarget = target;
+    g_hookPasteSequence = sequence;
+    if (PostMessageW(g_hWndMain, WM_DO_PASTE, sequence, (LPARAM)target)) return TRUE;
+    InterlockedExchange(&g_hookPastePending, FALSE);
+    return FALSE;
+}
+
+/* Runs only on the hook thread. Never log, encode, touch files/WebView, allocate,
+   or wait on the UI/a lock. Print Screen does one atomic state read and at most
+   one asynchronous post; unrelated keys do not even read shared state. */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION) {
-        KBDLLHOOKSTRUCT *pKb = (KBDLLHOOKSTRUCT *)lParam;
-        BOOL keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
-        BOOL keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+    if (nCode != HC_ACTION) return CallNextHookEx(NULL, nCode, wParam, lParam);
+    const KBDLLHOOKSTRUCT *pKb = (const KBDLLHOOKSTRUCT *)lParam;
+    if (pKb->vkCode != VK_SNAPSHOT && pKb->vkCode != VK_ESCAPE && pKb->vkCode != 'V') {
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
+    BOOL keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+    BOOL keyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+    if (!keyDown && !keyUp) return CallNextHookEx(NULL, nCode, wParam, lParam);
 
-        if (pKb->vkCode == VK_SNAPSHOT &&
-            (g_configScreenCaptureEnabled || g_captureOverlayHwnd)) {
-            if (keyDown && !g_printScreenKeyDown) {
-                g_printScreenKeyDown = TRUE;
-                PostMessage(g_hWndMain,
-                            g_captureOverlayHwnd
-                                ? WM_SCREEN_CAPTURE_COPY
-                                : WM_SCREEN_CAPTURE_BEGIN,
-                            g_captureOverlayHwnd ? TRUE : 0, 0);
-            } else if (keyUp) {
-                /* Some keyboards expose only the key-up transition. */
-                if (!g_printScreenKeyDown) {
-                    PostMessage(g_hWndMain,
-                                g_captureOverlayHwnd
-                                    ? WM_SCREEN_CAPTURE_COPY
-                                    : WM_SCREEN_CAPTURE_BEGIN,
-                                g_captureOverlayHwnd ? TRUE : 0, 0);
-                }
-                g_printScreenKeyDown = FALSE;
-            }
-            return 1;
+    if (pKb->vkCode == VK_SNAPSHOT) {
+        LONG state = InterlockedCompareExchange(&g_hookCaptureState, 0, 0);
+        if (!(state & (HOOK_CAPTURE_ENABLED | HOOK_CAPTURE_ACTIVE)) &&
+            !g_printScreenKeyDown) return CallNextHookEx(NULL, nCode, wParam, lParam);
+        /* Some keyboards expose only the key-up transition. */
+        if (!g_printScreenKeyDown && !QueueHookPrintScreen(state)) {
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
+        g_printScreenKeyDown = keyDown;
+        return 1;
+    }
 
-        if (pKb->vkCode == VK_ESCAPE &&
-            (g_captureOverlayHwnd || g_escapeKeyDown)) {
-            if (keyDown && !g_escapeKeyDown) {
-                g_escapeKeyDown = TRUE;
-                PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
-            } else if (keyUp) {
-                if (!g_escapeKeyDown && g_captureOverlayHwnd) {
-                    PostMessage(g_hWndMain, WM_SCREEN_CAPTURE_CANCEL, 0, 0);
-                }
-                g_escapeKeyDown = FALSE;
-            }
-            return 1;
+    if (pKb->vkCode == VK_ESCAPE) {
+        LONG state = InterlockedCompareExchange(&g_hookCaptureState, 0, 0);
+        if (!(state & HOOK_CAPTURE_ACTIVE) && !g_escapeKeyDown) {
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
+        if (!g_escapeKeyDown && !QueueHookCapture(WM_SCREEN_CAPTURE_CANCEL, 0)) {
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+        }
+        g_escapeKeyDown = keyDown;
+        return 1;
+    }
 
-        if (keyDown && pKb->vkCode == 'V') {
-            BOOL ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            BOOL altDown  = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    /* Paste is the only path needing routing queries. Keep normal typing,
+       injected pastes and non-image pastes out of title matching entirely. */
+    if (!keyDown || ((pKb->flags & LLKHF_INJECTED) &&
+                    pKb->dwExtraInfo == PASTE_INPUT_TAG) ||
+        !InterlockedCompareExchange(&g_hookHasKeywords, 0, 0) ||
+        !(GetAsyncKeyState(VK_CONTROL) & 0x8000) ||
+        (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
+    DWORD sequence = GetClipboardSequenceNumber();
+    BOOL imagePasteAvailable = IsClipboardFormatAvailable(CF_DIB) ||
+        (sequence == GetCachedClipboardSequence() && TryHasCachedImage());
+    if (imagePasteAvailable) {
+        HWND foreground = GetForegroundWindow();
+        if (HookForegroundTitleMatches(foreground) &&
+            QueueHookPaste(foreground, sequence)) return 1;
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
 
-            if (ctrlDown && !altDown) {
-                /* Recursion guard: skip if this is our re-injected paste */
-                if (g_bSkipNextPaste) {
-                    g_bSkipNextPaste = FALSE;
-                    LogMessage("Re-injected Ctrl+V detected, passing through");
-                    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-                }
-
-                LogMessage("Ctrl+V detected");
-
-                /* Check if a matching window is focused */
-                BOOL matchFound = FALSE;
-                {
-                    HWND hFg = GetForegroundWindow();
-                    if (hFg) {
-                        WCHAR title[512];
-                        if (GetWindowTextW(hFg, title, 512) > 0) {
-                            /* Lowercase the title */
-                            for (WCHAR *p = title; *p; p++) {
-                                if (*p >= L'A' && *p <= L'Z')
-                                    *p = *p - L'A' + L'a';
-                            }
-                            /* Check each keyword */
-                            for (int i = 0; i < g_keywordCount; i++) {
-                                if (wcsstr(title, g_keywords[i]) != NULL) {
-                                    matchFound = TRUE;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                LogMessage("Title match: %s", matchFound ? "YES" : "NO");
-
-                /* A user image may be awaiting WM_CLIPBOARDUPDATE processing. Our
-                   own text paste keeps the cached image authoritative. */
-                DWORD sequence = GetClipboardSequenceNumber();
-                BOOL clipboardHasImage = IsClipboardFormatAvailable(CF_DIB);
-                BOOL cacheIsCurrent = sequence == g_lastClipboardSequence && HasCachedImage();
-                BOOL imagePasteAvailable = clipboardHasImage || cacheIsCurrent;
-                LogMessage("Current clipboard image available: %s",
-                           imagePasteAvailable ? "YES" : "NO");
-
-                if (matchFound && imagePasteAvailable) {
-                    LogMessage("Intercepting image paste using %s mode",
-                               g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
-                    PostMessage(g_hWndMain, WM_DO_PASTE, 0, 0);
-
-                    /* Block the original Ctrl+V. Encoding and clipboard writes are
-                       deliberately deferred out of this low-level hook. */
-                    return 1;
-                }
+/* A registered hotkey is not subject to LowLevelHooksTimeout. The hook normally
+   swallows Print Screen before WM_HOTKEY is generated; this backup receives it
+   if the hook is removed. Registration may be denied by another app/the OS, so
+   keep the hook in either case and retry a failed registration at renewal. */
+static void ReconcilePrintScreenHotkey(void)
+{
+    BOOL wanted = (InterlockedCompareExchange(&g_hookCaptureState, 0, 0) &
+                   (HOOK_CAPTURE_ENABLED | HOOK_CAPTURE_ACTIVE)) != 0;
+    if (!wanted) {
+        if (g_printHotkeyRegistered) UnregisterHotKey(NULL, ID_HOTKEY_PRINT_SCREEN);
+        g_printHotkeyRegistered = FALSE;
+        g_printHotkeyError = 0;
+    } else if (!g_printHotkeyRegistered) {
+        if (RegisterHotKey(NULL, ID_HOTKEY_PRINT_SCREEN, MOD_NOREPEAT, VK_SNAPSHOT)) {
+            g_printHotkeyRegistered = TRUE;
+            g_printHotkeyError = 0;
+            PostMessageW(g_hWndMain, WM_KEYBOARD_HOTKEY_STATUS, TRUE, 0);
+        } else {
+            DWORD error = GetLastError();
+            if (error != g_printHotkeyError) {
+                PostMessageW(g_hWndMain, WM_KEYBOARD_HOTKEY_STATUS, FALSE, error);
+                g_printHotkeyError = error;
             }
         }
     }
+}
 
-    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+static void HandlePrintScreenHotkey(void)
+{
+    /* A hotkey message may outlive its registration/configuration. Recheck it. */
+    if (g_printHotkeyRegistered) {
+        if (QueueHookPrintScreen(InterlockedCompareExchange(&g_hookCaptureState, 0, 0))) {
+            /* This fallback key was not swallowed by our hook, so async state
+               is usable here. Its release must not become a second action. */
+            g_printScreenKeyDown = (GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) != 0;
+        }
+        /* Reinstall immediately, instead of waiting for the next deadline. */
+        InterlockedExchange(&g_hookRenewRequested, TRUE);
+    }
+}
+
+/* Windows provides no notification when LowLevelHooksTimeout silently removes
+   a hook. Renew periodically on its owner thread, even while the UI is busy.
+   Install first so a failed replacement never discards a working hook. */
+static BOOL RenewKeyboardHook(BOOL reportSuccess)
+{
+    HHOOK replacement = SetWindowsHookExW(
+        WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInstance, 0);
+    if (!replacement) {
+        DWORD error = GetLastError();
+        if (error != g_hookInstallError) {
+            PostMessageW(g_hWndMain, WM_KEYBOARD_HOOK_STATUS, FALSE, error);
+            g_hookInstallError = error;
+        }
+        return FALSE;
+    }
+
+    g_hookInstallError = 0;
+    HHOOK previous = g_hHook;
+    g_hHook = replacement;
+    if (previous) UnhookWindowsHookEx(previous);
+    /* Preserve key-down guards across renewal. Swallowed keys do not update
+       async key state: querying it here would mistake a held key for a release
+       and turn auto-repeat/key-up into an unwanted second capture. */
+    if (reportSuccess) {
+        PostMessageW(g_hWndMain, WM_KEYBOARD_HOOK_STATUS, TRUE, 0);
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI KeyboardHookThreadProc(LPVOID parameter)
+{
+    MSG message;
+    HANDLE events[] = {g_keyboardHookStopEvent, g_keyboardHookWakeEvent};
+    ULONGLONG renewAt = 0;
+    BOOL reportSuccess = TRUE;
+    BOOL reconcileHotkey = TRUE;
+    (void)parameter;
+
+    /* Prefer this tiny input pump to our CPU-heavy image work, without raising
+       the process to high/realtime priority or disabling normal OS boosts. */
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
+        PostMessageW(g_hWndMain, WM_KEYBOARD_HOOK_STATUS, 2, GetLastError());
+    }
+    /* Create this thread's message queue before installing the hook. */
+    PeekMessageW(&message, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    for (;;) {
+        if (WaitForSingleObject(g_keyboardHookStopEvent, 0) == WAIT_OBJECT_0) break;
+        ULONGLONG now = GetTickCount64();
+        if (reconcileHotkey || now >= renewAt) {
+            ReconcilePrintScreenHotkey();
+            reconcileHotkey = FALSE;
+        }
+        if (InterlockedExchange(&g_hookRenewRequested, FALSE) || now >= renewAt) {
+            reportSuccess = !RenewKeyboardHook(reportSuccess);
+            renewAt = GetTickCount64() + KEYBOARD_HOOK_RENEW_MS;
+        }
+
+        now = GetTickCount64();
+        DWORD waitMs = now < renewAt ? (DWORD)(renewAt - now) : 0;
+        DWORD result = MsgWaitForMultipleObjectsEx(
+            2, events, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (result == WAIT_OBJECT_0) break;
+        if (result == WAIT_OBJECT_0 + 1) reconcileHotkey = TRUE;
+        if (result == WAIT_FAILED) {
+            PostMessageW(g_hWndMain, WM_KEYBOARD_HOOK_STATUS, FALSE, GetLastError());
+            break;
+        }
+        /* Bound each drain so a stream of input cannot starve renewal or exit. */
+        for (int i = 0; i < 64 &&
+             PeekMessageW(&message, NULL, 0, 0, PM_REMOVE); i++) {
+            if (message.message == WM_QUIT) goto cleanup;
+            if (message.message == WM_HOTKEY &&
+                message.wParam == ID_HOTKEY_PRINT_SCREEN) HandlePrintScreenHotkey();
+            /* This thread owns no windows and never runs application/UI
+               handlers. PeekMessage itself dispatches low-level hook calls. */
+        }
+    }
+
+cleanup:
+    if (g_printHotkeyRegistered) UnregisterHotKey(NULL, ID_HOTKEY_PRINT_SCREEN);
+    g_printHotkeyRegistered = FALSE;
+    g_printHotkeyError = 0;
+    g_hookInstallError = 0;
+    if (g_hHook) UnhookWindowsHookEx(g_hHook);
+    g_hHook = NULL;
+    g_printScreenKeyDown = FALSE;
+    g_escapeKeyDown = FALSE;
+    return 0;
+}
+
+static void StartKeyboardHook(void)
+{
+    g_keyboardHookStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_keyboardHookStopEvent) {
+        LogMessage("ERROR: Could not create keyboard hook stop event (%lu)", GetLastError());
+        return;
+    }
+    g_keyboardHookWakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_keyboardHookWakeEvent) {
+        LogMessage("ERROR: Could not create keyboard hook wake event (%lu)", GetLastError());
+        CloseHandle(g_keyboardHookStopEvent);
+        g_keyboardHookStopEvent = NULL;
+        return;
+    }
+    g_keyboardHookThread = CreateThread(
+        NULL, 0, KeyboardHookThreadProc, NULL, 0, NULL);
+    if (!g_keyboardHookThread) {
+        LogMessage("ERROR: Could not start keyboard hook thread (%lu)", GetLastError());
+        CloseHandle(g_keyboardHookWakeEvent);
+        CloseHandle(g_keyboardHookStopEvent);
+        g_keyboardHookWakeEvent = NULL;
+        g_keyboardHookStopEvent = NULL;
+    }
+}
+
+static void StopKeyboardHook(void)
+{
+    if (!g_keyboardHookThread) return;
+    SetEvent(g_keyboardHookStopEvent);
+    /* Join before destroying windows/cache that the callback can inspect.
+       The hook never synchronously calls the UI, so there is no wait cycle. */
+    WaitForSingleObject(g_keyboardHookThread, INFINITE);
+    CloseHandle(g_keyboardHookThread);
+    CloseHandle(g_keyboardHookWakeEvent);
+    CloseHandle(g_keyboardHookStopEvent);
+    g_keyboardHookThread = NULL;
+    g_keyboardHookWakeEvent = NULL;
+    g_keyboardHookStopEvent = NULL;
+}
+
+/* A hook can queue work while the UI is busy. Never paste that request into
+   a subsequently focused window or replace a newer clipboard item. */
+static BOOL IsPasteRequestCurrent(HWND target, DWORD clipboardSequence)
+{
+    return target && GetForegroundWindow() == target &&
+           GetClipboardSequenceNumber() == clipboardSequence;
 }
 
 /* ── System tray icon ──────────────────────────────────────────────────── */
@@ -8092,7 +8344,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         ParseKeywords();
         UpdateTooltip();
         if (qualityChanged && IsClipboardFormatAvailable(CF_DIB)) {
-            g_lastClipboardSequence = 0;
+            SetCachedClipboardSequence(0);
             RefreshClipboardImageCache();
         }
         ReconcileHttpServer();
@@ -8486,6 +8738,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case ID_TRAY_EXIT:
             LogMessage("User selected Exit");
+            StopKeyboardHook();
             CancelScreenCapture("application is exiting");
             /* Close WebView if open */
             if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
@@ -8503,7 +8756,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hAppIcon) DestroyIcon(g_hAppIcon);
             if (g_hMenu) DestroyMenu(g_hMenu);
-            if (g_hHook) UnhookWindowsHookEx(g_hHook);
             DestroyImageCache();
             if (g_httpSocketLockReady && !g_httpThread) {
                 DeleteCriticalSection(&g_httpSocketLock);
@@ -8525,16 +8777,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_SCREEN_CAPTURE_BEGIN:
-        BeginScreenCapture();
+        if (lParam != HOOK_CAPTURE_MESSAGE || g_configScreenCaptureEnabled ||
+            g_captureOverlayHwnd) BeginScreenCapture();
+        if (lParam == HOOK_CAPTURE_MESSAGE) InterlockedExchange(&g_hookPrintPending, FALSE);
         return 0;
 
     case WM_SCREEN_CAPTURE_COPY:
         CompleteScreenCapture((BOOL)wParam);
+        if (lParam == HOOK_CAPTURE_MESSAGE) InterlockedExchange(&g_hookPrintPending, FALSE);
         return 0;
 
     case WM_SCREEN_CAPTURE_CANCEL:
         CancelScreenCapture(wParam
             ? "display configuration changed" : "requested by user");
+        if (lParam == HOOK_CAPTURE_MESSAGE) InterlockedExchange(&g_hookCancelPending, FALSE);
+        return 0;
+
+    case WM_KEYBOARD_HOTKEY_STATUS:
+        if (wParam) {
+            LogMessage("Print Screen backup hotkey registered (independent of keyboard hook)");
+        } else {
+            LogMessage("Print Screen backup hotkey unavailable (%lu); keyboard hook remains enabled",
+                       (DWORD)lParam);
+        }
         return 0;
 
     case WM_APP_UPDATE_PROGRESS:
@@ -8556,28 +8821,62 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+    case WM_KEYBOARD_HOOK_STATUS:
+        if (wParam == 2) {
+            LogMessage("Could not raise input thread priority (%lu); continuing at normal priority",
+                       (DWORD)lParam);
+        } else if (wParam) {
+            LogMessage("Keyboard hook active on dedicated input thread (automatic renewal every %u seconds)",
+                       KEYBOARD_HOOK_RENEW_MS / 1000u);
+        } else {
+            LogMessage("ERROR: Keyboard hook installation/message loop failed (%lu)",
+                       (DWORD)lParam);
+        }
+        return 0;
+
     case WM_DO_PASTE:
         {
+            HWND target = (HWND)lParam;
+            DWORD requestedSequence = (DWORD)wParam;
+            if (!IsPasteRequestCurrent(target, requestedSequence)) {
+                KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
+                g_pasteDeferred = FALSE;
+                InterlockedExchange(&g_hookPastePending, FALSE);
+                LogMessage("Paste cancelled: focused window or clipboard changed while queued");
+                return 0;
+            }
             if (g_configCompatibilityPaste &&
                 (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) {
                 if (!g_pasteDeferred) {
                     LogMessage("Waiting for Ctrl release before Shift+Insert paste");
                     g_pasteDeferred = TRUE;
                 }
-                SetTimer(hWnd, ID_TIMER_DEFERRED_PASTE,
-                         DEFERRED_PASTE_DELAY_MS, NULL);
+                g_deferredPasteTarget = target;
+                g_deferredPasteSequence = requestedSequence;
+                if (!SetTimer(hWnd, ID_TIMER_DEFERRED_PASTE,
+                              DEFERRED_PASTE_DELAY_MS, NULL)) {
+                    g_pasteDeferred = FALSE;
+                    InterlockedExchange(&g_hookPastePending, FALSE);
+                    LogMessage("Paste cancelled: could not schedule Ctrl-release check");
+                }
                 return 0;
             }
             KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
             g_pasteDeferred = FALSE;
             DWORD sequence = GetClipboardSequenceNumber();
-            if (sequence != g_lastClipboardSequence) {
+            if (sequence != GetCachedClipboardSequence()) {
                 if (!RefreshClipboardImageCache()) {
+                    InterlockedExchange(&g_hookPastePending, FALSE);
                     LogMessage("Paste cancelled while waiting for the current clipboard image");
                     return 0;
                 }
             }
-            PasteCachedImage();
+            if (IsPasteRequestCurrent(target, requestedSequence)) {
+                PasteCachedImage();
+            } else {
+                LogMessage("Paste cancelled: focused window or clipboard changed during preparation");
+            }
+            InterlockedExchange(&g_hookPastePending, FALSE);
         }
         return 0;
 
@@ -8585,9 +8884,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             DWORD sequence = GetClipboardSequenceNumber();
             if (g_writingClipboardText) return 0;
-            if (sequence == g_lastClipboardSequence) return 0;
+            if (sequence == GetCachedClipboardSequence()) return 0;
             if (sequence == g_ownClipboardSequence) {
-                g_lastClipboardSequence = sequence;
+                SetCachedClipboardSequence(sequence);
                 return 0;
             }
             RefreshClipboardImageCache();
@@ -8605,7 +8904,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         if (wParam == ID_TIMER_DEFERRED_PASTE) {
             KillTimer(hWnd, ID_TIMER_DEFERRED_PASTE);
-            PostMessage(hWnd, WM_DO_PASTE, 0, 0);
+            if (g_pasteDeferred && !PostMessage(hWnd, WM_DO_PASTE,
+                    g_deferredPasteSequence, (LPARAM)g_deferredPasteTarget)) {
+                g_pasteDeferred = FALSE;
+                InterlockedExchange(&g_hookPastePending, FALSE);
+                LogMessage("Paste cancelled: could not queue Ctrl-release check");
+            }
             return 0;
         }
         if (wParam == ID_TIMER_AUTO_UPDATE) {
@@ -8778,15 +9082,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SetTimer(g_hWndMain, ID_TIMER_HTTP_RECONCILE,
              HTTP_RECONCILE_INTERVAL_MS, NULL);
 
-    /* Install keyboard hook */
-    g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
-    if (!g_hHook) {
-        LogMessage("ERROR: Failed to install keyboard hook (%lu)", GetLastError());
-    } else {
-        LogMessage("Keyboard hook installed (WH_KEYBOARD_LL)");
-        LogMessage("Monitoring for Ctrl+V%s...",
-                   g_configScreenCaptureEnabled ? " and Print Screen" : "");
-    }
+    /* Keep low-level input delivery independent of encoding, disk I/O and UI. */
+    StartKeyboardHook();
 
     if (updateCompleted) {
         LogMessage("Application update completed: %s", APP_VERSION_A);
@@ -8806,5 +9103,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         DispatchMessageW(&msg);
     }
 
+    StopKeyboardHook();
     return (int)msg.wParam;
 }
