@@ -31,6 +31,26 @@ interface PreviewTracker {
 // Rows this close to the visible part of the list are fetched ahead of time.
 const PREFETCH_MARGIN = "240px 0px";
 
+// Previews sit on a neutral mat inside their 128 × 80 tile, whole and at
+// their true proportions. Small images keep their size rather than blurring.
+const PREVIEW_MAX_WIDTH = 120;
+const PREVIEW_MAX_HEIGHT = 72;
+
+function previewSize(width: number, height: number) {
+  if (width <= 0 || height <= 0) {
+    return { width: PREVIEW_MAX_WIDTH, height: PREVIEW_MAX_HEIGHT };
+  }
+  const scale = Math.min(
+    PREVIEW_MAX_WIDTH / width,
+    PREVIEW_MAX_HEIGHT / height,
+    1,
+  );
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
 function formatBytes(bytes: number) {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
@@ -56,6 +76,8 @@ const HistoryRow = memo(function HistoryRow({
   tracker: PreviewTracker | null;
 }) {
   const previewRef = useRef<HTMLButtonElement>(null);
+  // The placeholder already has the image's shape, so nothing moves on load.
+  const size = previewSize(entry.width, entry.height);
 
   useEffect(() => {
     const element = previewRef.current;
@@ -72,33 +94,24 @@ const HistoryRow = memo(function HistoryRow({
         data-token={entry.token}
         title="Open in default browser"
         onClick={() => openHistoryUrl(entry.token)}
-        className="relative flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
+        className="flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center rounded-md border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
       >
         {thumb ? (
-          <>
-            {/* Blurred cover copy fills the letterbox area behind the image */}
-            <img
-              src={thumb}
-              alt=""
-              aria-hidden
-              decoding="async"
-              className="absolute inset-0 h-full w-full scale-110 object-cover blur-md brightness-90"
-              draggable={false}
-            />
-            <img
-              src={thumb}
-              alt={`${entry.width} × ${entry.height} preview`}
-              decoding="async"
-              className="relative max-h-full max-w-full object-contain"
-              draggable={false}
-            />
-          </>
+          <img
+            src={thumb}
+            alt={`${entry.width} × ${entry.height} preview`}
+            decoding="async"
+            draggable={false}
+            style={size}
+            className="rounded-[3px] object-cover shadow-[0_1px_3px_rgba(0,0,0,0.18)] ring-1 ring-black/10"
+          />
         ) : thumb === "" ? (
           <span className="text-[10px] text-neutral-400">No preview</span>
         ) : (
           <span
             aria-hidden
-            className="absolute inset-0 animate-pulse bg-neutral-200/70"
+            style={size}
+            className="animate-pulse rounded-[3px] bg-neutral-200"
           />
         )}
       </button>

@@ -83,9 +83,16 @@ with sync_playwright() as playwright:
     rows = page.locator('ul > li')
     previews = page.locator('ul > li img[alt$="preview"]')
 
+    def box(locator):
+        found = locator.bounding_box()
+        return tuple(round(found[key]) for key in ('x', 'y', 'width', 'height'))
+
     page.evaluate('(history) => window.onInit({view: "history", history})', page_data(0))
     expect(rows).to_have_count(PAGE_SIZE)
     expect(previews).to_have_count(0)  # rows appear before any image exists
+    # The placeholder already has the 16:9 image's fitted shape (120 x 68).
+    placeholder = box(rows.first.locator('button > span[aria-hidden]'))
+    assert placeholder[2:] == (120, 68), placeholder
     first = next_request()
     assert first[0] == token(1), first
     assert 1 < len(first) < 12, f'only near-visible rows are requested: {len(first)}'
@@ -95,6 +102,10 @@ with sync_playwright() as playwright:
     send_thumbs(first[-1:], thumb='')  # the worker could not decode this one
     expect(previews).to_have_count(len(first) - 1)
     expect(rows.nth(len(first) - 1)).to_contain_text('No preview')
+    assert box(previews.first) == placeholder, 'the image lands where it was held'
+    # One plain image per preview: no blurred or decorative copies behind it.
+    expect(page.locator('ul > li img')).to_have_count(len(first) - 1)
+    assert previews.first.evaluate('image => getComputedStyle(image).filter') == 'none'
 
     page.locator('ul').evaluate('list => list.parentElement.scrollTo({top: 1e6})')
     bottom = request_with(token(PAGE_SIZE))
@@ -147,11 +158,16 @@ with sync_playwright() as playwright:
     small = page_data(0)
     small['total'] = 3
     small['entries'] = small['entries'][:3]
+    small['entries'][1].update(width=1080, height=2340)
+    small['entries'][2].update(width=48, height=48)
     page.evaluate('(history) => window.onHistoryData(history)', small)
     expect(pager).to_have_count(0)  # one page needs no pager
     expect(rows).to_have_count(3)
+    assert box(previews.nth(1))[2:] == (33, 72)  # portrait keeps its shape
+    assert box(previews.nth(2))[2:] == (48, 48)  # small images are not enlarged
 
     assert not errors, errors
     browser.close()
     print('PASS: instant metadata rows, visible-only thumbnail requests, scrolling, '
-          'failed previews, paging, late previews and live refreshes')
+          'failed previews, true-proportion previews without blur, paging, late '
+          'previews and live refreshes')

@@ -1,4 +1,4 @@
-# ImagePaster 1.0.39
+# ImagePaster 1.0.40
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -97,7 +97,10 @@ and 256-pixel previews appear as they finish. Rows scrolled past, or pages left
 before their previews are ready, are skipped. The 256 most recently used
 previews stay cached for the session, so reopening the dialog or returning to a
 page is immediate. Disk-backed images are read without holding the image cache
-lock, so browsing History never delays clipboard handling.
+lock, so browsing History never delays clipboard handling. Each preview is shown
+whole and at its true proportions on a neutral mat, with a hairline edge and a
+soft shadow so dark and white screenshots both stand out; small images are not
+enlarged, and the loading placeholder already has the image's shape.
 
 If the **Allowed Clients** list is non-empty, only connections from the listed IPv4 addresses and CIDR subnets are served; everything else is dropped before the request is read and the rejection is recorded in the Activity Log. An empty list allows every client (equivalent to `0.0.0.0/0`).
 
@@ -260,8 +263,9 @@ reliability still require a Windows desktop.
 After `make`, `python3 tests/check_update_ui.py` and
 `python3 tests/check_history_ui.py` check the built UI with a recording WebView
 bridge (requires Python Playwright and Chromium). The History check covers
-visible-only thumbnail requests, scrolling, failed previews, paging, late
-previews, and live refreshes. These checks do not exercise Windows UAC,
+visible-only thumbnail requests, scrolling, failed previews, preview
+proportions without blur or layout shift, paging, late previews, and live
+refreshes. These checks do not exercise Windows UAC,
 replacement, relaunch, or real WIC decoding.
 
 ## Project Structure
