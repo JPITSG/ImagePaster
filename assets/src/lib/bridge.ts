@@ -16,6 +16,8 @@ export interface ConfigData {
   compatibilityPaste: boolean;
   screenCaptureEnabled: boolean;
   captureGapFill: CaptureGapFill;
+  /** 0 when ImagePaster can register Print Screen; 1409 when another program holds it. */
+  printScreenHotkeyError: number;
   autoCheckForUpdates: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
@@ -92,6 +94,10 @@ export interface UpdateProgress {
   percentComplete: number;
 }
 
+export interface PrintScreenStatus {
+  error: number;
+}
+
 type InitCallback = (data: InitData) => void;
 type LogUpdateCallback = (entry: LogEntry) => void;
 type SaveResultCallback = (result: { ok: boolean; message?: string }) => void;
@@ -101,6 +107,7 @@ let logUpdateCallback: LogUpdateCallback | null = null;
 let saveResultCallback: SaveResultCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
+let printScreenStatusCallback: ((status: PrintScreenStatus) => void) | null = null;
 let historyActionResultCallback:
   | ((result: HistoryActionResult) => void)
   | null = null;
@@ -114,6 +121,7 @@ declare global {
     onSaveResult: (result: { ok: boolean; message?: string }) => void;
     onUpdateResult: (result: UpdateResult) => void;
     onUpdateProgress: (progress: UpdateProgress) => void;
+    onPrintScreenStatus: (status: PrintScreenStatus) => void;
     onHistoryActionResult: (result: HistoryActionResult) => void;
     onHistoryData: (history: HistoryData) => void;
     onHistoryThumbs: (thumbs: HistoryThumb[]) => void;
@@ -143,6 +151,10 @@ window.onUpdateResult = (result) => {
 
 window.onUpdateProgress = (progress) => {
   updateProgressCallback?.(progress);
+};
+
+window.onPrintScreenStatus = (status) => {
+  printScreenStatusCallback?.(status);
 };
 
 window.onHistoryActionResult = (result) => {
@@ -180,6 +192,13 @@ export function onUpdateProgress(cb: (progress: UpdateProgress) => void) {
   updateProgressCallback = cb;
   return () => {
     if (updateProgressCallback === cb) updateProgressCallback = null;
+  };
+}
+
+export function onPrintScreenStatus(cb: (status: PrintScreenStatus) => void) {
+  printScreenStatusCallback = cb;
+  return () => {
+    if (printScreenStatusCallback === cb) printScreenStatusCallback = null;
   };
 }
 

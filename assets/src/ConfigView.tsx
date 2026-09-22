@@ -14,6 +14,7 @@ import {
   dismissUpdateConfirmation,
   onUpdateResult,
   onUpdateProgress,
+  onPrintScreenStatus,
   type CaptureGapFill,
   type ConfigData,
   type ImageStorage,
@@ -90,6 +91,9 @@ export default function ConfigView({
   const [captureGapFill, setCaptureGapFill] = useState<CaptureGapFill>(
     config.captureGapFill,
   );
+  const [printScreenError, setPrintScreenError] = useState(
+    config.printScreenHotkeyError ?? 0,
+  );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true,
   );
@@ -118,6 +122,12 @@ export default function ConfigView({
   const selectedBindIp = useMemo(
     () => (ipChoice === "other" ? customIp.trim() : ipChoice),
     [customIp, ipChoice],
+  );
+
+  // Another program can claim or release Print Screen while this is open.
+  useEffect(
+    () => onPrintScreenStatus((status) => setPrintScreenError(status.error)),
+    [],
   );
 
   useEffect(() => {
@@ -345,11 +355,12 @@ export default function ConfigView({
     </div>
   );
 
+  const printScreenNotice = screenCaptureEnabled && printScreenError !== 0;
   const captureSection = (
-    <div className="space-y-4">
+    <div>
       <div className="text-xs font-medium">Screen Capture</div>
 
-      <div className="flex items-start gap-2 pt-1">
+      <div className="mt-4 flex items-start gap-2 pt-1">
         <Checkbox
           id="screenCaptureEnabled"
           className="mt-0.5"
@@ -364,10 +375,20 @@ export default function ConfigView({
             Opens a multi-monitor selection overlay. Shift-drag adds regions;
             Print Screen again copies the full desktop; Esc cancels.
           </p>
+          {printScreenNotice && (
+            <p className="pt-1 text-[11px] leading-snug text-red-600">
+              {printScreenError === 1409
+                ? "Another program has claimed the Print Screen key."
+                : `The Print Screen key could not be claimed (error ${printScreenError}).`}{" "}
+              Capture still works, but keyboard-sharing tools can't send the key to
+              another computer.
+            </p>
+          )}
         </div>
       </div>
 
-      <div className="ml-6 space-y-1.5">
+      {/* As much space below the Print Screen notice as above it. */}
+      <div className={`ml-6 space-y-1.5 ${printScreenNotice ? "mt-1" : "mt-4"}`}>
         <Label htmlFor="captureGapFill">Multi-region Gap Fill</Label>
         <select
           id="captureGapFill"

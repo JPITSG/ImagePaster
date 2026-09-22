@@ -43,7 +43,7 @@ class KeyboardHookTests(unittest.TestCase):
             'GetCachedClipboardSequence', 'SetCachedClipboardSequence',
             'TryHasCachedImage', 'HookForegroundTitleMatches',
             'SetHookCaptureFlag', 'QueueHookCapture', 'QueueHookPrintScreen', 'QueueHookPaste',
-            'LowLevelKeyboardProc', 'ReconcilePrintScreenHotkey',
+            'PrintScreenModifierHeld', 'LowLevelKeyboardProc', 'ReconcilePrintScreenHotkey',
             'HandlePrintScreenHotkey', 'RenewKeyboardHook',
             'KeyboardHookThreadProc', 'StartKeyboardHook', 'StopKeyboardHook',
             'SimulateStandardTextPaste',
@@ -98,6 +98,9 @@ class KeyboardHookTests(unittest.TestCase):
     def test_hotkey_recovers_before_periodic_deadline(self):
         self.check('hotkey_loop')
 
+    def test_registered_hotkey_lets_print_screen_reach_other_hooks(self):
+        self.check('hotkey_routing')
+
     def test_start_failure_and_shutdown_release_all_handles(self):
         self.check('lifecycle')
 
@@ -145,8 +148,11 @@ typedef LRESULT (*HOOKPROC)(int, WPARAM, LPARAM);
 #define HC_ACTION 0
 #define VK_SNAPSHOT 0x2c
 #define VK_ESCAPE 0x1b
+#define VK_SHIFT 0x10
 #define VK_CONTROL 0x11
 #define VK_MENU 0x12
+#define VK_LWIN 0x5b
+#define VK_RWIN 0x5c
 #define CF_DIB 8
 #define LLKHF_INJECTED 0x10
 #define WH_KEYBOARD_LL 13
@@ -178,7 +184,7 @@ static HWND g_hookPasteTarget;
 static DWORD g_hookPasteSequence;
 static BOOL g_printHotkeyRegistered;
 static DWORD g_printHotkeyError, g_hookInstallError;
-static BOOL g_printScreenKeyDown, g_escapeKeyDown;
+static BOOL g_printScreenKeyDown, g_printScreenPassed, g_printScreenSeen, g_escapeKeyDown;
 static WCHAR g_keywords[64][128] = { L"xshell" };
 static int g_keywordCount = 1;
 static SRWLOCK g_keywordLock, g_imageLock;
@@ -621,7 +627,8 @@ static void hotkey(void) {
     assert(RenewKeyboardHook(FALSE));
     g_hookPrintPending = FALSE;
     printDown = FALSE;
-    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 1);
+    // The release follows its press, which went on to the hotkey stage.
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 77);
     assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == actions); // No duplicate on key-up.
     SetHookCaptureFlag(HOOK_CAPTURE_ENABLED, FALSE);
     HandlePrintScreenHotkey(); // Already queued hotkey after disabling capture.
@@ -645,6 +652,69 @@ static void hotkey_loop(void) {
     assert(waits == 2 && installCount == 2 && now < KEYBOARD_HOOK_RENEW_MS);
     assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 1 && !installed);
     assert(!g_printHotkeyRegistered && unregisterCount == 1);
+}
+static void hotkey_routing(void) {
+    SetHookCaptureFlag(HOOK_CAPTURE_ENABLED, TRUE);
+    ReconcilePrintScreenHotkey();
+    assert(g_printHotkeyRegistered);
+    // The hotkey captures: the hook only notes the press and passes it on, so a
+    // program behind it that sends the keyboard to another computer decides first.
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 77);
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 77); // Auto-repeat follows the press.
+    assert(!postCount[WM_SCREEN_CAPTURE_BEGIN] && g_printScreenKeyDown);
+    printDown = TRUE;
+    HandlePrintScreenHotkey(); // Windows' hotkey, after every hook passed the key on.
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 1 && !g_hookRenewRequested);
+    printDown = FALSE;
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 77); // The release follows it.
+    assert(!g_printScreenKeyDown && postCount[WM_SCREEN_CAPTURE_BEGIN] == 1);
+    g_hookPrintPending = FALSE;
+    // A hotkey for a press the hook never saw: Windows removed the hook.
+    printDown = TRUE;
+    HandlePrintScreenHotkey();
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 2 && g_hookRenewRequested);
+    assert(RenewKeyboardHook(FALSE));
+    g_hookRenewRequested = FALSE;
+    printDown = FALSE;
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 77); // Its release passes as its press did.
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 2);
+    g_hookPrintPending = FALSE;
+    // Sent to another computer by a hook behind this one: no hotkey arrives.
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 77);
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 77);
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 2 && !g_hookPrintPending);
+    // A key-up-only keyboard is still acted on by the hook.
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 1);
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 3);
+    g_hookPrintPending = FALSE;
+    // While the overlay is open, the hotkey copies the full desktop.
+    SetHookCaptureFlag(HOOK_CAPTURE_ACTIVE, TRUE);
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 77);
+    HandlePrintScreenHotkey();
+    assert(postCount[WM_SCREEN_CAPTURE_COPY] == 1 && !g_hookRenewRequested);
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 77);
+    g_hookPrintPending = FALSE;
+    SetHookCaptureFlag(HOOK_CAPTURE_ACTIVE, FALSE);
+    // The hotkey is plain Print Screen: with a modifier held the hook captures,
+    // as it always did, and keeps the release.
+    altDown = TRUE;
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 1);
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 4 && !g_printScreenPassed);
+    altDown = FALSE;
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 1);
+    g_hookPrintPending = FALSE;
+    // Another program claims Print Screen: the hook captures itself again.
+    SetHookCaptureFlag(HOOK_CAPTURE_ENABLED, FALSE);
+    ReconcilePrintScreenHotkey();
+    assert(!g_printHotkeyRegistered);
+    failHotkey = TRUE;
+    SetHookCaptureFlag(HOOK_CAPTURE_ENABLED, TRUE);
+    ReconcilePrintScreenHotkey();
+    assert(!g_printHotkeyRegistered && postCount[WM_KEYBOARD_HOTKEY_STATUS] == 2);
+    assert(key(VK_SNAPSHOT, TRUE, 0, 0) == 1);
+    assert(postCount[WM_SCREEN_CAPTURE_BEGIN] == 5);
+    assert(key(VK_SNAPSHOT, FALSE, 0, 0) == 1);
+    assert(!g_printScreenKeyDown && !g_printScreenPassed && logCount == 0);
 }
 static void lifecycle(void) {
     g_keyboardHookStopEvent = g_keyboardHookWakeEvent = NULL;
@@ -753,6 +823,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "flood")) capture_flood();
     else if (!strcmp(argv[1], "hotkey")) hotkey();
     else if (!strcmp(argv[1], "hotkey_loop")) hotkey_loop();
+    else if (!strcmp(argv[1], "hotkey_routing")) hotkey_routing();
     else if (!strcmp(argv[1], "lifecycle")) lifecycle();
     else if (!strcmp(argv[1], "paste_flood")) paste_flood();
     else if (!strcmp(argv[1], "ui_slots")) ui_slots();

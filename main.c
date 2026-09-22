@@ -198,8 +198,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.40"
-#define APP_VERSION_W     L"1.0.40"
+#define APP_VERSION_A     "1.0.41"
+#define APP_VERSION_W     L"1.0.41"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -214,6 +214,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define WM_HISTORY_THUMBS_READY   (WM_APP + 10)
 #define KEYBOARD_HOOK_RENEW_MS    5000u
 #define ID_HOTKEY_PRINT_SCREEN   1
+#define ID_HOTKEY_PRINT_SCREEN_PROBE 2 /* UI thread: availability check, released at once */
 #define HOOK_CAPTURE_ENABLED     1
 #define HOOK_CAPTURE_ACTIVE      2
 #define HOOK_CAPTURE_MESSAGE     1
@@ -489,7 +490,15 @@ static size_t g_captureSelectionCount = 0;
 static size_t g_captureSelectionCapacity = 0;
 static HANDLE g_capturePreviousDpiContext = NULL;
 static BOOL g_printScreenKeyDown = FALSE;
+/* Input thread only: the held Print Screen press went on to the registered
+   hotkey rather than being swallowed here, so its repeats and release pass
+   too; and the hook let a press through since the last hotkey arrived. */
+static BOOL g_printScreenPassed = FALSE;
+static BOOL g_printScreenSeen = FALSE;
 static BOOL g_escapeKeyDown = FALSE;
+/* UI thread only: the Print Screen hotkey's last registration error while
+   ImagePaster uses the key (0 = registered), shown by the settings page. */
+static DWORD g_printHotkeyStatusError = 0;
 
 /* HTTP client allowlist. Empty text allows every client; otherwise only
    matching source addresses may connect. The parsed rules are shared with
@@ -5519,6 +5528,17 @@ static BOOL QueueHookPaste(HWND target, DWORD sequence)
     return FALSE;
 }
 
+/* The registered hotkey is plain Print Screen. With Shift, Control, Alt or a
+   Windows key held, Print Screen stays with the hook, which captures as before. */
+static BOOL PrintScreenModifierHeld(void)
+{
+    static const int modifiers[] = {VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN};
+    for (size_t i = 0; i < sizeof(modifiers) / sizeof(modifiers[0]); i++) {
+        if (GetAsyncKeyState(modifiers[i]) & 0x8000) return TRUE;
+    }
+    return FALSE;
+}
+
 /* Runs only on the hook thread. Never log, encode, touch files/WebView, allocate,
    or wait on the UI/a lock. Print Screen does one atomic state read and at most
    one asynchronous post; unrelated keys do not even read shared state. */
@@ -5537,7 +5557,23 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         LONG state = InterlockedCompareExchange(&g_hookCaptureState, 0, 0);
         if (!(state & (HOOK_CAPTURE_ENABLED | HOOK_CAPTURE_ACTIVE)) &&
             !g_printScreenKeyDown) return CallNextHookEx(NULL, nCode, wParam, lParam);
-        /* Some keyboards expose only the key-up transition. */
+        /* A press passed on to the hotkey keeps its repeats and release there. */
+        if (g_printScreenKeyDown && g_printScreenPassed) {
+            g_printScreenKeyDown = g_printScreenPassed = keyDown;
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+        }
+        /* With the hotkey registered, the capture starts from WM_HOTKEY, which
+           Windows generates only after every low-level hook has let the key
+           through: a program that sends this keyboard to another computer
+           decides first where Print Screen goes. The press is only noted. */
+        if (!g_printScreenKeyDown && keyDown && g_printHotkeyRegistered &&
+            !PrintScreenModifierHeld()) {
+            g_printScreenKeyDown = g_printScreenPassed = g_printScreenSeen = TRUE;
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+        }
+        /* Without the hotkey - another program holds Print Screen - the hook
+           acts on the press itself. Some keyboards expose only the key-up
+           transition, which is acted on here either way. */
         if (!g_printScreenKeyDown && !QueueHookPrintScreen(state)) {
             return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
@@ -5577,10 +5613,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
-/* A registered hotkey is not subject to LowLevelHooksTimeout. The hook normally
-   swallows Print Screen before WM_HOTKEY is generated; this backup receives it
-   if the hook is removed. Registration may be denied by another app/the OS, so
-   keep the hook in either case and retry a failed registration at renewal. */
+/* Print Screen captures from this hotkey. Windows generates WM_HOTKEY only
+   after every low-level keyboard hook has passed the key on, so a program that
+   routes the keyboard to another computer decides first, and a registered
+   hotkey is not subject to LowLevelHooksTimeout. Registration may be denied
+   by another app/the OS: the hook then acts on Print Screen itself. Keep the
+   hook in either case and retry a failed registration at renewal. */
 static void ReconcilePrintScreenHotkey(void)
 {
     BOOL wanted = (InterlockedCompareExchange(&g_hookCaptureState, 0, 0) &
@@ -5607,15 +5645,18 @@ static void ReconcilePrintScreenHotkey(void)
 static void HandlePrintScreenHotkey(void)
 {
     /* A hotkey message may outlive its registration/configuration. Recheck it. */
-    if (g_printHotkeyRegistered) {
-        if (QueueHookPrintScreen(InterlockedCompareExchange(&g_hookCaptureState, 0, 0))) {
-            /* This fallback key was not swallowed by our hook, so async state
-               is usable here. Its release must not become a second action. */
-            g_printScreenKeyDown = (GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) != 0;
-        }
-        /* Reinstall immediately, instead of waiting for the next deadline. */
+    if (!g_printHotkeyRegistered) return;
+    QueueHookPrintScreen(InterlockedCompareExchange(&g_hookCaptureState, 0, 0));
+    /* The hook notes every press it passes on. A hotkey for a press it never
+       saw means Windows removed the hook: reinstall it now instead of at the
+       next deadline. That key was not swallowed, so async state is usable
+       here, and its release must pass as the press did - never a second action. */
+    if (!g_printScreenSeen) {
         InterlockedExchange(&g_hookRenewRequested, TRUE);
+        g_printScreenKeyDown = g_printScreenPassed =
+            (GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) != 0;
     }
+    g_printScreenSeen = FALSE;
 }
 
 /* Windows provides no notification when LowLevelHooksTimeout silently removes
@@ -5703,7 +5744,7 @@ cleanup:
     g_hookInstallError = 0;
     if (g_hHook) UnhookWindowsHookEx(g_hHook);
     g_hHook = NULL;
-    g_printScreenKeyDown = FALSE;
+    g_printScreenKeyDown = g_printScreenPassed = g_printScreenSeen = FALSE;
     g_escapeKeyDown = FALSE;
     return 0;
 }
@@ -7172,6 +7213,29 @@ static void CfgSendUpdateProgress(DWORD percent) {
     if (written > 0) webview_execute_script(script);
 }
 
+/* The Print Screen hotkey's state for the settings page, beside "Enable
+   interactive Print Screen capture": 0 when ImagePaster can register it,
+   otherwise the error (ERROR_HOTKEY_ALREADY_REGISTERED: another program holds
+   it). While ImagePaster uses the key this is the input thread's last result;
+   otherwise a registration probe, released at once, so ticking the box shows
+   the conflict before it is saved. */
+static DWORD PrintScreenHotkeyErrorForSettings(void) {
+    if (g_configScreenCaptureEnabled || g_captureOverlayHwnd) return g_printHotkeyStatusError;
+    if (RegisterHotKey(NULL, ID_HOTKEY_PRINT_SCREEN_PROBE, MOD_NOREPEAT, VK_SNAPSHOT)) {
+        UnregisterHotKey(NULL, ID_HOTKEY_PRINT_SCREEN_PROBE);
+        return 0;
+    }
+    return GetLastError();
+}
+
+static void CfgSendPrintScreenStatus(DWORD error) {
+    wchar_t script[128];
+    int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
+        L"window.onPrintScreenStatus && window.onPrintScreenStatus({\"error\":%lu})",
+        (unsigned long)error);
+    if (written > 0) webview_execute_script(script);
+}
+
 static void DiscardPendingUpdateNotice(void) {
     UpdateCheckTask* task = g_updateNoticeTask;
     g_updateNoticeTask = NULL;
@@ -7716,6 +7780,7 @@ static void webview_push_init_config(void)
         L"\"compatibilityPaste\":%s,"
         L"\"screenCaptureEnabled\":%s,"
         L"\"captureGapFill\":\"%s\","
+        L"\"printScreenHotkeyError\":%lu,"
         L"\"autoCheckForUpdates\":%s,"
         L"\"updateCheckPending\":%s,"
         L"\"updatePromptPending\":%s,"
@@ -7733,6 +7798,7 @@ static void webview_push_init_config(void)
         g_configCompatibilityPaste ? L"true" : L"false",
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
+        (unsigned long)PrintScreenHotkeyErrorForSettings(),
         g_configAutoCheckForUpdates ? L"true" : L"false",
         IsUpdateCheckVisible() ? L"true" : L"false",
         g_updateNoticeTask ? L"true" : L"false",
@@ -9340,12 +9406,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_KEYBOARD_HOTKEY_STATUS:
+        g_printHotkeyStatusError = wParam ? 0 : (DWORD)lParam;
         if (wParam) {
-            LogMessage("Print Screen backup hotkey registered (independent of keyboard hook)");
+            LogMessage("Print Screen hotkey registered; capture follows programs that route the keyboard");
+        } else if (g_printHotkeyStatusError == ERROR_HOTKEY_ALREADY_REGISTERED) {
+            LogMessage("Print Screen hotkey is held by another program; the keyboard hook captures instead");
         } else {
-            LogMessage("Print Screen backup hotkey unavailable (%lu); keyboard hook remains enabled",
-                       (DWORD)lParam);
+            LogMessage("Print Screen hotkey unavailable (%lu); the keyboard hook captures instead",
+                       g_printHotkeyStatusError);
         }
+        if (g_configViewReady) CfgSendPrintScreenStatus(g_printHotkeyStatusError);
         return 0;
 
     case WM_APP_UPDATE_PROGRESS:

@@ -1,4 +1,4 @@
-# ImagePaster 1.0.40
+# ImagePaster 1.0.41
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -70,10 +70,18 @@ dialogs use normal clipboard handling.
 
 The input thread renews the hook every 5 seconds and retries failed installations
 without discarding an existing hook. While interactive capture is enabled (or a
-manually opened overlay is active), it also attempts to register an unmodified
-Print Screen hotkey. This independent backup handles Print Screen if Windows
-removes the low-level hook and requests immediate reinstallation. Hotkey
-conflicts are logged and retried; they do not disable hook-based capture. The
+manually opened overlay is active), it registers an unmodified Print Screen
+hotkey, and the capture starts from that hotkey. Windows generates a hotkey only
+after every program's low-level keyboard hook has passed the key on, so a tool
+that shares this keyboard with another computer decides first where Print Screen
+goes, and ImagePaster captures only when the key stays on this computer. The
+hook merely notes each plain Print Screen press and passes it on (with Shift,
+Control, Alt or a Windows key held, the hook still captures itself); a hotkey for
+a press the hook never saw means Windows removed the hook, which is then
+reinstalled at once. If another program holds Print Screen, the conflict is logged and retried,
+the hook captures instead (ahead of keyboard-sharing tools), and the settings
+show the conflict in red under the capture option. Keyboards that expose only
+the Print Screen key-up transition are always handled by the hook. The
 registration is released when capture is disabled and no overlay is active.
 
 Windows can still remove a timed-out hook, and OS scheduling, another app's hook,
@@ -138,6 +146,12 @@ the normal Print Screen action with a multi-monitor capture workflow:
 
 The overlay and its controls are rendered from a pre-overlay snapshot, so neither
 the dimming nor the toolbar is included in the copied image.
+
+When Print Screen is claimed by another program, a red notice under **Enable
+interactive Print Screen capture** says so: capture still works, but tools that
+share the keyboard with another computer cannot send Print Screen there. The
+notice follows the key live while settings are open, and appears as soon as the
+option is ticked.
 
 ## Building
 
@@ -253,16 +267,21 @@ clamping, visible-only requests that replace earlier ones, cached and failed
 previews, rows re-requested mid-decode, batching, eviction, and that nothing
 decodes or calls into the page while holding a lock. Hook tests cover blocked UI/contended locks, millions
 of unrelated key events, bounded capture queues, held keys across renewal,
-hotkey conflicts/fallback, silent removal, installation failures, and shutdown.
+Print Screen passed on to the hotkey (so a hook behind ImagePaster can send it to
+another computer), hotkey conflicts/fallback, silent removal, installation
+failures, and shutdown.
 These are deterministic fault-injection tests, not Windows latency measurements.
 On Windows, smoke-test capture on/off, manual tray capture, holding Print Screen
 across a renewal, rapid taps during large image processing, Ctrl+V in a matching
-window, hotkey conflicts, and sleep/resume. Actual input delivery and long-running
+window, hotkey conflicts, Print Screen with a keyboard-sharing tool pointed at
+another computer, and sleep/resume. Actual input delivery and long-running
 reliability still require a Windows desktop.
 
-After `make`, `python3 tests/check_update_ui.py` and
-`python3 tests/check_history_ui.py` check the built UI with a recording WebView
-bridge (requires Python Playwright and Chromium). The History check covers
+After `make`, `python3 tests/check_update_ui.py`,
+`python3 tests/check_history_ui.py` and `python3 tests/check_capture_ui.py`
+check the built UI with a recording WebView bridge (requires Python Playwright
+and Chromium). The capture check covers the Print Screen conflict notice: its
+wording, red text, place under the capture option, and live updates. The History check covers
 visible-only thumbnail requests, scrolling, failed previews, preview
 proportions without blur or layout shift, paging, late previews, and live
 refreshes. These checks do not exercise Windows UAC,
