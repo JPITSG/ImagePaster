@@ -40,16 +40,24 @@ export interface HistoryEntry {
   storage: ImageStorage;
   path: string;
   url: string;
-  thumb: string;
 }
 
+/** One page of retained images, newest first; thumbnails arrive separately. */
 export interface HistoryData {
   pasteMethod: PasteMethod;
   historyLimit: number;
   total: number;
-  shown: number;
   totalBytes: number;
+  /** Zero-based page index. */
+  page: number;
+  pageSize: number;
   entries: HistoryEntry[];
+}
+
+/** An empty thumb means no preview could be made for that image. */
+export interface HistoryThumb {
+  token: string;
+  thumb: string;
 }
 
 export interface HistoryActionResult {
@@ -96,6 +104,8 @@ let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 let historyActionResultCallback:
   | ((result: HistoryActionResult) => void)
   | null = null;
+let historyDataCallback: ((history: HistoryData) => void) | null = null;
+let historyThumbsCallback: ((thumbs: HistoryThumb[]) => void) | null = null;
 
 declare global {
   interface Window {
@@ -105,6 +115,8 @@ declare global {
     onUpdateResult: (result: UpdateResult) => void;
     onUpdateProgress: (progress: UpdateProgress) => void;
     onHistoryActionResult: (result: HistoryActionResult) => void;
+    onHistoryData: (history: HistoryData) => void;
+    onHistoryThumbs: (thumbs: HistoryThumb[]) => void;
     chrome?: {
       webview?: {
         postMessage: (s: string) => void;
@@ -135,6 +147,14 @@ window.onUpdateProgress = (progress) => {
 
 window.onHistoryActionResult = (result) => {
   historyActionResultCallback?.(result);
+};
+
+window.onHistoryData = (history) => {
+  historyDataCallback?.(history);
+};
+
+window.onHistoryThumbs = (thumbs) => {
+  historyThumbsCallback?.(thumbs);
 };
 
 export function onInit(cb: InitCallback) {
@@ -243,6 +263,29 @@ export function onHistoryActionResult(
   return () => {
     if (historyActionResultCallback === cb) historyActionResultCallback = null;
   };
+}
+
+export function onHistoryData(cb: (history: HistoryData) => void) {
+  historyDataCallback = cb;
+  return () => {
+    if (historyDataCallback === cb) historyDataCallback = null;
+  };
+}
+
+export function onHistoryThumbs(cb: (thumbs: HistoryThumb[]) => void) {
+  historyThumbsCallback = cb;
+  return () => {
+    if (historyThumbsCallback === cb) historyThumbsCallback = null;
+  };
+}
+
+export function requestHistoryPage(page: number) {
+  postMessage({ action: "historyPage", page });
+}
+
+/** Replaces any earlier request: rows no longer listed are not generated. */
+export function requestHistoryThumbs(tokens: string[]) {
+  postMessage({ action: "historyThumbs", tokens: tokens.join(",") });
 }
 
 export function copyHistoryUrl(token: string) {

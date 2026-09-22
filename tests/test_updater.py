@@ -85,7 +85,7 @@ int main(void) {
         # Run the real message handlers rather than copies of their logic.
         window = function('WndProc')
         ui_cases = window[window.index('    case WM_APP_UPDATE_PROGRESS:'):
-                          window.index('    case WM_KEYBOARD_HOOK_STATUS:')]
+                          window.index('    case WM_HISTORY_THUMBS_READY:')]
         webview = function('WebViewWndProc')
         destroy_case = webview[webview.index('        case WM_DESTROY:'):
                                webview.index('\n    }\n    return DefWindowProcW(')]
@@ -367,6 +367,7 @@ static void QueueUpdateNotice(UpdateCheckTask *task) {
 static void ShowWebViewDialog(const char *view, int width, int height) {
     (void)view; (void)width; (void)height;
 }
+static void DropHistoryThumbnailRequests(void) {}
 static void DiscardPreparedUpdate(void);
 '''
 

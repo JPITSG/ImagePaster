@@ -1,4 +1,4 @@
-# ImagePaster 1.0.38
+# ImagePaster 1.0.39
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -11,7 +11,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Watches the clipboard continuously and keeps the latest image encoded and ready for both methods
 - Retains a configurable JPEG history (1–1000 total images or Unlimited) in memory for the current session or on disk across application restarts
 - Selectable image storage: memory (default) or persistent disk storage under `%LOCALAPPDATA%\ImagePaster`, with graceful fallback to memory when an image cannot be written and JPEG-based recovery when the durable history index is missing or invalid
-- History dialog with live-updating thumbnails, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser, and each entry shows whether it is stored in memory or on disk with a click-to-reveal path that opens File Explorer with the file selected
+- History dialog that opens instantly and pages through any number of images (50 per page, newest first), with thumbnails loaded lazily in the background as rows scroll into view, live updates, capture time and size details, per-image save to disk, URL copying, deletion, and one-click clear-all; clicking a thumbnail or URL opens the image in the default browser, and each entry shows whether it is stored in memory or on disk with a click-to-reveal path that opens File Explorer with the file selected
 - Clears the current paste target when the user copies non-image content while preserving configured HTTP history
 - Built-in IPv4 HTTP server with configurable bind address, port, and JPEG quality
 - Optional HTTP client allowlist restricting image downloads to specific IPv4 addresses and CIDR subnets
@@ -86,6 +86,18 @@ used.
 The HTTP server runs in both modes. URLs for the current image and retained history return `200 OK` with `image/jpeg`. When a retained image exceeds the configured limit, its URL returns `410 Gone` with a plain-language response body and header. Unknown or malformed image paths return `404 Not Found`. Memory-backed history is discarded when ImagePaster exits; disk-backed history, metadata, ordering, and URLs are restored on the next launch when Disk storage is selected.
 
 **Image Storage** chooses where retained JPEGs live. Memory (the default) keeps everything in RAM for the current session. Disk writes each new image to `%LOCALAPPDATA%\ImagePaster\<image-id>.jpg` and maintains an atomic history index in the same folder. On restart, indexed JPEGs are validated and restored with their original metadata, ordering, and URL tokens; existing token-named JPEGs from versions without an index are imported automatically. The base64 PNG for the current clipboard image remains in memory, so base64 pasting is unaffected. The setting applies to newly copied images — existing entries keep their location until evicted. If the folder, image file, or index cannot be written, the failure is logged and image capture continues without crashing. Disk files and their index entries are removed when images are evicted, deleted, or cleared, while indexed files present at exit remain available in the next session.
+
+The **History** dialog opens with metadata only (sizes, times, URLs, and
+storage), 50 images per page, newest first; the **« ‹ Page N of M › »** controls
+reach older images. Thumbnails are requested only for rows on screen or about
+to scroll into view. A background thread decodes each JPEG with the Windows
+Imaging Component, which lets the JPEG decoder shrink a large screenshot while
+decoding it instead of decoding it at full size (GDI+ remains as a fallback),
+and 256-pixel previews appear as they finish. Rows scrolled past, or pages left
+before their previews are ready, are skipped. The 256 most recently used
+previews stay cached for the session, so reopening the dialog or returning to a
+page is immediate. Disk-backed images are read without holding the image cache
+lock, so browsing History never delays clipboard handling.
 
 If the **Allowed Clients** list is non-empty, only connections from the listed IPv4 addresses and CIDR subnets are served; everything else is dropped before the request is read and the rejection is recorded in the Activity Log. An empty list allows every client (equivalent to `0.0.0.0/0`).
 
@@ -228,10 +240,15 @@ used only to validate the download and enforce its safety limit.
 
 Native regression checks can run without launching the Windows application:
 `python3 -B -m unittest discover -s tests -v` compiles production hook, updater
-progress and stop handling, and command-line parsing functions with inert
-operating-system boundaries (requires a host C compiler). Updater tests cover
+progress and stop handling, History paging and thumbnail, and command-line
+parsing functions with inert operating-system boundaries (requires a host C
+compiler). Updater tests cover
 stopping mid-download or just as a result arrives, stale progress, clicks while
-a stopped check unwinds, closing settings, and lost result messages. Hook tests cover blocked UI/contended locks, millions
+a stopped check unwinds, closing settings, and lost result messages. History
+tests parse every pushed page and preview as JSON and cover page order and
+clamping, visible-only requests that replace earlier ones, cached and failed
+previews, rows re-requested mid-decode, batching, eviction, and that nothing
+decodes or calls into the page while holding a lock. Hook tests cover blocked UI/contended locks, millions
 of unrelated key events, bounded capture queues, held keys across renewal,
 hotkey conflicts/fallback, silent removal, installation failures, and shutdown.
 These are deterministic fault-injection tests, not Windows latency measurements.
@@ -240,9 +257,12 @@ across a renewal, rapid taps during large image processing, Ctrl+V in a matching
 window, hotkey conflicts, and sleep/resume. Actual input delivery and long-running
 reliability still require a Windows desktop.
 
-After `make`, `python3 tests/check_update_ui.py` checks the
-built UI with a recording WebView bridge (requires Python Playwright and
-Chromium). These checks do not exercise Windows UAC, replacement, or relaunch.
+After `make`, `python3 tests/check_update_ui.py` and
+`python3 tests/check_history_ui.py` check the built UI with a recording WebView
+bridge (requires Python Playwright and Chromium). The History check covers
+visible-only thumbnail requests, scrolling, failed previews, paging, late
+previews, and live refreshes. These checks do not exercise Windows UAC,
+replacement, relaunch, or real WIC decoding.
 
 ## Project Structure
 

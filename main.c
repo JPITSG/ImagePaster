@@ -32,6 +32,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <objbase.h>
+#include <wincodec.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -197,8 +198,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.38"
-#define APP_VERSION_W     L"1.0.38"
+#define APP_VERSION_A     "1.0.39"
+#define APP_VERSION_W     L"1.0.39"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -210,6 +211,7 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define WM_SCREEN_CAPTURE_CANCEL (WM_APP + 7)
 #define WM_KEYBOARD_HOOK_STATUS   (WM_APP + 8)
 #define WM_KEYBOARD_HOTKEY_STATUS (WM_APP + 9)
+#define WM_HISTORY_THUMBS_READY   (WM_APP + 10)
 #define KEYBOARD_HOOK_RENEW_MS    5000u
 #define ID_HOTKEY_PRINT_SCREEN   1
 #define HOOK_CAPTURE_ENABLED     1
@@ -303,9 +305,12 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define CAPTURE_SEPARATOR_GAP 14
 #define CAPTURE_PANEL_BOTTOM_MARGIN 40
 
-/* History dialog: thumbnails are re-encoded small JPEGs pushed to the
-   WebView as data URIs; the entry list is capped to keep the payload sane. */
-#define HISTORY_VIEW_MAX_ENTRIES   100
+/* History dialog: pages carry metadata only. Thumbnails are small JPEG data
+   URIs made on a background thread when rows scroll into view, then cached. */
+#define HISTORY_VIEW_PAGE_SIZE      50
+#define HISTORY_THUMB_CACHE_ENTRIES 256
+#define HISTORY_THUMB_QUEUE_MAX     HISTORY_VIEW_PAGE_SIZE
+#define HISTORY_THUMB_PUSH_BATCH    8
 #define HISTORY_THUMB_MAX_DIM      256
 #define HISTORY_THUMB_JPEG_QUALITY 82
 #define HISTORY_THUMB_PIXEL_FORMAT 0x0026200A /* PixelFormat32bppARGB */
@@ -1241,6 +1246,48 @@ static void FreeCachedImageData(CachedImage *image)
     FreeCachedImageDataEx(image, TRUE);
 }
 
+/* Returns a malloc'd copy of a disk-stored JPEG. Sharing delete access lets
+   a reader outside g_imageLock never make an eviction's DeleteFileW fail;
+   the file then disappears once this handle closes. Must not log. */
+static BYTE *ReadRetainedImageFile(const WCHAR *path, DWORD *size)
+{
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    LARGE_INTEGER fileSize;
+    BYTE *data;
+    DWORD readTotal = 0;
+
+    *size = 0;
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
+        fileSize.QuadPart > 0x7fffffffLL) {
+        CloseHandle(file);
+        return NULL;
+    }
+    data = (BYTE *)malloc((size_t)fileSize.QuadPart);
+    if (!data) {
+        CloseHandle(file);
+        return NULL;
+    }
+    while (readTotal < (DWORD)fileSize.QuadPart) {
+        DWORD readNow = 0;
+        if (!ReadFile(file, data + readTotal,
+                      (DWORD)fileSize.QuadPart - readTotal,
+                      &readNow, NULL) || readNow == 0) {
+            break;
+        }
+        readTotal += readNow;
+    }
+    CloseHandle(file);
+    if (readTotal != (DWORD)fileSize.QuadPart) {
+        free(data);
+        return NULL;
+    }
+    *size = readTotal;
+    return data;
+}
+
 /* Returns a malloc'd copy of the image's JPEG bytes from memory or disk.
    Caller must hold g_imageLock (shared is enough); safe on the HTTP worker
    thread, so it must not call LogMessage. */
@@ -1254,41 +1301,7 @@ static BYTE *LoadCachedImageBytesLocked(const CachedImage *image, DWORD *size)
         *size = image->jpegSize;
         return copy;
     }
-    if (image->diskPath) {
-        HANDLE file = CreateFileW(image->diskPath, GENERIC_READ,
-                                  FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, NULL);
-        LARGE_INTEGER fileSize;
-        BYTE *data;
-        DWORD readTotal = 0;
-        if (file == INVALID_HANDLE_VALUE) return NULL;
-        if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
-            fileSize.QuadPart > 0x7fffffffLL) {
-            CloseHandle(file);
-            return NULL;
-        }
-        data = (BYTE *)malloc((size_t)fileSize.QuadPart);
-        if (!data) {
-            CloseHandle(file);
-            return NULL;
-        }
-        while (readTotal < (DWORD)fileSize.QuadPart) {
-            DWORD readNow = 0;
-            if (!ReadFile(file, data + readTotal,
-                          (DWORD)fileSize.QuadPart - readTotal,
-                          &readNow, NULL) || readNow == 0) {
-                break;
-            }
-            readTotal += readNow;
-        }
-        CloseHandle(file);
-        if (readTotal != (DWORD)fileSize.QuadPart) {
-            free(data);
-            return NULL;
-        }
-        *size = readTotal;
-        return data;
-    }
+    if (image->diskPath) return ReadRetainedImageFile(image->diskPath, size);
     return NULL;
 }
 
@@ -7771,29 +7784,210 @@ static void webview_push_init_log(void)
     free(logJson);
 }
 
-/* Decodes a retained JPEG and re-encodes a small preview as a data URI the
-   History view can show without any network access. Returns malloc'd text. */
-static char *CreateHistoryThumbnailDataUri(const BYTE *jpegData, DWORD jpegSize)
+/* ── History view ──────────────────────────────────────────────────────── */
+
+static const GUID g_wicImagingFactoryClsid =
+    {0xcacaf262, 0x9370, 0x4615, {0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a}};
+static const GUID g_wicImagingFactoryIid =
+    {0xec5ec8a9, 0xc395, 0x4314, {0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70}};
+static const GUID g_wicContainerFormatJpeg =
+    {0x19e4a5aa, 0x5662, 0x4fc5, {0xa0, 0xc0, 0x17, 0x58, 0x02, 0x8e, 0x10, 0x57}};
+static const GUID g_wicPixelFormat24bppBGR =
+    {0x6fddc324, 0x4e03, 0x4bfe, {0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0c}};
+/* Catmull-Rom scaling on Windows 10 and later; older systems use Fant. */
+#define WIC_INTERPOLATION_HIGH_QUALITY_CUBIC ((WICBitmapInterpolationMode)4)
+
+typedef struct {
+    char token[IMAGE_TOKEN_HEX_LEN + 1];
+    char *dataUri;      /* malloc'd JPEG data URI */
+    ULONGLONG lastUsed; /* the least recently used entry is replaced first */
+} HistoryThumbnail;
+
+/* Shared by the UI thread and the thumbnail worker under g_thumbLock. The
+   queue only holds rows the History page can currently see, top first. */
+static SRWLOCK g_thumbLock = SRWLOCK_INIT;
+static HistoryThumbnail g_thumbCache[HISTORY_THUMB_CACHE_ENTRIES];
+static size_t g_thumbCacheCount = 0;
+static ULONGLONG g_thumbClock = 0;
+static char g_thumbQueue[HISTORY_THUMB_QUEUE_MAX][IMAGE_TOKEN_HEX_LEN + 1];
+static size_t g_thumbQueueCount = 0;
+static char g_thumbReady[HISTORY_THUMB_QUEUE_MAX * 2][IMAGE_TOKEN_HEX_LEN + 1];
+static size_t g_thumbReadyCount = 0;
+static BOOL g_thumbStop = FALSE;
+static volatile LONG g_thumbReadyPosted = FALSE;
+static HANDLE g_thumbWorkEvent = NULL;
+static HANDLE g_thumbThread = NULL;  /* UI thread only */
+static size_t g_historyViewPage = 0; /* UI thread only; zero-based */
+
+static void CalculateHistoryThumbnailSize(UINT width, UINT height,
+                                          UINT *thumbWidth, UINT *thumbHeight)
 {
-    static const char prefix[] = "data:image/jpeg;base64,";
+    if (width >= height) {
+        *thumbWidth = width > HISTORY_THUMB_MAX_DIM ? HISTORY_THUMB_MAX_DIM : width;
+        *thumbHeight = (UINT)(((ULONGLONG)height * *thumbWidth + width / 2) / width);
+    } else {
+        *thumbHeight = height > HISTORY_THUMB_MAX_DIM ? HISTORY_THUMB_MAX_DIM : height;
+        *thumbWidth = (UINT)(((ULONGLONG)width * *thumbHeight + height / 2) / height);
+    }
+    if (*thumbWidth < 1) *thumbWidth = 1;
+    if (*thumbHeight < 1) *thumbHeight = 1;
+}
+
+static BOOL CopyStreamBytes(IStream *stream, BYTE **data, DWORD *size)
+{
+    STATSTG stat;
+    LARGE_INTEGER zero;
+    ULONG bytesRead = 0;
+
+    *data = NULL;
+    *size = 0;
+    ZeroMemory(&stat, sizeof(stat));
+    if (IStream_Stat(stream, &stat, STATFLAG_NONAME) != S_OK ||
+        stat.cbSize.QuadPart == 0 || stat.cbSize.QuadPart > 0xffffffffULL) {
+        return FALSE;
+    }
+    *data = (BYTE *)malloc((size_t)stat.cbSize.QuadPart);
+    if (!*data) return FALSE;
+    zero.QuadPart = 0;
+    if (IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL) != S_OK ||
+        IStream_Read(stream, *data, (ULONG)stat.cbSize.QuadPart,
+                     &bytesRead) != S_OK ||
+        bytesRead != (ULONG)stat.cbSize.QuadPart) {
+        free(*data);
+        *data = NULL;
+        return FALSE;
+    }
+    *size = (DWORD)bytesRead;
+    return TRUE;
+}
+
+/* Scaling the decoder's frame directly lets the WIC JPEG decoder drop
+   resolution in the DCT domain before the cubic filter runs, so a large
+   screenshot is never decoded at full size. */
+static BOOL CreateHistoryThumbnailJpegWic(IWICImagingFactory *factory,
+                                          const BYTE *jpegData, DWORD jpegSize,
+                                          BYTE **thumbJpeg, DWORD *thumbSize)
+{
+    IWICStream *input = NULL;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapScaler *scaler = NULL;
+    IWICFormatConverter *converter = NULL;
+    IStream *output = NULL;
+    IWICBitmapEncoder *encoder = NULL;
+    IWICBitmapFrameEncode *target = NULL;
+    IPropertyBag2 *options = NULL;
+    WICPixelFormatGUID format = g_wicPixelFormat24bppBGR;
+    UINT width = 0;
+    UINT height = 0;
+    UINT thumbWidth = 0;
+    UINT thumbHeight = 0;
+    BOOL ok = FALSE;
+    HRESULT hr;
+
+    *thumbJpeg = NULL;
+    *thumbSize = 0;
+    hr = IWICImagingFactory_CreateStream(factory, &input);
+    if (SUCCEEDED(hr)) {
+        hr = IWICStream_InitializeFromMemory(input, (BYTE *)jpegData, jpegSize);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = IWICImagingFactory_CreateDecoderFromStream(factory, (IStream *)input,
+            NULL, WICDecodeMetadataCacheOnDemand, &decoder);
+    }
+    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameDecode_GetSize(frame, &width, &height);
+    if (SUCCEEDED(hr) && (width == 0 || height == 0)) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        CalculateHistoryThumbnailSize(width, height, &thumbWidth, &thumbHeight);
+        hr = IWICImagingFactory_CreateBitmapScaler(factory, &scaler);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)frame,
+            thumbWidth, thumbHeight, WIC_INTERPOLATION_HIGH_QUALITY_CUBIC);
+        if (FAILED(hr)) {
+            IWICBitmapScaler_Release(scaler);
+            scaler = NULL;
+            hr = IWICImagingFactory_CreateBitmapScaler(factory, &scaler);
+            if (SUCCEEDED(hr)) {
+                hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)frame,
+                    thumbWidth, thumbHeight, WICBitmapInterpolationModeFant);
+            }
+        }
+    }
+    if (SUCCEEDED(hr)) hr = IWICImagingFactory_CreateFormatConverter(factory, &converter);
+    if (SUCCEEDED(hr)) {
+        hr = IWICFormatConverter_Initialize(converter, (IWICBitmapSource *)scaler,
+            &g_wicPixelFormat24bppBGR, WICBitmapDitherTypeNone, NULL, 0.0,
+            WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr)) hr = CreateStreamOnHGlobal(NULL, TRUE, &output);
+    if (SUCCEEDED(hr)) {
+        hr = IWICImagingFactory_CreateEncoder(factory, &g_wicContainerFormatJpeg,
+                                              NULL, &encoder);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = IWICBitmapEncoder_Initialize(encoder, output, WICBitmapEncoderNoCache);
+    }
+    if (SUCCEEDED(hr)) hr = IWICBitmapEncoder_CreateNewFrame(encoder, &target, &options);
+    if (SUCCEEDED(hr)) {
+        PROPBAG2 option;
+        VARIANT quality;
+        ZeroMemory(&option, sizeof(option));
+        ZeroMemory(&quality, sizeof(quality));
+        option.pstrName = (LPOLESTR)L"ImageQuality";
+        quality.vt = VT_R4;
+        quality.fltVal = HISTORY_THUMB_JPEG_QUALITY / 100.0f;
+        IPropertyBag2_Write(options, 1, &option, &quality); /* else default */
+        hr = IWICBitmapFrameEncode_Initialize(target, options);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = IWICBitmapFrameEncode_SetSize(target, thumbWidth, thumbHeight);
+    }
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_SetPixelFormat(target, &format);
+    if (SUCCEEDED(hr) && !IsEqualGUID(&format, &g_wicPixelFormat24bppBGR)) {
+        hr = E_FAIL;
+    }
+    if (SUCCEEDED(hr)) {
+        hr = IWICBitmapFrameEncode_WriteSource(target,
+            (IWICBitmapSource *)converter, NULL);
+    }
+    if (SUCCEEDED(hr)) hr = IWICBitmapFrameEncode_Commit(target);
+    if (SUCCEEDED(hr)) hr = IWICBitmapEncoder_Commit(encoder);
+    if (SUCCEEDED(hr)) ok = CopyStreamBytes(output, thumbJpeg, thumbSize);
+
+    if (options) IPropertyBag2_Release(options);
+    if (target) IWICBitmapFrameEncode_Release(target);
+    if (encoder) IWICBitmapEncoder_Release(encoder);
+    if (output) IStream_Release(output);
+    if (converter) IWICFormatConverter_Release(converter);
+    if (scaler) IWICBitmapScaler_Release(scaler);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    if (input) IWICStream_Release(input);
+    return ok;
+}
+
+/* Fallback if WIC is unavailable: full GDI+ decode and bicubic resample. */
+static BOOL CreateHistoryThumbnailJpegGdiplus(const BYTE *jpegData,
+                                              DWORD jpegSize,
+                                              BYTE **thumbJpeg, DWORD *thumbSize)
+{
     IStream *stream = NULL;
     GpBitmap *source = NULL;
     GpBitmap *thumbnail = NULL;
     GpGraphics *graphics = NULL;
-    BYTE *thumbJpeg = NULL;
-    DWORD thumbJpegSize = 0;
-    char *base64 = NULL;
-    DWORD base64Len = 0;
-    char *dataUri = NULL;
     UINT width = 0;
     UINT height = 0;
-    INT thumbWidth;
-    INT thumbHeight;
+    UINT thumbWidth;
+    UINT thumbHeight;
     ULONG written = 0;
     LARGE_INTEGER zero;
+    BOOL ok = FALSE;
 
-    if (!jpegData || jpegSize == 0) return NULL;
-    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) return NULL;
+    *thumbJpeg = NULL;
+    *thumbSize = 0;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) return FALSE;
     zero.QuadPart = 0;
     if (IStream_Write(stream, jpegData, jpegSize, &written) != S_OK ||
         written != jpegSize ||
@@ -7806,22 +8000,9 @@ static char *CreateHistoryThumbnailDataUri(const BYTE *jpegData, DWORD jpegSize)
     GdipGetImageWidth((GpImage *)source, &width);
     GdipGetImageHeight((GpImage *)source, &height);
     if (width == 0 || height == 0) goto cleanup;
+    CalculateHistoryThumbnailSize(width, height, &thumbWidth, &thumbHeight);
 
-    if (width >= height) {
-        thumbWidth = width > HISTORY_THUMB_MAX_DIM
-            ? HISTORY_THUMB_MAX_DIM : (INT)width;
-        thumbHeight = (INT)(((ULONGLONG)height * (ULONGLONG)thumbWidth +
-                             width / 2) / width);
-    } else {
-        thumbHeight = height > HISTORY_THUMB_MAX_DIM
-            ? HISTORY_THUMB_MAX_DIM : (INT)height;
-        thumbWidth = (INT)(((ULONGLONG)width * (ULONGLONG)thumbHeight +
-                            height / 2) / height);
-    }
-    if (thumbWidth < 1) thumbWidth = 1;
-    if (thumbHeight < 1) thumbHeight = 1;
-
-    if (GdipCreateBitmapFromScan0(thumbWidth, thumbHeight, 0,
+    if (GdipCreateBitmapFromScan0((INT)thumbWidth, (INT)thumbHeight, 0,
                                   HISTORY_THUMB_PIXEL_FORMAT, NULL,
                                   &thumbnail) != 0 || !thumbnail) {
         goto cleanup;
@@ -7833,42 +8014,345 @@ static char *CreateHistoryThumbnailDataUri(const BYTE *jpegData, DWORD jpegSize)
     GdipSetInterpolationMode(graphics, GDIP_INTERPOLATION_HIGH_BICUBIC);
     GdipSetPixelOffsetMode(graphics, CAPTURE_GDIP_PIXEL_OFFSET_HIGH_QUALITY);
     if (GdipDrawImageRectI(graphics, (GpImage *)source, 0, 0,
-                           thumbWidth, thumbHeight) != 0) {
+                           (INT)thumbWidth, (INT)thumbHeight) != 0) {
         goto cleanup;
     }
     GdipDeleteGraphics(graphics);
     graphics = NULL;
+    ok = EncodeImageToMemory((GpImage *)thumbnail, L"image/jpeg",
+                             HISTORY_THUMB_JPEG_QUALITY, thumbJpeg, thumbSize);
 
-    if (!EncodeImageToMemory((GpImage *)thumbnail, L"image/jpeg",
-                             HISTORY_THUMB_JPEG_QUALITY,
-                             &thumbJpeg, &thumbJpegSize)) {
-        goto cleanup;
-    }
-    base64 = Base64Encode(thumbJpeg, thumbJpegSize, &base64Len);
-    if (!base64) goto cleanup;
+cleanup:
+    if (graphics) GdipDeleteGraphics(graphics);
+    if (thumbnail) GdipDisposeImage((GpImage *)thumbnail);
+    if (source) GdipDisposeImage((GpImage *)source);
+    if (stream) IStream_Release(stream);
+    return ok;
+}
+
+static char *CreateJpegDataUri(const BYTE *jpegData, DWORD jpegSize)
+{
+    static const char prefix[] = "data:image/jpeg;base64,";
+    DWORD base64Len = 0;
+    char *base64 = Base64Encode(jpegData, jpegSize, &base64Len);
+    char *dataUri;
+
+    if (!base64) return NULL;
     dataUri = (char *)malloc(sizeof(prefix) + base64Len);
     if (dataUri) {
         memcpy(dataUri, prefix, sizeof(prefix) - 1);
         memcpy(dataUri + sizeof(prefix) - 1, base64, base64Len + 1);
     }
-
-cleanup:
     free(base64);
-    free(thumbJpeg);
-    if (graphics) GdipDeleteGraphics(graphics);
-    if (thumbnail) GdipDisposeImage((GpImage *)thumbnail);
-    if (source) GdipDisposeImage((GpImage *)source);
-    if (stream) IStream_Release(stream);
     return dataUri;
 }
 
-static void webview_push_init_history(void)
+/* Worker thread. Returns a malloc'd data URI, or NULL if the image is gone
+   or unreadable. Disk files are read and decoded outside g_imageLock, so a
+   slow disk never holds up clipboard updates. */
+static char *CreateHistoryThumbnail(IWICImagingFactory *factory,
+                                    const char *token)
 {
-    const CachedImage *items[HISTORY_VIEW_MAX_ENTRIES];
-    BOOL currentFlags[HISTORY_VIEW_MAX_ENTRIES];
-    char *thumbs[HISTORY_VIEW_MAX_ENTRIES];
-    size_t shown = 0;
-    size_t total = 0;
+    WCHAR *path = GetRetainedImageDiskPathCopy(token);
+    BYTE *jpegData = NULL;
+    DWORD jpegSize = 0;
+    BYTE *thumbJpeg = NULL;
+    DWORD thumbSize = 0;
+    char *dataUri = NULL;
+
+    if (path) {
+        jpegData = ReadRetainedImageFile(path, &jpegSize);
+        free(path);
+    } else {
+        CopyRetainedImageByToken(token, &jpegData, &jpegSize, NULL);
+    }
+    if (!jpegData) return NULL;
+    if ((factory && CreateHistoryThumbnailJpegWic(factory, jpegData, jpegSize,
+                                                  &thumbJpeg, &thumbSize)) ||
+        CreateHistoryThumbnailJpegGdiplus(jpegData, jpegSize,
+                                          &thumbJpeg, &thumbSize)) {
+        dataUri = CreateJpegDataUri(thumbJpeg, thumbSize);
+        free(thumbJpeg);
+    }
+    free(jpegData);
+    return dataUri;
+}
+
+/* Caller holds g_thumbLock exclusively. */
+static HistoryThumbnail *FindHistoryThumbnailLocked(const char *token)
+{
+    for (size_t i = 0; i < g_thumbCacheCount; i++) {
+        if (strcmp(g_thumbCache[i].token, token) == 0) {
+            g_thumbCache[i].lastUsed = ++g_thumbClock;
+            return &g_thumbCache[i];
+        }
+    }
+    return NULL;
+}
+
+/* Caller holds g_thumbLock exclusively; takes ownership of dataUri. */
+static void StoreHistoryThumbnailLocked(const char *token, char *dataUri)
+{
+    HistoryThumbnail *slot = FindHistoryThumbnailLocked(token);
+
+    if (!slot && g_thumbCacheCount < HISTORY_THUMB_CACHE_ENTRIES) {
+        slot = &g_thumbCache[g_thumbCacheCount++];
+    } else if (!slot) {
+        slot = &g_thumbCache[0];
+        for (size_t i = 1; i < g_thumbCacheCount; i++) {
+            if (g_thumbCache[i].lastUsed < slot->lastUsed) slot = &g_thumbCache[i];
+        }
+    }
+    free(slot->dataUri);
+    memcpy(slot->token, token, sizeof(slot->token));
+    slot->dataUri = dataUri;
+    slot->lastUsed = ++g_thumbClock;
+}
+
+/* Caller holds g_thumbLock exclusively. */
+static void MarkHistoryThumbnailReadyLocked(const char *token)
+{
+    size_t capacity = sizeof(g_thumbReady) / sizeof(g_thumbReady[0]);
+    for (size_t i = 0; i < g_thumbReadyCount; i++) {
+        if (strcmp(g_thumbReady[i], token) == 0) return;
+    }
+    if (g_thumbReadyCount < capacity) {
+        memcpy(g_thumbReady[g_thumbReadyCount++], token, sizeof(g_thumbReady[0]));
+    }
+}
+
+static DWORD WINAPI HistoryThumbnailThread(LPVOID parameter)
+{
+    HRESULT comResult = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IWICImagingFactory *factory = NULL;
+
+    (void)parameter;
+    if (SUCCEEDED(comResult) &&
+        FAILED(CoCreateInstance(&g_wicImagingFactoryClsid, NULL,
+                                CLSCTX_INPROC_SERVER, &g_wicImagingFactoryIid,
+                                (void **)&factory))) {
+        factory = NULL;
+    }
+    for (;;) {
+        char token[IMAGE_TOKEN_HEX_LEN + 1];
+        BOOL haveWork = FALSE;
+        BOOL cached = FALSE;
+        BOOL stop;
+
+        AcquireSRWLockExclusive(&g_thumbLock);
+        stop = g_thumbStop;
+        if (!stop && g_thumbQueueCount > 0) {
+            memcpy(token, g_thumbQueue[0], sizeof(token));
+            g_thumbQueueCount--;
+            memmove(g_thumbQueue[0], g_thumbQueue[1],
+                    g_thumbQueueCount * sizeof(g_thumbQueue[0]));
+            haveWork = TRUE;
+            if (FindHistoryThumbnailLocked(token)) {
+                MarkHistoryThumbnailReadyLocked(token);
+                cached = TRUE;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_thumbLock);
+        if (stop) break;
+        if (!haveWork) {
+            WaitForSingleObject(g_thumbWorkEvent, INFINITE);
+            continue;
+        }
+
+        if (!cached) {
+            // A failure is reported but not cached, so reopening retries.
+            char *dataUri = CreateHistoryThumbnail(factory, token);
+            AcquireSRWLockExclusive(&g_thumbLock);
+            if (dataUri) StoreHistoryThumbnailLocked(token, dataUri);
+            MarkHistoryThumbnailReadyLocked(token);
+            ReleaseSRWLockExclusive(&g_thumbLock);
+        }
+        if (InterlockedCompareExchange(&g_thumbReadyPosted, TRUE, FALSE) == FALSE &&
+            !PostMessageW(g_hWndMain, WM_HISTORY_THUMBS_READY, 0, 0)) {
+            InterlockedExchange(&g_thumbReadyPosted, FALSE);
+        }
+    }
+    if (factory) IWICImagingFactory_Release(factory);
+    if (SUCCEEDED(comResult)) CoUninitialize();
+    return 0;
+}
+
+static BOOL EnsureHistoryThumbnailWorker(void)
+{
+    if (g_thumbThread) return TRUE;
+    if (!g_thumbWorkEvent) {
+        g_thumbWorkEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_thumbWorkEvent) return FALSE;
+    }
+    g_thumbThread = CreateThread(NULL, 0, HistoryThumbnailThread, NULL, 0, NULL);
+    if (!g_thumbThread) return FALSE;
+    // Previews should never compete with input handling or the dialog.
+    SetThreadPriority(g_thumbThread, THREAD_PRIORITY_BELOW_NORMAL);
+    return TRUE;
+}
+
+static void StopHistoryThumbnailWorker(void)
+{
+    if (!g_thumbThread) return;
+    AcquireSRWLockExclusive(&g_thumbLock);
+    g_thumbStop = TRUE;
+    g_thumbQueueCount = 0;
+    ReleaseSRWLockExclusive(&g_thumbLock);
+    SetEvent(g_thumbWorkEvent);
+    // One preview takes far less than this; exit continues regardless.
+    WaitForSingleObject(g_thumbThread, 2000);
+    CloseHandle(g_thumbThread);
+    g_thumbThread = NULL;
+}
+
+/* UI thread. Sends finished thumbnails to the History page in small batches.
+   A token without a cached thumbnail goes out empty: no preview available. */
+static void PushReadyHistoryThumbnails(void)
+{
+    BOOL historyOpen = g_webviewView && strcmp(g_pendingView, "history") == 0;
+
+    for (;;) {
+        char tokens[HISTORY_THUMB_PUSH_BATCH][IMAGE_TOKEN_HEX_LEN + 1];
+        size_t count;
+        size_t scriptCap = 128;
+        size_t pos = 0;
+        wchar_t *script = NULL;
+        int written = -1;
+
+        AcquireSRWLockExclusive(&g_thumbLock);
+        if (!historyOpen) g_thumbReadyCount = 0;
+        count = g_thumbReadyCount < HISTORY_THUMB_PUSH_BATCH
+            ? g_thumbReadyCount : HISTORY_THUMB_PUSH_BATCH;
+        memcpy(tokens, g_thumbReady, count * sizeof(g_thumbReady[0]));
+        g_thumbReadyCount -= count;
+        memmove(g_thumbReady[0], g_thumbReady[count],
+                g_thumbReadyCount * sizeof(g_thumbReady[0]));
+        for (size_t i = 0; i < count; i++) {
+            HistoryThumbnail *thumb = FindHistoryThumbnailLocked(tokens[i]);
+            scriptCap += (thumb ? strlen(thumb->dataUri) : 0) +
+                         IMAGE_TOKEN_HEX_LEN + 32;
+        }
+        if (count > 0) script = (wchar_t *)malloc(scriptCap * sizeof(wchar_t));
+        if (script) {
+            written = swprintf(script, scriptCap,
+                L"window.onHistoryThumbs && window.onHistoryThumbs([");
+            for (size_t i = 0; i < count && written >= 0; i++) {
+                HistoryThumbnail *thumb = FindHistoryThumbnailLocked(tokens[i]);
+                pos += (size_t)written;
+                written = swprintf(script + pos, scriptCap - pos,
+                    L"%s{\"token\":\"%hs\",\"thumb\":\"%hs\"}", i ? L"," : L"",
+                    tokens[i], thumb ? thumb->dataUri : "");
+            }
+            if (written >= 0) {
+                pos += (size_t)written;
+                written = swprintf(script + pos, scriptCap - pos, L"])");
+            }
+        }
+        ReleaseSRWLockExclusive(&g_thumbLock);
+
+        if (count == 0) return;
+        if (script && written >= 0) webview_execute_script(script);
+        free(script);
+    }
+}
+
+/* UI thread. tokens lists the rows the History page can see that still lack
+   a thumbnail, top first. It replaces the previous request so rows already
+   scrolled past are never generated; cached thumbnails are sent at once. */
+static void RequestHistoryThumbnails(const char *tokens)
+{
+    char queue[HISTORY_THUMB_QUEUE_MAX][IMAGE_TOKEN_HEX_LEN + 1];
+    size_t queued = 0;
+    BOOL anyReady = FALSE;
+    const char *cursor = tokens;
+
+    AcquireSRWLockExclusive(&g_thumbLock);
+    while (cursor && *cursor && queued < HISTORY_THUMB_QUEUE_MAX) {
+        const char *start = cursor;
+        const char *end = strchr(start, ',');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        char token[IMAGE_TOKEN_HEX_LEN + 1];
+        BOOL duplicate = FALSE;
+
+        cursor = end ? end + 1 : NULL;
+        if (length != IMAGE_TOKEN_HEX_LEN) continue;
+        memcpy(token, start, length);
+        token[length] = '\0';
+        if (!IsValidImageToken(token)) continue;
+        if (FindHistoryThumbnailLocked(token)) {
+            MarkHistoryThumbnailReadyLocked(token);
+            anyReady = TRUE;
+            continue;
+        }
+        for (size_t i = 0; i < queued && !duplicate; i++) {
+            duplicate = strcmp(queue[i], token) == 0;
+        }
+        if (!duplicate) memcpy(queue[queued++], token, sizeof(token));
+    }
+    memcpy(g_thumbQueue, queue, queued * sizeof(queue[0]));
+    g_thumbQueueCount = queued;
+    ReleaseSRWLockExclusive(&g_thumbLock);
+
+    if (queued > 0) {
+        if (EnsureHistoryThumbnailWorker()) {
+            SetEvent(g_thumbWorkEvent);
+        } else {
+            AcquireSRWLockExclusive(&g_thumbLock);
+            for (size_t i = 0; i < queued; i++) {
+                MarkHistoryThumbnailReadyLocked(queue[i]);
+            }
+            g_thumbQueueCount = 0;
+            ReleaseSRWLockExclusive(&g_thumbLock);
+            anyReady = TRUE;
+        }
+    }
+    if (anyReady) PushReadyHistoryThumbnails();
+}
+
+/* UI thread. Pending previews are pointless once the History dialog closes;
+   finished ones stay cached for the next time it opens. */
+static void DropHistoryThumbnailRequests(void)
+{
+    AcquireSRWLockExclusive(&g_thumbLock);
+    g_thumbQueueCount = 0;
+    g_thumbReadyCount = 0;
+    ReleaseSRWLockExclusive(&g_thumbLock);
+}
+
+static void ForgetHistoryThumbnail(const char *token)
+{
+    AcquireSRWLockExclusive(&g_thumbLock);
+    for (size_t i = 0; i < g_thumbCacheCount; i++) {
+        if (strcmp(g_thumbCache[i].token, token) != 0) continue;
+        free(g_thumbCache[i].dataUri);
+        g_thumbCache[i] = g_thumbCache[--g_thumbCacheCount];
+        ZeroMemory(&g_thumbCache[g_thumbCacheCount], sizeof(g_thumbCache[0]));
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_thumbLock);
+}
+
+static void ClearHistoryThumbnails(void)
+{
+    AcquireSRWLockExclusive(&g_thumbLock);
+    for (size_t i = 0; i < g_thumbCacheCount; i++) free(g_thumbCache[i].dataUri);
+    ZeroMemory(g_thumbCache, sizeof(g_thumbCache));
+    g_thumbCacheCount = 0;
+    g_thumbQueueCount = 0;
+    g_thumbReadyCount = 0;
+    ReleaseSRWLockExclusive(&g_thumbLock);
+}
+
+/* Sends one page of History metadata, newest first with the current image
+   leading page 0. Thumbnails follow separately as rows become visible. The
+   first push answers getInit; later ones refresh the open page in place. */
+static void webview_push_history(BOOL initial)
+{
+    BOOL hasCurrent;
+    size_t total;
+    size_t pageCount;
+    size_t first;
+    size_t count;
     ULONGLONG totalBytes = 0;
     size_t scriptCap;
     wchar_t *script = NULL;
@@ -7882,52 +8366,43 @@ static void webview_push_init_history(void)
        the whole snapshot without risking a self-deadlock. */
     AcquireSRWLockShared(&g_imageLock);
 
-    if (g_cachedImage.token[0] &&
-        (g_cachedImage.jpegData || g_cachedImage.diskPath)) {
-        total++;
-        totalBytes += g_cachedImage.jpegSize;
-        items[shown] = &g_cachedImage;
-        currentFlags[shown] = TRUE;
-        shown++;
+    hasCurrent = g_cachedImage.token[0] &&
+                 (g_cachedImage.jpegData || g_cachedImage.diskPath);
+    total = (hasCurrent ? 1 : 0) + g_imageHistoryCount;
+    if (hasCurrent) totalBytes += g_cachedImage.jpegSize;
+    for (size_t i = 0; i < g_imageHistoryCount; i++) {
+        totalBytes += g_imageHistory[i].jpegSize;
     }
-    for (size_t i = g_imageHistoryCount; i > 0; i--) {
-        const CachedImage *image = &g_imageHistory[i - 1];
-        total++;
-        totalBytes += image->jpegSize;
-        if (shown < HISTORY_VIEW_MAX_ENTRIES) {
-            items[shown] = image;
-            currentFlags[shown] = FALSE;
-            shown++;
-        }
-    }
+    pageCount = total ? (total + HISTORY_VIEW_PAGE_SIZE - 1) / HISTORY_VIEW_PAGE_SIZE
+                      : 1;
+    if (g_historyViewPage >= pageCount) g_historyViewPage = pageCount - 1;
+    first = g_historyViewPage * HISTORY_VIEW_PAGE_SIZE;
+    count = total - first < HISTORY_VIEW_PAGE_SIZE ? total - first
+                                                   : HISTORY_VIEW_PAGE_SIZE;
 
-    scriptCap = 512;
-    for (size_t i = 0; i < shown; i++) {
-        DWORD loadedSize = 0;
-        BYTE *loadedBytes = LoadCachedImageBytesLocked(items[i], &loadedSize);
-        thumbs[i] = loadedBytes
-            ? CreateHistoryThumbnailDataUri(loadedBytes, loadedSize)
-            : NULL;
-        free(loadedBytes);
-        scriptCap += (thumbs[i] ? strlen(thumbs[i]) : 0) + 1280;
-    }
-
+    scriptCap = 512 + count * (MAX_PATH * 2 + 640);
     script = (wchar_t *)malloc(scriptCap * sizeof(wchar_t));
     if (script) {
         written = swprintf(script + pos, scriptCap - pos,
-            L"window.onInit({\"view\":\"history\",\"history\":{"
-            L"\"pasteMethod\":\"%s\",\"historyLimit\":%d,"
-            L"\"total\":%I64u,\"shown\":%I64u,\"totalBytes\":%I64u,"
-            L"\"entries\":[",
+            L"%s{\"pasteMethod\":\"%s\",\"historyLimit\":%d,"
+            L"\"total\":%I64u,\"totalBytes\":%I64u,"
+            L"\"page\":%I64u,\"pageSize\":%d,\"entries\":[",
+            initial ? L"window.onInit({\"view\":\"history\",\"history\":"
+                    : L"window.onHistoryData && window.onHistoryData(",
             g_configPasteMethod == PASTE_METHOD_HTTP ? L"http" : L"base64",
-            g_configImageHistoryLimit,
-            (ULONGLONG)total, (ULONGLONG)shown, totalBytes);
+            g_configImageHistoryLimit, (ULONGLONG)total, totalBytes,
+            (ULONGLONG)g_historyViewPage, HISTORY_VIEW_PAGE_SIZE);
         if (written < 0) formatted = FALSE; else pos += (size_t)written;
-        for (size_t i = 0; i < shown && formatted; i++) {
+        for (size_t i = 0; i < count && formatted; i++) {
+            size_t index = first + i;
+            BOOL isCurrent = hasCurrent && index == 0;
+            const CachedImage *image = isCurrent
+                ? &g_cachedImage
+                : &g_imageHistory[g_imageHistoryCount - 1 -
+                                  (index - (hasCurrent ? 1 : 0))];
             wchar_t wDiskPath[MAX_PATH * 2];
-            if (items[i]->diskPath) {
-                json_escape_wstring(items[i]->diskPath, wDiskPath,
-                                    MAX_PATH * 2);
+            if (image->diskPath) {
+                json_escape_wstring(image->diskPath, wDiskPath, MAX_PATH * 2);
             } else {
                 wDiskPath[0] = L'\0';
             }
@@ -7936,20 +8411,20 @@ static void webview_push_init_history(void)
                 L"\"width\":%u,\"height\":%u,\"bytes\":%lu,"
                 L"\"capturedAt\":%I64u,"
                 L"\"storage\":\"%s\",\"path\":\"%s\","
-                L"\"url\":\"http://%hs:%d/%hs.jpg\",\"thumb\":\"%hs\"}",
+                L"\"url\":\"http://%hs:%d/%hs.jpg\"}",
                 i == 0 ? L"" : L",",
-                items[i]->token,
-                currentFlags[i] ? L"true" : L"false",
-                items[i]->width, items[i]->height,
-                (unsigned long)items[i]->jpegSize,
-                items[i]->capturedAtMs,
-                items[i]->diskPath ? L"disk" : L"memory", wDiskPath,
-                g_configBindIp, g_configHttpPort, items[i]->token,
-                thumbs[i] ? thumbs[i] : "");
+                image->token,
+                isCurrent ? L"true" : L"false",
+                image->width, image->height,
+                (unsigned long)image->jpegSize,
+                image->capturedAtMs,
+                image->diskPath ? L"disk" : L"memory", wDiskPath,
+                g_configBindIp, g_configHttpPort, image->token);
             if (written < 0) formatted = FALSE; else pos += (size_t)written;
         }
         if (formatted) {
-            written = swprintf(script + pos, scriptCap - pos, L"]}})");
+            written = swprintf(script + pos, scriptCap - pos, L"]}%s",
+                               initial ? L"})" : L")");
             if (written < 0) formatted = FALSE;
         }
     }
@@ -7960,13 +8435,12 @@ static void webview_push_init_history(void)
         if (formatted) webview_execute_script(script);
         free(script);
     }
-    for (size_t i = 0; i < shown; i++) free(thumbs[i]);
 }
 
 static void NotifyHistoryViewChanged(void)
 {
     if (g_webviewView && strcmp(g_pendingView, "history") == 0) {
-        webview_push_init_history();
+        webview_push_history(FALSE);
     }
 }
 
@@ -8198,7 +8672,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         } else if (strcmp(g_pendingView, "log") == 0) {
             webview_push_init_log();
         } else if (strcmp(g_pendingView, "history") == 0) {
-            webview_push_init_history();
+            g_historyViewPage = 0;
+            webview_push_history(TRUE);
         }
     } else if (strcmp(action, "configReady") == 0) {
         if (IsConfigurationViewOpen()) {
@@ -8406,6 +8881,21 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         webview_execute_script(L"window.onInit && window.onInit({\"view\":\"log\",\"log\":[]})");
     } else if (strcmp(action, "copyLog") == 0) {
         CopyActivityLogToClipboard();
+    } else if (strcmp(action, "historyPage") == 0) {
+        int page = 0;
+        json_get_int(msg, "page", &page);
+        if (strcmp(g_pendingView, "history") == 0) {
+            g_historyViewPage = page > 0 ? (size_t)page : 0;
+            webview_push_history(FALSE);
+        }
+    } else if (strcmp(action, "historyThumbs") == 0) {
+        char tokens[HISTORY_THUMB_QUEUE_MAX * (IMAGE_TOKEN_HEX_LEN + 1) + 1];
+        if (!json_get_string(msg, "tokens", tokens, sizeof(tokens))) {
+            tokens[0] = '\0';
+        }
+        if (strcmp(g_pendingView, "history") == 0) {
+            RequestHistoryThumbnails(tokens);
+        }
     } else if (strcmp(action, "historyCopyUrl") == 0) {
         char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
         char url[192];
@@ -8469,6 +8959,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char token[IMAGE_TOKEN_HEX_LEN + 1] = {0};
         json_get_string(msg, "token", token, sizeof(token));
         if (DeleteRetainedImageByToken(token)) {
+            ForgetHistoryThumbnail(token);
             LogMessage("History image %.12s... removed by user", token);
             SendHistoryActionResult(TRUE, L"Image removed.");
         } else {
@@ -8479,6 +8970,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "historyClearAll") == 0) {
         size_t removed = ClearAllRetainedImages();
         wchar_t message[80];
+        ClearHistoryThumbnails();
         LogMessage("History cleared by user (%llu image(s) discarded)",
                    (unsigned long long)removed);
         swprintf(message, 80, L"Removed %I64u retained image%s.",
@@ -8630,6 +9122,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
                 g_updateCheckAbandoned = TRUE;
             }
+            DropHistoryThumbnailRequests();
             DiscardPendingUpdateNotice();
             DiscardPreparedUpdate();
             g_webviewHwnd = NULL;
@@ -8803,6 +9296,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 (PVOID volatile*)&g_updatePostedResult, NULL));
             DiscardPendingUpdateNotice();
             DiscardPreparedUpdate();
+            StopHistoryThumbnailWorker();
             if (fnRemoveClipboardFormatListener) fnRemoveClipboardFormatListener(hWnd);
             StopHttpServer();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -8871,6 +9365,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 (PVOID volatile*)&g_updatePostedResult, NULL);
             HandleCompletedUpdateCheck(task);
         }
+        return 0;
+
+    case WM_HISTORY_THUMBS_READY:
+        InterlockedExchange(&g_thumbReadyPosted, FALSE);
+        PushReadyHistoryThumbnails();
         return 0;
 
     case WM_KEYBOARD_HOOK_STATUS:

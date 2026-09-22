@@ -1,11 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   clearHistoryImages,
   closeDialog,
   copyHistoryUrl,
   deleteHistoryImage,
   onHistoryActionResult,
+  onHistoryData,
+  onHistoryThumbs,
   openHistoryUrl,
+  requestHistoryPage,
+  requestHistoryThumbs,
   revealHistoryFile,
   saveHistoryImage,
   type HistoryActionResult,
@@ -17,6 +21,15 @@ import { Button } from "./components/ui/button";
 interface Props {
   history: HistoryData;
 }
+
+/** Registers preview elements so thumbnails load only once they are near view. */
+interface PreviewTracker {
+  observe: (element: Element) => void;
+  unobserve: (element: Element, token: string) => void;
+}
+
+// Rows this close to the visible part of the list are fetched ahead of time.
+const PREFETCH_MARGIN = "240px 0px";
 
 function formatBytes(bytes: number) {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -32,34 +45,61 @@ function formatCapturedAt(ms: number) {
   return sameDay ? time : `${date.toLocaleDateString()} ${time}`;
 }
 
-function HistoryRow({ entry }: { entry: HistoryEntry }) {
+const HistoryRow = memo(function HistoryRow({
+  entry,
+  thumb,
+  tracker,
+}: {
+  entry: HistoryEntry;
+  /** undefined while loading; empty when no preview could be made. */
+  thumb: string | undefined;
+  tracker: PreviewTracker | null;
+}) {
+  const previewRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element || !tracker) return;
+    tracker.observe(element);
+    return () => tracker.unobserve(element, entry.token);
+  }, [tracker, entry.token]);
+
   return (
     <li className="flex items-center gap-3 px-3 py-2.5 hover:bg-neutral-50">
       <button
+        ref={previewRef}
         type="button"
+        data-token={entry.token}
         title="Open in default browser"
         onClick={() => openHistoryUrl(entry.token)}
         className="relative flex h-20 w-32 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded border border-neutral-200 bg-neutral-100 transition-shadow hover:ring-2 hover:ring-neutral-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-400"
       >
-        {entry.thumb ? (
+        {thumb ? (
           <>
             {/* Blurred cover copy fills the letterbox area behind the image */}
             <img
-              src={entry.thumb}
+              src={thumb}
               alt=""
               aria-hidden
+              decoding="async"
               className="absolute inset-0 h-full w-full scale-110 object-cover blur-md brightness-90"
               draggable={false}
             />
             <img
-              src={entry.thumb}
+              src={thumb}
               alt={`${entry.width} × ${entry.height} preview`}
+              decoding="async"
               className="relative max-h-full max-w-full object-contain"
               draggable={false}
             />
           </>
-        ) : (
+        ) : thumb === "" ? (
           <span className="text-[10px] text-neutral-400">No preview</span>
+        ) : (
+          <span
+            aria-hidden
+            className="absolute inset-0 animate-pulse bg-neutral-200/70"
+          />
         )}
       </button>
 
@@ -127,26 +167,119 @@ function HistoryRow({ entry }: { entry: HistoryEntry }) {
       </div>
     </li>
   );
-}
+});
 
-export default function HistoryView({ history }: Props) {
+const pagerButtonClass = "h-7 w-7 px-0 text-sm";
+
+export default function HistoryView({ history: initialHistory }: Props) {
+  const [history, setHistory] = useState(initialHistory);
+  const [thumbs, setThumbs] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+  const [tracker, setTracker] = useState<PreviewTracker | null>(null);
+  const [visibilityChanges, setVisibilityChanges] = useState(0);
   const [status, setStatus] = useState<HistoryActionResult | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const statusTimer = useRef<number | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const visibleTokens = useRef(new Set<string>());
+  const pageTokens = useRef(new Set<string>());
+  const lastThumbRequest = useRef("");
+
+  const entries = history.entries;
+
+  useEffect(() => setHistory(initialHistory), [initialHistory]);
 
   useEffect(() => {
-    const removeListener = onHistoryActionResult((result) => {
+    const removeResultListener = onHistoryActionResult((result) => {
       setStatus(result);
       if (statusTimer.current !== null) window.clearTimeout(statusTimer.current);
       statusTimer.current = window.setTimeout(() => setStatus(null), 5000);
     });
+    const removeDataListener = onHistoryData(setHistory);
+    const removeThumbsListener = onHistoryThumbs((items) => {
+      setThumbs((previous) => {
+        const next = new Map(previous);
+        for (const item of items) {
+          // Ignore previews for rows that left the page meanwhile.
+          if (pageTokens.current.has(item.token)) next.set(item.token, item.thumb);
+        }
+        return next;
+      });
+    });
     return () => {
-      removeListener();
+      removeResultListener();
+      removeDataListener();
+      removeThumbsListener();
       if (statusTimer.current !== null) window.clearTimeout(statusTimer.current);
     };
   }, []);
 
-  const entries = history.entries;
+  useEffect(() => {
+    const root = listRef.current;
+    if (!root) return;
+    const observer = new IntersectionObserver(
+      (records) => {
+        for (const record of records) {
+          const token = (record.target as HTMLElement).dataset.token;
+          if (!token) continue;
+          if (record.isIntersecting) visibleTokens.current.add(token);
+          else visibleTokens.current.delete(token);
+        }
+        setVisibilityChanges((count) => count + 1);
+      },
+      { root, rootMargin: PREFETCH_MARGIN },
+    );
+    setTracker({
+      observe: (element) => observer.observe(element),
+      unobserve: (element, token) => {
+        observer.unobserve(element);
+        visibleTokens.current.delete(token);
+      },
+    });
+    return () => observer.disconnect();
+  }, []);
+
+  // Keep only previews for the rows on this page. This runs before the request
+  // below, so a preview is never dropped for a row it asked about.
+  useEffect(() => {
+    pageTokens.current = new Set(entries.map((entry) => entry.token));
+    setThumbs((previous) => {
+      const next = new Map(
+        [...previous].filter(([token]) => pageTokens.current.has(token)),
+      );
+      return next.size === previous.size ? previous : next;
+    });
+  }, [entries]);
+
+  // Ask for exactly the visible rows still lacking a preview, top first. Each
+  // request replaces the last, so rows scrolled past are never generated.
+  useEffect(() => {
+    const wanted = entries
+      .filter(
+        (entry) =>
+          visibleTokens.current.has(entry.token) && !thumbs.has(entry.token),
+      )
+      .map((entry) => entry.token);
+    const request = wanted.join(",");
+    if (request === lastThumbRequest.current) return;
+    lastThumbRequest.current = request;
+    requestHistoryThumbs(wanted);
+  }, [entries, thumbs, visibilityChanges]);
+
+  useLayoutEffect(() => {
+    listRef.current?.scrollTo({ top: 0 });
+  }, [history.page]);
+
+  const pageCount = Math.max(1, Math.ceil(history.total / history.pageSize));
+  const page = Math.min(history.page, pageCount - 1);
+  const firstShown = page * history.pageSize + 1;
+  const lastShown = page * history.pageSize + entries.length;
+
+  const goToPage = (target: number) => {
+    const next = Math.min(Math.max(target, 0), pageCount - 1);
+    if (next !== page) requestHistoryPage(next);
+  };
 
   const handleClearAll = () => {
     setConfirmClear(false);
@@ -171,6 +304,7 @@ export default function HistoryView({ history }: Props) {
       </div>
 
       <div
+        ref={listRef}
         className="overflow-y-auto rounded-md border border-neutral-200"
         style={{ maxHeight: "430px" }}
       >
@@ -181,16 +315,75 @@ export default function HistoryView({ history }: Props) {
         ) : (
           <ul className="divide-y divide-neutral-100">
             {entries.map((entry) => (
-              <HistoryRow key={entry.token} entry={entry} />
+              <HistoryRow
+                key={entry.token}
+                entry={entry}
+                thumb={thumbs.get(entry.token)}
+                tracker={tracker}
+              />
             ))}
           </ul>
         )}
       </div>
 
-      {history.shown < history.total && (
-        <p className="text-[11px] text-neutral-500">
-          Showing the newest {history.shown} of {history.total} images.
-        </p>
+      {pageCount > 1 && (
+        <nav
+          aria-label="History pages"
+          className="flex items-center justify-between gap-3"
+        >
+          <span className="text-[11px] tabular-nums text-neutral-500">
+            {firstShown}–{lastShown} of {history.total}
+          </span>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              className={pagerButtonClass}
+              aria-label="First page"
+              title="Newest images"
+              disabled={page === 0}
+              onClick={() => goToPage(0)}
+            >
+              «
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className={pagerButtonClass}
+              aria-label="Previous page"
+              title="Newer images"
+              disabled={page === 0}
+              onClick={() => goToPage(page - 1)}
+            >
+              ‹
+            </Button>
+            <span className="min-w-[6.5rem] text-center text-[11px] tabular-nums text-neutral-600">
+              Page {page + 1} of {pageCount}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className={pagerButtonClass}
+              aria-label="Next page"
+              title="Older images"
+              disabled={page >= pageCount - 1}
+              onClick={() => goToPage(page + 1)}
+            >
+              ›
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className={pagerButtonClass}
+              aria-label="Last page"
+              title="Oldest images"
+              disabled={page >= pageCount - 1}
+              onClick={() => goToPage(pageCount - 1)}
+            >
+              »
+            </Button>
+          </div>
+        </nav>
       )}
 
       {status && (
@@ -210,7 +403,7 @@ export default function HistoryView({ history }: Props) {
           variant="outline"
           size="sm"
           className="text-red-600 hover:bg-red-50 hover:text-red-700"
-          disabled={entries.length === 0}
+          disabled={history.total === 0}
           onClick={() => setConfirmClear(true)}
         >
           Clear All
