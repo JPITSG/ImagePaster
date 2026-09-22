@@ -197,8 +197,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.37"
-#define APP_VERSION_W     L"1.0.37"
+#define APP_VERSION_A     "1.0.38"
+#define APP_VERSION_W     L"1.0.38"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -234,7 +234,6 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 
 #define UPDATE_URL L"https://github.com/JPITSG/ImagePaster/raw/refs/heads/main/release/ImagePaster.exe"
 #define UPDATE_MAX_BYTES (100ULL * 1024ULL * 1024ULL)
-#define UPDATE_PROGRESS_INTERVAL_MS 250
 #define UPDATE_HELPER_READY_MS 10000
 #define UPDATE_HELPER_WAIT_MS 120000
 
@@ -731,8 +730,14 @@ static volatile LONG g_updateCheckAutomatic = FALSE;
 static BOOL g_updateInstallReady = FALSE;
 static volatile LONG g_updateRequestSequence = 0;
 static HANDLE g_updateCancelEvent = NULL;
-static volatile LONG g_updateSpeedKbps = 0;
+static volatile LONG g_updateProgressPercent = 0;
 static volatile LONG g_updateProgressPosted = FALSE;
+/* UI thread only. A stopped check can remain inside a blocking network call
+   until its timeout, so settings are told at once and its late result is
+   discarded. A check requested meanwhile starts when that worker exits. */
+static BOOL g_updateCheckAbandoned = FALSE;
+static BOOL g_updateQueuedCheck = FALSE;
+static BOOL g_updateQueuedAutomatic = FALSE;
 
 typedef struct {
     WORD major;
@@ -5983,25 +5988,26 @@ static BOOL CancelUpdateTaskIfRequested(UpdateCheckTask* task) {
     return TRUE;
 }
 
-static void PublishUpdateProgress(UpdateCheckTask* task, DWORD speedKbps) {
+static void PublishUpdateProgress(UpdateCheckTask* task, DWORD percent) {
     if (!task || CancelUpdateTaskIfRequested(task) ||
         !IsWindow(task->targetWindow)) {
         return;
     }
 
-    InterlockedExchange(&g_updateSpeedKbps, (LONG)speedKbps);
+    InterlockedExchange(&g_updateProgressPercent, (LONG)percent);
     if (InterlockedCompareExchange(&g_updateProgressPosted, TRUE, FALSE) == FALSE &&
         !PostMessageW(task->targetWindow, WM_APP_UPDATE_PROGRESS, 0, 0)) {
         InterlockedExchange(&g_updateProgressPosted, FALSE);
     }
 }
 
-static DWORD CalculateUpdateSpeedKbps(ULONGLONG receivedBytes,
-                                       ULONGLONG elapsedMs) {
-    if (!elapsedMs) return 0;
-    double speed = (double)receivedBytes * 1000.0 / ((double)elapsedMs * 1024.0);
-    if (speed >= MAXLONG) return MAXLONG;
-    return (DWORD)(speed + 0.5);
+static DWORD CalculateUpdateProgressPercent(ULONGLONG receivedBytes,
+                                            ULONGLONG totalBytes) {
+    if (!totalBytes) return 0;
+    if (receivedBytes >= totalBytes) return 100;
+    // Whole percent completed; 100 is reserved for the final byte.
+    DWORD percent = (DWORD)((double)receivedBytes * 100.0 / (double)totalBytes);
+    return percent > 99 ? 99 : percent;
 }
 
 static BOOL OpenUpdateHttpRequest(LPCWSTR verb, ULONGLONG cacheBuster,
@@ -6322,9 +6328,8 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
 
     BOOL ok = TRUE;
     ULONGLONG totalWritten = 0;
-    ULONGLONG speedWindowBytes = 0;
-    ULONGLONG speedWindowStarted = GetTickCount64();
-    BOOL speedReported = FALSE;
+    DWORD reportedPercent = 0;
+    PublishUpdateProgress(task, reportedPercent);
     BYTE buffer[64 * 1024];
     while (ok) {
         if (CancelUpdateTaskIfRequested(task)) {
@@ -6352,20 +6357,6 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
             break;
         }
 
-        speedWindowBytes += bytesRead;
-        ULONGLONG now = GetTickCount64();
-        ULONGLONG elapsed = now - speedWindowStarted;
-        // Show the first measurable sample promptly, then at most four per
-        // second. Count received bytes and use the monotonic Windows clock.
-        if (elapsed >= UPDATE_PROGRESS_INTERVAL_MS ||
-            (!speedReported && elapsed > 0)) {
-            PublishUpdateProgress(task,
-                CalculateUpdateSpeedKbps(speedWindowBytes, elapsed));
-            speedReported = TRUE;
-            speedWindowBytes = 0;
-            speedWindowStarted = now;
-        }
-
         DWORD bytesWritten = 0;
         if (!WriteFile(file, buffer, bytesRead, &bytesWritten, NULL)) {
             SetUpdateTaskError(task, L"Could not write the staged update", GetLastError());
@@ -6379,6 +6370,14 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
             break;
         }
         totalWritten += bytesWritten;
+
+        // The size was validated above, so progress is a share of the whole
+        // file. Only whole-percent changes are posted to the UI thread.
+        DWORD percent = CalculateUpdateProgressPercent(totalWritten, expectedSize);
+        if (percent != reportedPercent) {
+            PublishUpdateProgress(task, percent);
+            reportedPercent = percent;
+        }
     }
 
     if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
@@ -6414,17 +6413,22 @@ static void DiscardUpdateTask(UpdateCheckTask* task) {
 
 static void PublishUpdateTask(UpdateCheckTask* task) {
     CancelUpdateTaskIfRequested(task);
+    HWND targetWindow = task ? task->targetWindow : NULL;
+    if (task && IsWindow(targetWindow)) {
+        // Hand the result over before clearing the pending flag, so the UI
+        // thread never sees an idle updater while this result is in flight.
+        UpdateCheckTask* previous = (UpdateCheckTask*)InterlockedExchangePointer(
+            (PVOID volatile*)&g_updatePostedResult, task);
+        DiscardUpdateTask(previous);
+    } else {
+        DiscardUpdateTask(task);
+        targetWindow = NULL;
+    }
     InterlockedExchange(&g_updateCheckPending, FALSE);
     InterlockedExchange(&g_updateCheckAutomatic, FALSE);
-    if (!task || !IsWindow(task->targetWindow)) {
-        DiscardUpdateTask(task);
-        return;
-    }
 
-    UpdateCheckTask* previous = (UpdateCheckTask*)InterlockedExchangePointer(
-        (PVOID volatile*)&g_updatePostedResult, task);
-    DiscardUpdateTask(previous);
-    if (!PostMessageW(task->targetWindow, WM_APP_UPDATE_RESULT, 0, 0)) {
+    if (targetWindow &&
+        !PostMessageW(targetWindow, WM_APP_UPDATE_RESULT, 0, 0)) {
         UpdateCheckTask* unclaimed = (UpdateCheckTask*)InterlockedExchangePointer(
             (PVOID volatile*)&g_updatePostedResult, NULL);
         DiscardUpdateTask(unclaimed);
@@ -7147,11 +7151,11 @@ static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) 
     CfgSendUpdateResultWithVersions(status, title, message, L"", L"", FALSE);
 }
 
-static void CfgSendUpdateProgress(DWORD speedKbps) {
+static void CfgSendUpdateProgress(DWORD percent) {
     wchar_t script[160];
     int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
-        (unsigned long)speedKbps);
+        L"window.onUpdateProgress({\"percentComplete\":%lu})",
+        (unsigned long)percent);
     if (written > 0) webview_execute_script(script);
 }
 
@@ -7161,24 +7165,47 @@ static void DiscardPendingUpdateNotice(void) {
     DiscardUpdateTask(task);
 }
 
+static BOOL IsUpdateWorkerActive(void) {
+    // Read the pending flag first: a worker publishes its result before
+    // clearing that flag, so an idle answer means no result is in flight.
+    if (InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE) {
+        return TRUE;
+    }
+    return InterlockedCompareExchangePointer(
+        (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
+}
+
+/* UI thread only. Whether settings should show a check in progress. */
+static BOOL IsUpdateCheckVisible(void) {
+    return (IsUpdateWorkerActive() && !g_updateCheckAbandoned) ||
+           g_updateQueuedCheck;
+}
+
 static void StartUpdateCheck(BOOL automatic) {
     if (!g_hWndMain) return;
     if (automatic && (g_updateNoticeTask || g_updateReadyTask)) return;
-    if (InterlockedCompareExchangePointer(
-            (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL) {
+    if (g_updateCheckAbandoned && IsUpdateWorkerActive()) {
+        // Run this request once the stopped worker exits instead of
+        // reporting a conflict. A manual request replaces an automatic one.
+        if (!automatic || !g_updateQueuedCheck) {
+            g_updateQueuedCheck = TRUE;
+            g_updateQueuedAutomatic = automatic;
+        }
+        return;
+    }
+    if (IsUpdateWorkerActive() ||
+        InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
         if (!automatic) {
             CfgSendUpdateResult(L"error", L"Update check in progress",
                 L"Another update check is still finishing. Try again shortly.");
         }
         return;
     }
-    if (InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
-        if (!automatic) {
-            CfgSendUpdateResult(L"error", L"Update check in progress",
-                L"Another update check is still finishing. Try again shortly.");
-        }
-        return;
-    }
+    // The check starting now also satisfies any queued request.
+    if (g_updateQueuedCheck && !g_updateQueuedAutomatic) automatic = FALSE;
+    g_updateQueuedCheck = FALSE;
+    g_updateQueuedAutomatic = FALSE;
+    g_updateCheckAbandoned = FALSE;
     InterlockedExchange(&g_updateCheckAutomatic, automatic ? TRUE : FALSE);
 
     // Every accepted request starts from scratch. Automatic requests are
@@ -7203,7 +7230,7 @@ static void StartUpdateCheck(BOOL automatic) {
         }
     }
     ResetEvent(g_updateCancelEvent);
-    InterlockedExchange(&g_updateSpeedKbps, 0);
+    InterlockedExchange(&g_updateProgressPercent, 0);
     InterlockedExchange(&g_updateProgressPosted, FALSE);
 
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
@@ -7337,10 +7364,28 @@ static void QueueUpdateNotice(UpdateCheckTask* task) {
     PresentPendingUpdateNotice();
 }
 
+static void StartQueuedUpdateCheck(void) {
+    if (!g_updateQueuedCheck) return;
+    BOOL automatic = g_updateQueuedAutomatic;
+    g_updateQueuedCheck = FALSE;
+    g_updateQueuedAutomatic = FALSE;
+    StartUpdateCheck(automatic);
+}
+
 static void HandleCompletedUpdateCheck(UpdateCheckTask* task) {
     if (!task) return;
     InterlockedExchange(&g_updateProgressPosted, FALSE);
-    InterlockedExchange(&g_updateSpeedKbps, 0);
+    InterlockedExchange(&g_updateProgressPercent, 0);
+
+    if (g_updateCheckAbandoned) {
+        // Settings already showed this check as stopped; drop its result
+        // and any staged download instead of presenting it.
+        g_updateCheckAbandoned = FALSE;
+        UpdateDebugPrint(L"[INFO] Stopped update check has exited\n");
+        DiscardUpdateTask(task);
+        StartQueuedUpdateCheck();
+        return;
+    }
 
     if (task->kind == UPDATE_CHECK_CANCELLED) {
         UpdateDebugPrint(L"[INFO] Update check cancelled\n");
@@ -7407,11 +7452,19 @@ static void IgnorePreparedUpdateVersion(const char* requestedVersion) {
 }
 
 static void CancelUpdateCheck(void) {
-    if (InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE &&
-        g_updateCancelEvent) {
+    BOOL stopped = g_updateQueuedCheck;
+    g_updateQueuedCheck = FALSE;
+    g_updateQueuedAutomatic = FALSE;
+    if (!g_updateCheckAbandoned && IsUpdateWorkerActive()) {
         UpdateDebugPrint(L"[INFO] Update check cancellation requested\n");
-        SetEvent(g_updateCancelEvent);
+        if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
+        g_updateCheckAbandoned = TRUE;
+        stopped = TRUE;
     }
+    // Report the stop at once. A blocking network call may not return until
+    // its timeout; the worker then deletes its partial download and its
+    // late result is discarded rather than shown.
+    if (stopped) CfgSendUpdateResult(L"cancelled", L"", L"");
 }
 
 static HANDLE CreateUpdateReadyEvent(DWORD processId, wchar_t* eventName,
@@ -7668,11 +7721,7 @@ static void webview_push_init_config(void)
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
         g_configAutoCheckForUpdates ? L"true" : L"false",
-        (InterlockedCompareExchange(&g_updateCheckPending,
-                                    FALSE, FALSE) == TRUE ||
-         InterlockedCompareExchangePointer(
-             (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL)
-            ? L"true" : L"false",
+        IsUpdateCheckVisible() ? L"true" : L"false",
         g_updateNoticeTask ? L"true" : L"false",
         ipsJson,
         IsConfiguredBindAddressPresent() ? L"true" : L"false",
@@ -8154,11 +8203,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "configReady") == 0) {
         if (IsConfigurationViewOpen()) {
             int checkAutomatically = 0;
-            BOOL updateWorkAlreadyActive =
-                InterlockedCompareExchange(&g_updateCheckPending,
-                                           FALSE, FALSE) == TRUE ||
-                InterlockedCompareExchangePointer(
-                    (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL ||
+            // A stopped worker that is still exiting does not count; the
+            // automatic check is queued behind it by StartUpdateCheck.
+            BOOL updateWorkAlreadyActive = IsUpdateCheckVisible() ||
                 g_updateNoticeTask || g_updateReadyTask;
             json_get_int(msg, "checkAutomatically", &checkAutomatically);
             g_configViewReady = TRUE;
@@ -8511,10 +8558,11 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case WM_APP_UPDATE_PROGRESS:
             InterlockedExchange(&g_updateProgressPosted, FALSE);
             if (InterlockedCompareExchange(&g_updateCheckPending,
-                                           FALSE, FALSE) == TRUE) {
-                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
-                    &g_updateSpeedKbps, 0, 0);
-                CfgSendUpdateProgress(speedKbps);
+                                           FALSE, FALSE) == TRUE &&
+                !g_updateCheckAbandoned) {
+                DWORD percent = (DWORD)InterlockedCompareExchange(
+                    &g_updateProgressPercent, 0, 0);
+                CfgSendUpdateProgress(percent);
             }
             return 0;
 
@@ -8571,12 +8619,16 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
+            // Closing settings stops a manual check, including a queued one.
+            if (g_updateQueuedCheck && !g_updateQueuedAutomatic) {
+                g_updateQueuedCheck = FALSE;
+            }
             if (InterlockedCompareExchange(&g_updateCheckPending,
                                            FALSE, FALSE) == TRUE &&
                 InterlockedCompareExchange(&g_updateCheckAutomatic,
-                                           FALSE, FALSE) == FALSE &&
-                g_updateCancelEvent) {
-                SetEvent(g_updateCancelEvent);
+                                           FALSE, FALSE) == FALSE) {
+                if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
+                g_updateCheckAbandoned = TRUE;
             }
             DiscardPendingUpdateNotice();
             DiscardPreparedUpdate();
@@ -8806,10 +8858,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         InterlockedExchange(&g_updateProgressPosted, FALSE);
         if (InterlockedCompareExchange(&g_updateCheckPending,
                                        FALSE, FALSE) == TRUE &&
-            g_configViewReady) {
-            DWORD speedKbps = (DWORD)InterlockedCompareExchange(
-                &g_updateSpeedKbps, 0, 0);
-            CfgSendUpdateProgress(speedKbps);
+            !g_updateCheckAbandoned && g_configViewReady) {
+            DWORD percent = (DWORD)InterlockedCompareExchange(
+                &g_updateProgressPercent, 0, 0);
+            CfgSendUpdateProgress(percent);
         }
         return 0;
 

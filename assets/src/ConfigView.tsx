@@ -99,7 +99,7 @@ export default function ConfigView({
     config.updateCheckPending ?? false,
   );
   const [updateCancelling, setUpdateCancelling] = useState(false);
-  const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
+  const [updatePercent, setUpdatePercent] = useState<number | null>(null);
   const [reopenSettingsAfterUpdate, setReopenSettingsAfterUpdate] = useState(false);
   const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
     updateCompletedVersion
@@ -143,7 +143,7 @@ export default function ConfigView({
     const removeResultListener = onUpdateResult((result) => {
       setUpdateChecking(false);
       setUpdateCancelling(false);
-      setUpdateSpeedKbps(null);
+      setUpdatePercent(null);
       setReopenSettingsAfterUpdate(false);
       if (result.status === "cancelled") {
         setUpdateAlert((current) =>
@@ -158,7 +158,10 @@ export default function ConfigView({
       }
     });
     const removeProgressListener = onUpdateProgress((progress) => {
-      setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
+      const percent = Math.floor(progress.percentComplete);
+      if (Number.isFinite(percent)) {
+        setUpdatePercent(Math.min(100, Math.max(0, percent)));
+      }
     });
 
     const shouldCheckAutomatically =
@@ -193,14 +196,14 @@ export default function ConfigView({
     setUpdateAlert(null);
     setUpdateChecking(true);
     setUpdateCancelling(false);
-    setUpdateSpeedKbps(null);
+    setUpdatePercent(null);
     checkForUpdate(false);
   }
 
   function handleInstallUpdate() {
     setUpdateChecking(true);
     setUpdateCancelling(false);
-    setUpdateSpeedKbps(null);
+    setUpdatePercent(null);
     installUpdate(reopenSettingsAfterUpdate);
   }
 
@@ -633,7 +636,7 @@ export default function ConfigView({
           <Button
             variant={updateChecking ? "destructive" : "outline"}
             size="sm"
-            className="min-w-[5rem]"
+            className="min-w-[5rem] tabular-nums"
             disabled={updateCancelling}
             aria-label={
               updateChecking ? "Stop update check and download" : undefined
@@ -646,9 +649,9 @@ export default function ConfigView({
             {updateCancelling
               ? "Stopping..."
               : updateChecking
-                ? updateSpeedKbps === null
+                ? updatePercent === null
                   ? "Checking..."
-                  : `Checking (${updateSpeedKbps}kb/s)...`
+                  : `Checking (${updatePercent}%)...`
                 : "Update"}
           </Button>
           <Button

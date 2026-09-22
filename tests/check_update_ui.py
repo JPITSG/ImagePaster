@@ -50,15 +50,23 @@ with sync_playwright() as playwright:
     expect(busy).to_have_text('Checking...')
     expect(busy).to_be_enabled()
     expect(busy).to_have_class(re.compile('bg-red-'))
-    for speed, text in [(100, '100'), (12345, '12345'), (99.5, '100'), (0, '0')]:
-        page.evaluate('(speed) => window.onUpdateProgress({kilobytesPerSecond: speed})', speed)
-        expect(busy).to_have_text(f'Checking ({text}kb/s)...')
+    for percent, text in [(0, '0'), (42, '42'), (99.9, '99'), (100, '100'),
+                          (-5, '0'), (250, '100')]:
+        page.evaluate('(percent) => window.onUpdateProgress({percentComplete: percent})', percent)
+        expect(busy).to_have_text(f'Checking ({text}%)...')
     busy.click()
     expect(busy).to_have_text('Stopping...')
     expect(busy).to_be_disabled()
     assert last_message('cancelUpdateCheck') == {'action': 'cancelUpdateCheck'}
     result('cancelled')
-    expect(page.get_by_role('button', name='Update', exact=True)).to_be_enabled()
+    idle = page.get_by_role('button', name='Update', exact=True)
+    expect(idle).to_be_enabled()
+
+    idle.click()  # A new check never shows the previous percentage.
+    expect(busy).to_have_text('Checking...')
+    busy.click()
+    result('cancelled')
+    expect(idle).to_be_enabled()
 
     result()
     modal = page.get_by_role('alertdialog')
@@ -100,4 +108,4 @@ with sync_playwright() as playwright:
     expect(modal.get_by_role('button', name='Update', exact=True)).to_have_count(0)
     assert not errors, errors
     browser.close()
-    print('PASS: speed labels, busy/cancel states, checkbox defaults/resets, install payloads, force update and downgrade UI')
+    print('PASS: percentage labels, busy/cancel states, checkbox defaults/resets, install payloads, force update and downgrade UI')

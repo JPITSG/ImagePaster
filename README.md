@@ -1,4 +1,4 @@
-# ImagePaster 1.0.37
+# ImagePaster 1.0.38
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -204,9 +204,14 @@ every result and can install an ignored version. Checks use the repository's
 
 The update check downloads the executable to the user's temporary directory
 and compares its embedded Windows file version with the running executable's
-version. While downloading, the red button displays the measured transfer speed
-rounded to whole kilobytes per second, for example **Checking (100kb/s)...**, and
-can be clicked again to stop the check and remove the partial download. The
+version. While downloading, the red button displays the share of the file
+received so far as a whole percentage, for example **Checking (42%)...**; it
+reads 100% only once the last byte has arrived. Clicking the red button again
+stops the check immediately, even when the connection has stalled: the button
+returns to **Update** at once, the background download is abandoned, and its
+partial file is removed as soon as the pending network call returns. Its late
+result is never shown, and an **Update** click made in the meantime starts a
+fresh check as soon as that cleanup finishes. The
 result dialog displays both version numbers. Installable results also offer an
 unchecked-by-default
 **Reopen settings after update** checkbox. This choice applies only to that
@@ -223,8 +228,10 @@ used only to validate the download and enforce its safety limit.
 
 Native regression checks can run without launching the Windows application:
 `python3 -B -m unittest discover -s tests -v` compiles production hook, updater
-speed, and command-line parsing functions with inert operating-system boundaries
-(requires a host C compiler). Hook tests cover blocked UI/contended locks, millions
+progress and stop handling, and command-line parsing functions with inert
+operating-system boundaries (requires a host C compiler). Updater tests cover
+stopping mid-download or just as a result arrives, stale progress, clicks while
+a stopped check unwinds, closing settings, and lost result messages. Hook tests cover blocked UI/contended locks, millions
 of unrelated key events, bounded capture queues, held keys across renewal,
 hotkey conflicts/fallback, silent removal, installation failures, and shutdown.
 These are deterministic fault-injection tests, not Windows latency measurements.

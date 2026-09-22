@@ -81,7 +81,7 @@ export interface UpdateResult {
 }
 
 export interface UpdateProgress {
-  kilobytesPerSecond: number;
+  percentComplete: number;
 }
 
 type InitCallback = (data: InitData) => void;
