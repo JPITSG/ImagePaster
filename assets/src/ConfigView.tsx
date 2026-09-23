@@ -94,6 +94,9 @@ export default function ConfigView({
   const [printScreenError, setPrintScreenError] = useState(
     config.printScreenHotkeyError ?? 0,
   );
+  const [startWithWindows, setStartWithWindows] = useState(
+    config.startWithWindows ?? false,
+  );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true,
   );
@@ -298,6 +301,7 @@ export default function ConfigView({
       compatibilityPaste,
       screenCaptureEnabled,
       captureGapFill,
+      startWithWindows,
       autoCheckForUpdates,
     });
   };
@@ -586,6 +590,29 @@ export default function ConfigView({
     </div>
   );
 
+  const startupSection = (
+    <div className="space-y-4">
+      <div className="text-xs font-medium">Startup</div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="startWithWindows"
+          className="mt-0.5"
+          checked={startWithWindows}
+          onChange={(event) => setStartWithWindows(event.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="startWithWindows" className="cursor-pointer">
+            Start with Windows
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Launches in the tray when you sign in to Windows.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+
   const updatesSection = (
     <div className="space-y-4">
       <div className="text-xs font-medium">Updates</div>
@@ -620,6 +647,9 @@ export default function ConfigView({
               {captureSection}
             </div>
             <div className="border-t border-neutral-200 pt-4">
+              {startupSection}
+            </div>
+            <div className="border-t border-neutral-200 pt-4">
               {updatesSection}
             </div>
           </div>
@@ -634,6 +664,9 @@ export default function ConfigView({
             {captureSection}
           </div>
           <div className="border-t border-neutral-200 pt-4">{serverSection}</div>
+          <div className="border-t border-neutral-200 pt-4">
+            {startupSection}
+          </div>
           <div className="border-t border-neutral-200 pt-4">
             {updatesSection}
           </div>

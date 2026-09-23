@@ -198,8 +198,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.41"
-#define APP_VERSION_W     L"1.0.41"
+#define APP_VERSION_A     "1.0.42"
+#define APP_VERSION_W     L"1.0.42"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -256,6 +256,9 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 #define REG_VALUE_IGNORED_UPDATE_VERSION "IgnoredUpdateVersion"
 #define REG_VALUE_HTTP_ALLOW_LIST "HttpAllowList"
 #define REG_VALUE_IMAGE_STORAGE "ImageStorage"
+#define STARTUP_RUN_KEY_W L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_APPROVED_RUN_KEY_W \
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
 
 #define LOG_RING_CAPACITY  500
 #define MAX_KEYWORDS       64
@@ -3285,6 +3288,89 @@ static void SaveConfigToRegistry(void)
                g_configImageStorage == IMAGE_STORAGE_DISK ? "disk" : "memory",
                g_configHttpAllowList[0] ? g_configHttpAllowList : "all",
                g_configTitleMatch);
+}
+
+/* ── Start with Windows ────────────────────────────────────────────────── */
+
+/* A per-user Run entry launches this executable at sign-in. Task Manager and
+   Settings can disable that entry without deleting it (odd first byte of its
+   StartupApproved value), so a disabled entry counts as off. */
+
+static BOOL GetStartupCommand(wchar_t *command, size_t commandCch)
+{
+    wchar_t path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return FALSE;
+    return swprintf(command, commandCch, L"\"%s\"", path) > 0;
+}
+
+static BOOL IsStartWithWindowsEnabled(void)
+{
+    wchar_t expected[MAX_PATH + 2];
+    wchar_t actual[MAX_PATH + 2];
+    BYTE approved[64];
+    DWORD size = sizeof(actual);
+
+    if (!GetStartupCommand(expected, sizeof(expected) / sizeof(wchar_t)) ||
+        RegGetValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME,
+                     RRF_RT_REG_SZ, NULL, actual, &size) != ERROR_SUCCESS ||
+        _wcsicmp(actual, expected) != 0) {
+        return FALSE;
+    }
+
+    size = sizeof(approved);
+    if (RegGetValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY_W, APP_NAME,
+                     RRF_RT_REG_BINARY, NULL, approved, &size) != ERROR_SUCCESS ||
+        size == 0) {
+        return TRUE; /* No marker (or Windows 7, which has none) means enabled. */
+    }
+    return (approved[0] & 1) == 0;
+}
+
+static LONG SetStartWithWindows(BOOL enable)
+{
+    LONG result;
+
+    if (enable) {
+        wchar_t command[MAX_PATH + 2];
+        HKEY key;
+        if (!GetStartupCommand(command, sizeof(command) / sizeof(wchar_t))) {
+            return ERROR_BAD_PATHNAME;
+        }
+        result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, 0, NULL,
+                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL,
+                                 &key, NULL);
+        if (result != ERROR_SUCCESS) return result;
+        result = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)command,
+                                (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+    } else {
+        result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME);
+        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+    }
+    if (result != ERROR_SUCCESS) return result;
+
+    /* Drop any disabled marker so turning the option on takes effect and
+       turning it off leaves nothing behind. */
+    result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY_W,
+                                APP_NAME);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+}
+
+/* Only a changed toggle touches the Run entry, so an entry for another copy
+   of the executable is left alone unless the user turns this on. */
+static void ApplyStartWithWindows(BOOL enable)
+{
+    LONG result;
+
+    if (enable == IsStartWithWindowsEnabled()) return;
+    result = SetStartWithWindows(enable);
+    if (result != ERROR_SUCCESS) {
+        LogMessage("WARNING: Could not %s start with Windows (error %ld)",
+                   enable ? "enable" : "disable", result);
+    } else {
+        LogMessage("Start with Windows %s", enable ? "enabled" : "disabled");
+    }
 }
 
 /* ── Interactive multi-monitor screen capture ─────────────────────────── */
@@ -7781,6 +7867,7 @@ static void webview_push_init_config(void)
         L"\"screenCaptureEnabled\":%s,"
         L"\"captureGapFill\":\"%s\","
         L"\"printScreenHotkeyError\":%lu,"
+        L"\"startWithWindows\":%s,"
         L"\"autoCheckForUpdates\":%s,"
         L"\"updateCheckPending\":%s,"
         L"\"updatePromptPending\":%s,"
@@ -7799,6 +7886,7 @@ static void webview_push_init_config(void)
         g_configScreenCaptureEnabled ? L"true" : L"false",
         captureGapFill,
         (unsigned long)PrintScreenHotkeyErrorForSettings(),
+        IsStartWithWindowsEnabled() ? L"true" : L"false",
         g_configAutoCheckForUpdates ? L"true" : L"false",
         IsUpdateCheckVisible() ? L"true" : L"false",
         g_updateNoticeTask ? L"true" : L"false",
@@ -8789,7 +8877,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         int imageHistoryLimit = -1;
         int compatibilityPaste = -1;
         int screenCaptureEnabled = -1;
+        int startWithWindows = -1;
         int autoCheckForUpdates = -1;
+        BOOL hasStartWithWindows;
         BOOL httpMessageParsed;
         IN_ADDR parsedAddress;
 
@@ -8810,6 +8900,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_int(msg, "screenCaptureEnabled", &screenCaptureEnabled);
         json_get_string(msg, "captureGapFill", captureGapFill,
                         sizeof(captureGapFill));
+        hasStartWithWindows =
+            json_get_int(msg, "startWithWindows", &startWithWindows);
         json_get_int(msg, "autoCheckForUpdates", &autoCheckForUpdates);
 
         if (strcmp(pasteMethod, "base64") != 0 && strcmp(pasteMethod, "http") != 0) {
@@ -8876,6 +8968,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             free(msg);
             return S_OK;
         }
+        if (hasStartWithWindows && (startWithWindows < 0 || startWithWindows > 1)) {
+            webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid start with Windows setting.'})");
+            free(msg);
+            return S_OK;
+        }
         if (autoCheckForUpdates < 0 || autoCheckForUpdates > 1) {
             webview_execute_script(L"window.onSaveResult && window.onSaveResult({ok:false,message:'Select a valid automatic update setting.'})");
             free(msg);
@@ -8929,6 +9026,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
         g_configAutoCheckForUpdates = autoCheckForUpdates != 0;
         SaveConfigToRegistry();
+        if (hasStartWithWindows) ApplyStartWithWindows(startWithWindows != 0);
         ParseKeywords();
         UpdateTooltip();
         if (qualityChanged && IsClipboardFormatAvailable(CF_DIB)) {

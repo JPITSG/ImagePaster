@@ -1,4 +1,4 @@
-# ImagePaster 1.0.41
+# ImagePaster 1.0.42
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -29,6 +29,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
+- Optional start with Windows at sign-in (per user, no administrator rights needed)
 - System tray icon with a live status tooltip and context menu
 - Single-instance enforcement
 
@@ -196,6 +197,7 @@ enabled; otherwise it opens or refocuses **Configure**.
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
 | Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
 | Multi-region Gap Fill | `CaptureGapFill` | REG_DWORD | White |
+| Start with Windows | `ImagePaster` (see below) | REG_SZ | Off |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 | Ignored Update Version | `IgnoredUpdateVersion` | REG_SZ | Empty |
 
@@ -208,7 +210,11 @@ are preserved.
 
 The bind-address menu lists IPv4 addresses on active adapters and includes an **Other** option. If a saved address disappears, such as after a laptop changes networks, ImagePaster retains it, stops the unavailable listener safely, and retries periodically. Selecting a non-loopback address may require a Windows Firewall rule, and the remote machine must be able to route to that address.
 
-Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`.
+Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`, except
+**Start with Windows**: it adds or removes an `ImagePaster` value under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` that launches
+this executable when you sign in. An entry disabled in Task Manager's startup
+apps shows as off; turning the toggle on re-enables it.
 
 The history limit counts the current image: `1` keeps only the current image,
 `2` keeps it plus one historical image, and so on through `1000`. Selecting
@@ -257,9 +263,11 @@ used only to validate the download and enforce its safety limit.
 
 Native regression checks can run without launching the Windows application:
 `python3 -B -m unittest discover -s tests -v` compiles production hook, updater
-progress and stop handling, History paging and thumbnail, and command-line
-parsing functions with inert operating-system boundaries (requires a host C
-compiler). Updater tests cover
+progress and stop handling, History paging and thumbnail, Start with Windows,
+and command-line parsing functions with inert operating-system boundaries
+(requires a host C compiler). Start with Windows tests run the Run entry against
+an in-memory registry: the quoted path, Task Manager's disabled marker, an entry
+left by another copy, case-insensitive paths, and logged failures. Updater tests cover
 stopping mid-download or just as a result arrives, stale progress, clicks while
 a stopped check unwinds, closing settings, and lost result messages. History
 tests parse every pushed page and preview as JSON and cover page order and
@@ -278,9 +286,11 @@ another computer, and sleep/resume. Actual input delivery and long-running
 reliability still require a Windows desktop.
 
 After `make`, `python3 tests/check_update_ui.py`,
-`python3 tests/check_history_ui.py` and `python3 tests/check_capture_ui.py`
-check the built UI with a recording WebView bridge (requires Python Playwright
-and Chromium). The capture check covers the Print Screen conflict notice: its
+`python3 tests/check_history_ui.py`, `python3 tests/check_capture_ui.py` and
+`python3 tests/check_startup_ui.py` check the built UI with a recording WebView
+bridge (requires Python Playwright and Chromium). The startup check covers the
+Startup section's wording, its place above Updates in both layouts, and the
+saved choice. The capture check covers the Print Screen conflict notice: its
 wording, red text, place under the capture option, and live updates. The History check covers
 visible-only thumbnail requests, scrolling, failed previews, preview
 proportions without blur or layout shift, paging, late previews, and live

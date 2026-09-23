@@ -18,6 +18,8 @@ export interface ConfigData {
   captureGapFill: CaptureGapFill;
   /** 0 when ImagePaster can register Print Screen; 1409 when another program holds it. */
   printScreenHotkeyError: number;
+  /** True only while this executable's own sign-in entry is present and enabled. */
+  startWithWindows: boolean;
   autoCheckForUpdates: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
@@ -229,6 +231,7 @@ export function saveSettings(config: ConfigData) {
     compatibilityPaste: config.compatibilityPaste ? 1 : 0,
     screenCaptureEnabled: config.screenCaptureEnabled ? 1 : 0,
     captureGapFill: config.captureGapFill,
+    startWithWindows: config.startWithWindows ? 1 : 0,
     autoCheckForUpdates: config.autoCheckForUpdates ? 1 : 0,
   });
 }
