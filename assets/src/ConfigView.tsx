@@ -428,7 +428,7 @@ export default function ConfigView({
           <Label htmlFor="httpMessageTemplate">HTTP Paste Message</Label>
           <textarea
             id="httpMessageTemplate"
-            className="flex min-h-20 w-full resize-y rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs leading-relaxed shadow-sm transition-colors placeholder:text-neutral-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+            className="flex min-h-20 w-full resize-none rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs leading-relaxed shadow-sm transition-colors placeholder:text-neutral-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
             rows={4}
             maxLength={maxHttpMessageLength}
             value={httpMessageTemplate}
