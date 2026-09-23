@@ -1,4 +1,4 @@
-# ImagePaster 1.0.43
+# ImagePaster 1.0.44
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -27,7 +27,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Double-buffered, anti-aliased capture rendering for smooth selection feedback
 - Self update with embedded-version comparison, cancellation, safe replacement, and restart
 - Modern WebView2-based configuration and activity log dialogs (React + Tailwind CSS)
-- Configuration, History and Activity Log windows size themselves to their content; they cannot be resized or maximized
+- Configuration, History and Activity Log windows size themselves to their content, cannot be resized, and have only a Close button
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
 - Optional start with Windows at sign-in (per user, no administrator rights needed)
@@ -278,9 +278,10 @@ decodes or calls into the page while holding a lock. Hook tests cover blocked UI
 of unrelated key events, bounded capture queues, held keys across renewal,
 Print Screen passed on to the hotkey (so a hook behind ImagePaster can send it to
 another computer), hotkey conflicts/fallback, silent removal, installation
-failures, and shutdown. Dialog frame tests cover the fixed window size: edge
-and corner drags, the Size and Maximize commands, the pinned track size that
-also stops Snap, and every place the app sizes a dialog.
+failures, and shutdown. Dialog frame tests cover the fixed window size and its
+Close-only title bar: edge and corner drags, the Size and Maximize commands,
+the pinned track size that also stops Snap, and every place the app sizes a
+dialog.
 These are deterministic fault-injection tests, not Windows latency measurements.
 On Windows, smoke-test capture on/off, manual tray capture, holding Print Screen
 across a renewal, rapid taps during large image processing, Ctrl+V in a matching
