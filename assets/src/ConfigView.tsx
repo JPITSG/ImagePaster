@@ -1,9 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import ConfigAlert from "./components/ConfigAlert";
 import {
   type UpdateResult,
   saveSettings,
   closeDialog,
   onSaveResult,
+  onCloseRequested,
   reportSize,
   checkForUpdate,
   cancelUpdateCheck,
@@ -121,6 +130,57 @@ export default function ConfigView({
       : null,
   );
   const automaticUpdateStarted = useRef(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const hasChanges =
+    titleMatch !== config.titleMatch ||
+    pasteMethod !== config.pasteMethod ||
+    httpMessageTemplate !== config.httpMessageTemplate ||
+    (ipChoice === "other" ? customIp : ipChoice) !== config.bindIp ||
+    httpPort !== String(config.httpPort) ||
+    httpAllowList !== config.httpAllowList ||
+    imageStorage !== config.imageStorage ||
+    jpegQuality !== String(config.jpegQuality) ||
+    unlimitedImageHistory !== (config.imageHistoryLimit === 0) ||
+    (!unlimitedImageHistory &&
+      imageHistoryLimit !== String(config.imageHistoryLimit)) ||
+    compatibilityPaste !== config.compatibilityPaste ||
+    screenCaptureEnabled !== config.screenCaptureEnabled ||
+    captureGapFill !== config.captureGapFill ||
+    startWithWindows !== (config.startWithWindows ?? false) ||
+    autoCheckForUpdates !== (config.autoCheckForUpdates ?? true);
+
+  const handleRequestClose = useCallback(() => {
+    if (hasChanges) {
+      setClosePrompt(true);
+    } else {
+      closeDialog();
+    }
+  }, [hasChanges]);
+
+  // Install before configReady, and keep native close requests in sync with edits.
+  useLayoutEffect(
+    () => onCloseRequested(handleRequestClose),
+    [handleRequestClose],
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !closePrompt && !updateAlert) {
+        event.preventDefault();
+        handleRequestClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [closePrompt, updateAlert, handleRequestClose]);
+
+  function showSaveError(message: string, fieldId?: string) {
+    setError(message);
+    setClosePrompt(false);
+    if (fieldId) {
+      requestAnimationFrame(() => document.getElementById(fieldId)?.focus());
+    }
+  }
 
   const selectedBindIp = useMemo(
     () => (ipChoice === "other" ? customIp.trim() : ipChoice),
@@ -135,7 +195,9 @@ export default function ConfigView({
 
   useEffect(() => {
     onSaveResult((result) => {
-      if (!result.ok) setError(result.message ?? "Could not save the settings.");
+      if (!result.ok) {
+        showSaveError(result.message ?? "Could not save the settings.");
+      }
     });
   }, []);
 
@@ -244,21 +306,25 @@ export default function ConfigView({
     setError("");
 
     if (!isValidIpv4(selectedBindIp)) {
-      setError("Enter a valid IPv4 bind address.");
+      showSaveError("Enter a valid IPv4 bind address.", "customIp");
       return;
     }
     if (httpMessageTemplate.length > maxHttpMessageLength) {
-      setError(
+      showSaveError(
         `HTTP paste message must be ${maxHttpMessageLength} characters or fewer.`,
+        "httpMessageTemplate",
       );
       return;
     }
     if (!httpMessageTemplate.includes("{URL}")) {
-      setError("HTTP paste message must include {URL}.");
+      showSaveError(
+        "HTTP paste message must include {URL}.",
+        "httpMessageTemplate",
+      );
       return;
     }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      setError("HTTP port must be between 1 and 65535.");
+      showSaveError("HTTP port must be between 1 and 65535.", "httpPort");
       return;
     }
     const allowEntries = httpAllowList
@@ -266,24 +332,31 @@ export default function ConfigView({
       .map((entry) => entry.trim())
       .filter(Boolean);
     if (!allowEntries.every(isValidAllowEntry)) {
-      setError(
+      showSaveError(
         "Allowed clients must be IPv4 addresses or CIDR subnets (e.g. 192.168.1.0/24), separated by commas.",
+        "httpAllowList",
       );
       return;
     }
     if (allowEntries.length > 64) {
-      setError("Allowed clients can contain at most 64 entries.");
+      showSaveError(
+        "Allowed clients can contain at most 64 entries.",
+        "httpAllowList",
+      );
       return;
     }
     if (!Number.isInteger(quality) || quality < 0 || quality > 100) {
-      setError("JPEG quality must be between 0 and 100.");
+      showSaveError("JPEG quality must be between 0 and 100.", "jpegQuality");
       return;
     }
     if (
       !unlimitedImageHistory &&
       (!Number.isInteger(historyLimit) || historyLimit < 1 || historyLimit > 1000)
     ) {
-      setError("Image history must be Unlimited or between 1 and 1000.");
+      showSaveError(
+        "Image history must be Unlimited or between 1 and 1000.",
+        "imageHistoryLimit",
+      );
       return;
     }
 
@@ -638,189 +711,197 @@ export default function ConfigView({
   );
 
   return (
-    <div className="p-5 space-y-4">
-      {twoColumn ? (
-        <div className="grid grid-cols-2">
-          <div className="space-y-4 pr-6">
+    <>
+      <div inert={closePrompt || !!updateAlert} className="p-5 space-y-4">
+        {twoColumn ? (
+          <div className="grid grid-cols-2">
+            <div className="space-y-4 pr-6">
+              {pastingSection}
+              <div className="border-t border-neutral-200 pt-4">
+                {captureSection}
+              </div>
+              <div className="border-t border-neutral-200 pt-4">
+                {startupSection}
+              </div>
+              <div className="border-t border-neutral-200 pt-4">
+                {updatesSection}
+              </div>
+            </div>
+            <div className="border-l border-neutral-200 pl-6">
+              {serverSection}
+            </div>
+          </div>
+        ) : (
+          <>
             {pastingSection}
             <div className="border-t border-neutral-200 pt-4">
               {captureSection}
             </div>
+            <div className="border-t border-neutral-200 pt-4">{serverSection}</div>
             <div className="border-t border-neutral-200 pt-4">
               {startupSection}
             </div>
             <div className="border-t border-neutral-200 pt-4">
               {updatesSection}
             </div>
-          </div>
-          <div className="border-l border-neutral-200 pl-6">
-            {serverSection}
-          </div>
-        </div>
-      ) : (
-        <>
-          {pastingSection}
-          <div className="border-t border-neutral-200 pt-4">
-            {captureSection}
-          </div>
-          <div className="border-t border-neutral-200 pt-4">{serverSection}</div>
-          <div className="border-t border-neutral-200 pt-4">
-            {startupSection}
-          </div>
-          <div className="border-t border-neutral-200 pt-4">
-            {updatesSection}
-          </div>
-        </>
-      )}
+          </>
+        )}
 
-      {error && (
-        <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
-          {error}
-        </div>
-      )}
+        {error && (
+          <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
+            {error}
+          </div>
+        )}
 
-      <div className="flex items-center justify-between gap-3 border-t border-neutral-200 pt-3">
-        <span
-          className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
-          title="Application version"
-        >
-          v{config.version}
-        </span>
-        <div className="flex items-center gap-2">
-          <Button
-            variant={updateChecking ? "destructive" : "outline"}
-            size="sm"
-            className="min-w-[5rem] tabular-nums"
-            disabled={updateCancelling}
-            aria-label={
-              updateChecking ? "Stop update check and download" : undefined
-            }
-            title={
-              updateChecking ? "Stop update check and download" : undefined
-            }
-            onClick={handleUpdate}
+        <div className="flex items-center justify-between gap-3 border-t border-neutral-200 pt-3">
+          <span
+            className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
+            title="Application version"
           >
-            {updateCancelling
-              ? "Stopping..."
-              : updateChecking
-                ? updatePercent === null
-                  ? "Checking..."
-                  : `Checking (${updatePercent}%)...`
-                : "Update"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="min-w-[5rem]"
-            onClick={closeDialog}
-          >
-            Cancel
-          </Button>
-          <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
-            Save
-          </Button>
+            v{config.version}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant={updateChecking ? "destructive" : "outline"}
+              size="sm"
+              className="min-w-[5rem] tabular-nums"
+              disabled={updateCancelling}
+              aria-label={
+                updateChecking ? "Stop update check and download" : undefined
+              }
+              title={
+                updateChecking ? "Stop update check and download" : undefined
+              }
+              onClick={handleUpdate}
+            >
+              {updateCancelling
+                ? "Stopping..."
+                : updateChecking
+                  ? updatePercent === null
+                    ? "Checking..."
+                    : `Checking (${updatePercent}%)...`
+                  : "Update"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="min-w-[5rem]"
+              onClick={handleRequestClose}
+            >
+              Cancel
+            </Button>
+            <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
+              Save
+            </Button>
+          </div>
         </div>
       </div>
 
-      {updateAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="update-alert-title"
-            aria-describedby="update-alert-message"
-            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
-          >
-            <div className="space-y-1">
-              <h2 id="update-alert-title" className="text-sm font-semibold">
-                {updateAlert.title}
-              </h2>
-              <p
-                id="update-alert-message"
-                className="text-xs leading-relaxed text-neutral-600"
-              >
-                {updateAlert.message}
-              </p>
-            </div>
-            {updateAlert.currentVersion && updateAlert.remoteVersion && (
-              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
-                <dt className="text-neutral-500">Current version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.currentVersion}
-                </dd>
-                <dt className="text-neutral-500">Remote version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.remoteVersion}
-                </dd>
-              </dl>
-            )}
-            {(updateAlert.status === "newer" || updateAlert.status === "same") && (
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="reopenSettingsAfterUpdate"
-                  checked={reopenSettingsAfterUpdate}
-                  disabled={updateChecking}
-                  onChange={(event) =>
-                    setReopenSettingsAfterUpdate(event.target.checked)
-                  }
-                />
-                <Label
-                  htmlFor="reopenSettingsAfterUpdate"
-                  className="cursor-pointer"
-                >
-                  Reopen settings after update
-                </Label>
-              </div>
-            )}
-            <div className="flex justify-end gap-2">
-              {updateAlert.status === "newer" && updateAlert.automatic && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={updateChecking}
-                  onClick={handleIgnoreUpdateVersion}
-                >
-                  Ignore this version
-                </Button>
-              )}
-              {(updateAlert.status === "newer" ||
-                updateAlert.status === "same") && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  autoFocus
-                  disabled={updateChecking}
-                  onClick={handleDismissUpdate}
-                >
-                  Cancel
-                </Button>
-              )}
-              <Button
-                size="sm"
-                autoFocus={
-                  updateAlert.status !== "newer" &&
-                  updateAlert.status !== "same"
-                }
-                disabled={updateChecking}
-                onClick={
-                  updateAlert.status === "newer" ||
-                  updateAlert.status === "same"
-                    ? handleInstallUpdate
-                    : handleDismissUpdate
-                }
-              >
-                {updateChecking
-                  ? "Starting..."
-                  : updateAlert.status === "same"
-                    ? "Force update"
-                    : updateAlert.status === "newer"
-                      ? "Update"
-                      : "OK"}
-              </Button>
-            </div>
+      {closePrompt ? (
+        <ConfigAlert
+          key="save"
+          id="save-alert"
+          title="Unsaved changes"
+          message="Save changes before closing?"
+          onEscape={() => setClosePrompt(false)}
+        >
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setClosePrompt(false)}>
+              Keep editing
+            </Button>
+            <Button variant="outline" size="sm" onClick={closeDialog}>
+              Discard
+            </Button>
+            <Button size="sm" onClick={handleSave}>
+              Save
+            </Button>
           </div>
-        </div>
+        </ConfigAlert>
+      ) : updateAlert && (
+        <ConfigAlert
+          key="update"
+          id="update-alert"
+          title={updateAlert.title}
+          message={updateAlert.message}
+        >
+          {updateAlert.currentVersion && updateAlert.remoteVersion && (
+            <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+              <dt className="text-neutral-500">Current version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.currentVersion}
+              </dd>
+              <dt className="text-neutral-500">Remote version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.remoteVersion}
+              </dd>
+            </dl>
+          )}
+          {(updateAlert.status === "newer" || updateAlert.status === "same") && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="reopenSettingsAfterUpdate"
+                checked={reopenSettingsAfterUpdate}
+                disabled={updateChecking}
+                onChange={(event) =>
+                  setReopenSettingsAfterUpdate(event.target.checked)
+                }
+              />
+              <Label
+                htmlFor="reopenSettingsAfterUpdate"
+                className="cursor-pointer"
+              >
+                Reopen settings after update
+              </Label>
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            {updateAlert.status === "newer" && updateAlert.automatic && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={updateChecking}
+                onClick={handleIgnoreUpdateVersion}
+              >
+                Ignore this version
+              </Button>
+            )}
+            {(updateAlert.status === "newer" ||
+              updateAlert.status === "same") && (
+              <Button
+                variant="outline"
+                size="sm"
+                autoFocus
+                disabled={updateChecking}
+                onClick={handleDismissUpdate}
+              >
+                Cancel
+              </Button>
+            )}
+            <Button
+              size="sm"
+              autoFocus={
+                updateAlert.status !== "newer" &&
+                updateAlert.status !== "same"
+              }
+              disabled={updateChecking}
+              onClick={
+                updateAlert.status === "newer" ||
+                updateAlert.status === "same"
+                  ? handleInstallUpdate
+                  : handleDismissUpdate
+              }
+            >
+              {updateChecking
+                ? "Starting..."
+                : updateAlert.status === "same"
+                  ? "Force update"
+                  : updateAlert.status === "newer"
+                    ? "Update"
+                    : "OK"}
+            </Button>
+          </div>
+        </ConfigAlert>
       )}
-    </div>
+    </>
   );
 }

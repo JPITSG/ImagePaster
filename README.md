@@ -1,4 +1,4 @@
-# ImagePaster 1.0.44
+# ImagePaster 1.0.45
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -183,6 +183,10 @@ Right-click the tray icon and select **Configure** to open the settings dialog.
 Selecting **Configure** again restores and focuses the existing dialog.
 Double-clicking the tray icon starts interactive capture when that feature is
 enabled; otherwise it opens or refocuses **Configure**.
+Closing with unsaved changes shows **Unsaved changes** / **Save changes before
+closing?** over the same dark overlay used by updates. Choose **Keep editing**,
+**Discard**, or **Save**. This covers Cancel, X, Alt+F4, and Escape; Escape from
+the prompt keeps editing. Unchanged settings close immediately.
 
 | Setting | Registry Value | Type | Default |
 |---------|---------------|------|---------|
@@ -281,7 +285,8 @@ another computer), hotkey conflicts/fallback, silent removal, installation
 failures, and shutdown. Dialog frame tests cover the fixed window size and its
 Close-only title bar: edge and corner drags, the Size and Maximize commands,
 the pinned track size that also stops Snap, and every place the app sizes a
-dialog.
+dialog. Configuration close tests cover the native close gate, repeated close
+requests, successful saves, and shutdown/update handoff.
 These are deterministic fault-injection tests, not Windows latency measurements.
 On Windows, smoke-test capture on/off, manual tray capture, holding Print Screen
 across a renewal, rapid taps during large image processing, Ctrl+V in a matching
@@ -290,11 +295,15 @@ another computer, and sleep/resume. Actual input delivery and long-running
 reliability still require a Windows desktop.
 
 After `make`, `python3 tests/check_update_ui.py`,
-`python3 tests/check_history_ui.py`, `python3 tests/check_capture_ui.py` and
-`python3 tests/check_startup_ui.py` check the built UI with a recording WebView
+`python3 tests/check_history_ui.py`, `python3 tests/check_capture_ui.py`,
+`python3 tests/check_startup_ui.py`, and `python3 tests/check_config_close_ui.py`
+check the built UI with a recording WebView
 bridge (requires Python Playwright and Chromium). The startup check covers the
 Startup section's wording, its place above Updates in both layouts, and the
-saved choice. The capture check covers the Print Screen conflict notice: its
+saved choice. The close check covers every editable setting in both layouts,
+reverted edits, all close routes, Save/Discard/Keep editing, validation failures,
+keyboard focus, the dark overlay, and arriving updates. The capture check covers
+the Print Screen conflict notice: its
 wording, red text, place under the capture option, and live updates. The History check covers
 visible-only thumbnail requests, scrolling, failed previews, preview
 proportions without blur or layout shift, paging, late previews, and live

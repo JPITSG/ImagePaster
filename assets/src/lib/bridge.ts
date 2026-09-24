@@ -107,6 +107,7 @@ type SaveResultCallback = (result: { ok: boolean; message?: string }) => void;
 let initCallback: InitCallback | null = null;
 let logUpdateCallback: LogUpdateCallback | null = null;
 let saveResultCallback: SaveResultCallback | null = null;
+let closeRequestedCallback: (() => void) | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 let printScreenStatusCallback: ((status: PrintScreenStatus) => void) | null = null;
@@ -121,6 +122,7 @@ declare global {
     onInit: (data: InitData) => void;
     onLogUpdate: (entry: LogEntry) => void;
     onSaveResult: (result: { ok: boolean; message?: string }) => void;
+    onCloseRequested: () => void;
     onUpdateResult: (result: UpdateResult) => void;
     onUpdateProgress: (progress: UpdateProgress) => void;
     onPrintScreenStatus: (status: PrintScreenStatus) => void;
@@ -146,6 +148,17 @@ window.onLogUpdate = (entry: LogEntry) => {
 window.onSaveResult = (result) => {
   saveResultCallback?.(result);
 };
+
+window.onCloseRequested = () => {
+  closeRequestedCallback?.();
+};
+
+export function onCloseRequested(cb: () => void) {
+  closeRequestedCallback = cb;
+  return () => {
+    if (closeRequestedCallback === cb) closeRequestedCallback = null;
+  };
+}
 
 window.onUpdateResult = (result) => {
   updateResultCallback?.(result);

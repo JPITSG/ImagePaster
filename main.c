@@ -198,8 +198,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.42"
-#define APP_VERSION_W     L"1.0.42"
+#define APP_VERSION_A     "1.0.45"
+#define APP_VERSION_W     L"1.0.45"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -742,6 +742,7 @@ static char g_pendingView[16] = "";
 static BOOL g_webviewWindowShown = FALSE;
 static SIZE g_webviewFrameSize = {0, 0};
 static BOOL g_configViewReady = FALSE;
+static BOOL g_configCloseApproved = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
 static volatile LONG g_updateCheckPending = FALSE;
 static volatile LONG g_updateCheckAutomatic = FALSE;
@@ -9117,8 +9118,11 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
         ReconcileHttpServer();
         LogMessage("Configuration updated");
+        g_configCloseApproved = TRUE;
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
+        // The configuration UI sends this only after checking for unsaved edits.
+        g_configCloseApproved = TRUE;
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "clearLog") == 0) {
         g_logCount = 0;
@@ -9291,6 +9295,17 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 
 /* ── WebView2 window ───────────────────────────────────────────────────── */
 
+static BOOL RequestConfigClose(void) {
+    if (strcmp(g_pendingView, "config") != 0 || !g_configViewReady ||
+        !g_webviewView || g_configCloseApproved || g_updateInstallReady) {
+        return FALSE;
+    }
+    // X, Alt+F4 and the system menu all arrive here through WM_CLOSE.
+    // Keep the window alive until the UI saves or explicitly approves closing.
+    webview_execute_script(L"window.onCloseRequested()");
+    return TRUE;
+}
+
 static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     LRESULT frameResult;
     if (FixedFrameMessage(hwnd, msg, wParam, lParam, &g_webviewFrameSize, &frameResult)) {
@@ -9342,6 +9357,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
 
         case WM_CLOSE:
+            if (RequestConfigClose()) return 0;
             g_webviewWindowShown = FALSE;
             KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             if (g_webviewController) {
@@ -9378,6 +9394,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_webviewHwnd = NULL;
             g_webviewWindowShown = FALSE;
             g_configViewReady = FALSE;
+            g_configCloseApproved = FALSE;
             KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             if (g_updateInstallReady && g_hWndMain) {
                 PostMessageW(g_hWndMain, WM_COMMAND, ID_TRAY_EXIT, 0);
@@ -9451,6 +9468,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     FixedFrameInit(g_webviewHwnd, &g_webviewFrameSize);
     g_webviewWindowShown = FALSE;
     g_configViewReady = FALSE;
+    g_configCloseApproved = FALSE;
     SetTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK, WEBVIEW_SHOW_FALLBACK_DELAY_MS, NULL);
 
     WCHAR userDataFolder[MAX_PATH];
@@ -9537,6 +9555,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             StopKeyboardHook();
             CancelScreenCapture("application is exiting");
             /* Close WebView if open */
+            g_configCloseApproved = TRUE;  // Application shutdown must finish synchronously.
             if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
             KillTimer(hWnd, ID_TIMER_HTTP_RECONCILE);
             KillTimer(hWnd, ID_TIMER_CLIPBOARD_RETRY);

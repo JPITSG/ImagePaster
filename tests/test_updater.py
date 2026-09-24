@@ -234,7 +234,7 @@ typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
 
 STOP_STUBS = r'''
 static HWND g_hWndMain = (HWND)1, g_webviewHwnd = (HWND)2;
-static BOOL g_webviewWindowShown, g_configViewReady = TRUE;
+static BOOL g_webviewWindowShown, g_configViewReady = TRUE, g_configCloseApproved;
 static BOOL g_configAutoCheckForUpdates = TRUE;
 static BOOL configOpen = TRUE, cancelSignalled, failPost, failThread;
 static int publishing; /* 1: a result handoff is expected, 2: none */
@@ -394,6 +394,7 @@ static void reset(void) {
     g_updateCheckAbandoned = g_updateQueuedCheck = g_updateQueuedAutomatic = FALSE;
     g_updateProgressPercent = g_updateProgressPosted = 0;
     g_configViewReady = configOpen = TRUE;
+    g_configCloseApproved = FALSE;
     cancelSignalled = failPost = failThread = FALSE;
     threadsStarted = sentResults = progressSent = presented = discarded = 0;
     queued = 0;
