@@ -1,4 +1,4 @@
-# ImagePaster 1.0.45
+# ImagePaster 1.0.46
 
 A Windows system tray utility that makes clipboard images usable in terminal applications such as Xshell, PuTTY, and other SSH clients that cannot forward the Windows image clipboard to a remote CLI.
 
@@ -30,13 +30,14 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Configuration, History and Activity Log windows size themselves to their content, cannot be resized, and have only a Close button
 - In-memory activity log with live updates and one-click clipboard copying (500-entry ring buffer)
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
-- Optional start with Windows at sign-in (per user, no administrator rights needed)
+- Optional start with Windows at sign-in using a per-user elevated interactive task
 - System tray icon with a live status tooltip and context menu
 - Single-instance enforcement
 
 ## Requirements
 
-- **Windows 7+**
+- **Windows 7+ with the Universal C Runtime** (included with Windows 10/11)
+- **Administrator privileges** — requested on manual launch so keyboard hooks, global hotkeys and paste injection work while elevated applications have focus.
 - **Microsoft Edge WebView2 Runtime** — required for the configuration and activity log dialogs. Usually pre-installed on Windows 10/11; can be downloaded from [Microsoft](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
 
 ## How It Works
@@ -57,6 +58,12 @@ A Windows system tray utility that makes clipboard images usable in terminal app
      ```
 
 5. The configured text-paste shortcut is injected so the target application receives the selected representation. Compatibility mode uses Shift+Insert for applications that handle Ctrl+V themselves; disabling it uses standard Ctrl+V re-injection.
+
+ImagePaster runs elevated so administrator windows and elevated window-sharing
+proxies do not block its keyboard hook and registered hotkeys. This applies to
+all of its input handling, including paste injection; it does not change which
+computer owns a key. MonitorBuddy continues to route desktop shortcuts to the
+computer under the pointer, independently of the focused application's owner.
 
 The keyboard hook runs on a dedicated, above-normal-priority input thread,
 separate from image encoding, disk storage, and dialogs. Ordinary keys return
@@ -157,13 +164,18 @@ option is ticked.
 
 ## Building
 
-Requires MinGW-w64 cross-compiler and Node.js (for the frontend build).
+Requires a current MinGW-w64 cross-compiler with the Task Scheduler COM
+interfaces in `taskschd.h`, and Node.js (for the frontend build). Older MinGW
+headers containing only the Task Scheduler enums are insufficient.
 
 ```sh
 make
 ```
 
 This builds the React frontend (`assets/dist/index.html`), compiles resources, and outputs `release/ImagePaster.exe`.
+
+The 1.0.46 release uses GCC 16.2 and the Universal C Runtime. `CC` and `WINDRES`
+can point at that toolchain without replacing an older system compiler.
 
 To build only the frontend:
 
@@ -202,7 +214,7 @@ the prompt keeps editing. Unchanged settings close immediately.
 | Compatibility Paste | `CompatibilityPaste` | REG_DWORD | Enabled |
 | Interactive Print Screen Capture | `ScreenCaptureEnabled` | REG_DWORD | Disabled |
 | Multi-region Gap Fill | `CaptureGapFill` | REG_DWORD | White |
-| Start with Windows | `ImagePaster` (see below) | REG_SZ | Off |
+| Start with Windows | Per-user scheduled task (see below) | — | Off |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | Enabled |
 | Ignored Update Version | `IgnoredUpdateVersion` | REG_SZ | Empty |
 
@@ -216,10 +228,18 @@ are preserved.
 The bind-address menu lists IPv4 addresses on active adapters and includes an **Other** option. If a saved address disappears, such as after a laptop changes networks, ImagePaster retains it, stops the unavailable listener safely, and retries periodically. Selecting a non-loopback address may require a Windows Firewall rule, and the remote machine must be able to route to that address.
 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\ImagePaster`, except
-**Start with Windows**: it adds or removes an `ImagePaster` value under
-`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` that launches
-this executable when you sign in. An entry disabled in Task Manager's startup
-apps shows as off; turning the toggle on re-enables it.
+**Start with Windows**: it creates or removes the scheduled task
+`ImagePaster-Startup-<user SID>`. The task launches this executable at that user's
+sign-in, in their interactive session with highest available privileges. It
+stores no password, does not run as SYSTEM, and has no battery or runtime limit.
+A task disabled in Task Scheduler shows as off; turning the toggle on repairs
+or re-enables it. Manual launches request administrator approval.
+
+On upgrading from the former `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+entry, an enabled entry pointing at this executable migrates automatically. The
+old entry is removed only after task creation succeeds. An entry disabled in
+Task Manager stays off, and another copy's entry is left alone. Existing task
+settings take precedence over the old entry, including a disabled task.
 
 The history limit counts the current image: `1` keeps only the current image,
 `2` keeps it plus one historical image, and so on through `1000`. Selecting
@@ -270,9 +290,12 @@ Native regression checks can run without launching the Windows application:
 `python3 -B -m unittest discover -s tests -v` compiles production hook, updater
 progress and stop handling, History paging and thumbnail, Start with Windows,
 and command-line parsing functions with inert operating-system boundaries
-(requires a host C compiler). Start with Windows tests run the Run entry against
-an in-memory registry: the quoted path, Task Manager's disabled marker, an entry
-left by another copy, case-insensitive paths, and logged failures. Updater tests cover
+(requires a host C compiler). Start with Windows tests cover task migration,
+creation failures, retried legacy cleanup, disabled settings, another copy's
+entry, case-insensitive paths and logged failures. The elevated Windows test
+`tests/windows_startup_task_test.c` exercises the real Task Scheduler API with
+an isolated task name and removes that task afterwards. Run it from a path
+containing spaces and an ampersand to check XML escaping. Updater tests cover
 stopping mid-download or just as a result arrives, stale progress, clicks while
 a stopped check unwinds, closing settings, and lost result messages. History
 tests parse every pushed page and preview as JSON and cover page order and

@@ -7,11 +7,11 @@ WINDRES = x86_64-w64-mingw32-windres
 TARGET = ImagePaster.exe
 RELEASE_DIR = release
 
-OBJ = main.o resources.o
+OBJ = main.o startup_task.o resources.o
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lshell32 -lshlwapi -luser32 -lgdi32 -lmsimg32 -ladvapi32 -lcomctl32 -lcomdlg32 -lole32 -lgdiplus -lws2_32 -liphlpapi -lwinhttp -lversion -lbcrypt -luserenv
+LIBS = -lshell32 -lshlwapi -luser32 -lgdi32 -lmsimg32 -ladvapi32 -lcomctl32 -lcomdlg32 -lole32 -lgdiplus -lws2_32 -liphlpapi -lwinhttp -lversion -lbcrypt -luserenv -loleaut32 -luuid -ltaskschd
 
 .PHONY: all clean assets
 
@@ -24,8 +24,11 @@ $(RELEASE_DIR)/$(TARGET): $(OBJ)
 	@rm -f $(OBJ)
 	@echo "Build complete: $(RELEASE_DIR)/$(TARGET)"
 
-main.o: main.c resource.h
+main.o: main.c resource.h startup_task.h
 	@echo "Compiling main.c..."
+	$(CC) -c $< -o $@ $(CFLAGS)
+
+startup_task.o: startup_task.c startup_task.h
 	$(CC) -c $< -o $@ $(CFLAGS)
 
 resources.o: resources.rc resource.h ImagePaster.manifest assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll

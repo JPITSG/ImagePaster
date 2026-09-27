@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.35.0" processorArchitecture="amd64" name="JPIT.ImagePaster" type="win32"/>
+  <assemblyIdentity version="1.0.46.0" processorArchitecture="amd64" name="JPIT.ImagePaster" type="win32"/>
   <description>ImagePaster</description>
+  <!-- Hooks and registered hotkeys must receive input while administrator
+       windows (including remote-window proxies) own the foreground. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security><requestedPrivileges>
+      <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+    </requestedPrivileges></security>
+  </trustInfo>
   <!-- Per-monitor DPI awareness keeps native window chrome and WebView content
        crisp and correctly sized on scaled and mixed-DPI displays. -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">

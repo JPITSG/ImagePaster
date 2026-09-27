@@ -1,7 +1,6 @@
-"""Run main.c's Start with Windows functions against an in-memory registry.
+"""Run the production startup migration and toggle with inert OS boundaries.
 
-Covers the per-user Run entry and the StartupApproved marker Task Manager uses
-to disable it. Run: python3 -m unittest discover -s tests -v
+Covers per-user task migration, disabled settings, ownership and failures. Run: python3 -m unittest discover -s tests -v
 """
 from pathlib import Path
 import re
@@ -13,13 +12,14 @@ from test_updater import SOURCE, function
 
 
 class StartupTests(unittest.TestCase):
-    def test_run_entry_follows_the_toggle_and_task_manager(self):
+    def test_task_migration_and_toggle(self):
         definitions = '\n'.join(
             re.findall(r'^#define (?:APP_NAME|STARTUP_\w+)\b(?:[^\n]*\\\n)*[^\n]*$',
                        SOURCE, re.MULTILINE))
         production = '\n'.join(function(name) for name in (
-            'GetStartupCommand', 'IsStartWithWindowsEnabled',
-            'SetStartWithWindows', 'ApplyStartWithWindows'))
+            'GetStartupCommand', 'IsLegacyStartWithWindowsEnabled',
+            'RemoveLegacyStartupEntry', 'IsStartWithWindowsEnabled',
+            'SetStartWithWindows', 'MigrateStartWithWindows', 'ApplyStartWithWindows'))
         with tempfile.TemporaryDirectory(prefix='imagepaster-startup-') as directory:
             path = Path(directory)
             (path / 'startup.c').write_text(PREFIX + definitions + '\n' + STUBS +
@@ -65,7 +65,19 @@ STUBS = r'''
 static wchar_t modulePath[400];
 static struct { BOOL present; wchar_t text[400]; } run;
 static struct { BOOL present; BYTE bytes[12]; } approved;
-static int writes, deletes, failCreate;
+static int deletes, failDelete, taskWrites, failWrite, failRead;
+static BOOL taskPresent, taskEnabled;
+static LONG ReadStartupTask(BOOL *present, BOOL *enabled) {
+    *present = taskPresent;
+    *enabled = taskEnabled;
+    return failRead ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+}
+static LONG WriteStartupTask(BOOL enable) {
+    taskWrites++;
+    if (failWrite) return ERROR_ACCESS_DENIED;
+    taskPresent = taskEnabled = enable;
+    return ERROR_SUCCESS;
+}
 static char lastLog[256];
 
 /* MSVCRT's swprintf reads %s as a wide string; glibc spells that %ls. */
@@ -113,37 +125,11 @@ static LONG RegGetValueW(HKEY root, LPCWSTR key, LPCWSTR name, DWORD flags,
     return ERROR_SUCCESS;
 }
 
-static LONG RegCreateKeyExW(HKEY root, LPCWSTR key, DWORD reserved, void *cls,
-                            DWORD options, DWORD access, void *security,
-                            HKEY *result, DWORD *disposition) {
-    (void)reserved; (void)cls; (void)security; (void)disposition;
-    assert(root == HKEY_CURRENT_USER && isRunKey(key));
-    assert(options == REG_OPTION_NON_VOLATILE && access == KEY_SET_VALUE);
-    if (failCreate) return ERROR_ACCESS_DENIED;
-    *result = (HKEY)0x77;
-    return ERROR_SUCCESS;
-}
-
-static LONG RegSetValueExW(HKEY key, LPCWSTR name, DWORD reserved, DWORD type,
-                           const BYTE *data, DWORD size) {
-    (void)reserved;
-    assert(key == (HKEY)0x77 && wcscmp(name, APP_NAME) == 0 && type == REG_SZ);
-    assert(size == (wcslen((const wchar_t *)data) + 1) * sizeof(wchar_t));
-    memcpy(run.text, data, size);
-    run.present = TRUE;
-    writes++;
-    return ERROR_SUCCESS;
-}
-
-static LONG RegCloseKey(HKEY key) {
-    assert(key == (HKEY)0x77);
-    return ERROR_SUCCESS;
-}
-
 static LONG RegDeleteKeyValueW(HKEY root, LPCWSTR key, LPCWSTR name) {
     BOOL *present = isRunKey(key) ? &run.present : &approved.present;
     assert(root == HKEY_CURRENT_USER && wcscmp(name, APP_NAME) == 0);
     assert(isRunKey(key) || isApprovedKey(key));
+    if (failDelete) return ERROR_ACCESS_DENIED;
     deletes++;
     if (!*present) return ERROR_FILE_NOT_FOUND;
     *present = FALSE;
@@ -166,61 +152,75 @@ static void disable_in_task_manager(BYTE state) {
 }
 
 int main(void) {
-    const wchar_t *expected = L"\"C:\\Program Files\\ImagePaster\\ImagePaster.exe\"";
-    int writesBefore, deletesBefore;
-
+    int before;
     wcscpy(modulePath, L"C:\\Program Files\\ImagePaster\\ImagePaster.exe");
-    assert(!IsStartWithWindowsEnabled()); /* off until the user turns it on */
-
-    ApplyStartWithWindows(TRUE); /* the quoted path survives spaces */
-    assert(run.present && wcscmp(run.text, expected) == 0);
-    assert(IsStartWithWindowsEnabled());
-    assert(strcmp(lastLog, "Start with Windows enabled") == 0);
-
-    writesBefore = writes;
-    deletesBefore = deletes;
-    ApplyStartWithWindows(TRUE); /* an unchanged toggle touches nothing */
-    assert(writes == writesBefore && deletes == deletesBefore);
-
-    disable_in_task_manager(3); /* odd first byte: disabled in Task Manager */
     assert(!IsStartWithWindowsEnabled());
-    disable_in_task_manager(2); /* even first byte: enabled again */
-    assert(IsStartWithWindowsEnabled());
-    disable_in_task_manager(3);
-    ApplyStartWithWindows(TRUE); /* turning it on clears the disabled marker */
-    assert(!approved.present && IsStartWithWindowsEnabled());
+    MigrateStartWithWindows();
+    assert(taskWrites == 0); /* initially off stays off */
 
+    run.present = TRUE;
     wcscpy(run.text, L"\"c:\\program files\\imagepaster\\IMAGEPASTER.EXE\"");
-    assert(IsStartWithWindowsEnabled()); /* Windows paths ignore case */
-
+    disable_in_task_manager(3);
+    MigrateStartWithWindows();
+    assert(taskWrites == 0 && run.present); /* respect disabled legacy entry */
     disable_in_task_manager(2);
-    ApplyStartWithWindows(FALSE); /* off removes the entry and the marker */
-    assert(!run.present && !approved.present && !IsStartWithWindowsEnabled());
-    assert(strcmp(lastLog, "Start with Windows disabled") == 0);
-    assert(SetStartWithWindows(FALSE) == ERROR_SUCCESS); /* already off */
+    assert(IsLegacyStartWithWindowsEnabled()); /* case-insensitive path */
+    failWrite = 1;
+    MigrateStartWithWindows();
+    assert(run.present && !taskPresent && deletes == 0);
+    assert(strstr(lastLog, "Could not migrate"));
+    failWrite = 0;
+    failDelete = 1;
+    MigrateStartWithWindows();
+    assert(taskEnabled && run.present); /* create before deleting legacy entry */
+    failDelete = 0;
+    MigrateStartWithWindows(); /* retry cleanup, without recreating the task */
+    assert(taskEnabled && !run.present && !approved.present);
+    before = taskWrites;
+    MigrateStartWithWindows();
+    ApplyStartWithWindows(TRUE);
+    assert(taskWrites == before && IsStartWithWindowsEnabled());
 
-    run.present = TRUE; /* another copy of ImagePaster owns the entry */
+    ApplyStartWithWindows(FALSE);
+    assert(!taskPresent && !IsStartWithWindowsEnabled());
+    assert(!strcmp(lastLog, "Start with Windows disabled"));
+    assert(SetStartWithWindows(FALSE) == ERROR_SUCCESS);
+    ApplyStartWithWindows(TRUE);
+    assert(taskEnabled && !strcmp(lastLog, "Start with Windows enabled"));
+
+    taskEnabled = FALSE; /* manually disabled task (or another copy's action) */
+    run.present = TRUE;
+    before = taskWrites;
+    MigrateStartWithWindows();
+    ApplyStartWithWindows(FALSE);
+    assert(taskWrites == before && taskPresent && run.present);
+    ApplyStartWithWindows(TRUE); /* explicit enable repairs the task */
+    assert(taskEnabled && !run.present);
+
+    taskPresent = taskEnabled = FALSE;
+    run.present = TRUE;
     wcscpy(run.text, L"\"D:\\Tools\\ImagePaster.exe\"");
-    assert(!IsStartWithWindowsEnabled());
-    writesBefore = writes;
-    deletesBefore = deletes;
-    ApplyStartWithWindows(FALSE); /* saving with the toggle off leaves it alone */
-    assert(run.present && writes == writesBefore && deletes == deletesBefore);
-    ApplyStartWithWindows(TRUE); /* turning it on points it at this copy */
-    assert(wcscmp(run.text, expected) == 0 && IsStartWithWindowsEnabled());
+    before = taskWrites;
+    MigrateStartWithWindows();
+    ApplyStartWithWindows(FALSE);
+    assert(taskWrites == before && run.present); /* preserve another copy */
+    ApplyStartWithWindows(TRUE);
+    assert(taskEnabled && run.present);
 
-    run.present = FALSE;
-    failCreate = 1;
-    assert(SetStartWithWindows(TRUE) == ERROR_ACCESS_DENIED);
-    ApplyStartWithWindows(TRUE); /* failures are logged, never hidden */
-    assert(strcmp(lastLog, "WARNING: Could not enable start with Windows (error 5)") == 0);
-    assert(!run.present);
-    failCreate = 0;
+    failRead = 1;
+    before = taskWrites;
+    ApplyStartWithWindows(FALSE);
+    assert(taskWrites == before && taskEnabled && strstr(lastLog, "Could not disable"));
+    MigrateStartWithWindows();
+    assert(taskWrites == before && strstr(lastLog, "Could not migrate"));
+    failRead = 0;
+    failWrite = 1;
+    ApplyStartWithWindows(FALSE);
+    assert(taskEnabled && strstr(lastLog, "Could not disable"));
 
     for (int i = 0; i < MAX_PATH + 20; i++) modulePath[i] = L'x';
-    modulePath[MAX_PATH + 20] = L'\0'; /* a path Windows would truncate */
-    assert(!IsStartWithWindowsEnabled());
-    assert(SetStartWithWindows(TRUE) == ERROR_BAD_PATHNAME && !run.present);
+    modulePath[MAX_PATH + 20] = L'\0';
+    assert(!IsLegacyStartWithWindowsEnabled()); /* truncated paths never migrate */
     return 0;
 }
 '''

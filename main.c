@@ -54,6 +54,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "resource.h"
+#include "startup_task.h"
 
 /* ── GDI+ flat API declarations ─────────────────────────────────────────── */
 
@@ -198,8 +199,8 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.45"
-#define APP_VERSION_W     L"1.0.45"
+#define APP_VERSION_A     "1.0.46"
+#define APP_VERSION_W     L"1.0.46"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
@@ -3294,9 +3295,8 @@ static void SaveConfigToRegistry(void)
 
 /* ── Start with Windows ────────────────────────────────────────────────── */
 
-/* A per-user Run entry launches this executable at sign-in. Task Manager and
-   Settings can disable that entry without deleting it (odd first byte of its
-   StartupApproved value), so a disabled entry counts as off. */
+/* Older releases used a Run entry. Respect Task Manager's disabled marker
+   when migrating it, and leave entries belonging to other copies alone. */
 
 static BOOL GetStartupCommand(wchar_t *command, size_t commandCch)
 {
@@ -3306,7 +3306,7 @@ static BOOL GetStartupCommand(wchar_t *command, size_t commandCch)
     return swprintf(command, commandCch, L"\"%s\"", path) > 0;
 }
 
-static BOOL IsStartWithWindowsEnabled(void)
+static BOOL IsLegacyStartWithWindowsEnabled(void)
 {
     wchar_t expected[MAX_PATH + 2];
     wchar_t actual[MAX_PATH + 2];
@@ -3329,44 +3329,58 @@ static BOOL IsStartWithWindowsEnabled(void)
     return (approved[0] & 1) == 0;
 }
 
-static LONG SetStartWithWindows(BOOL enable)
+static LONG RemoveLegacyStartupEntry(void)
 {
-    LONG result;
-
-    if (enable) {
-        wchar_t command[MAX_PATH + 2];
-        HKEY key;
-        if (!GetStartupCommand(command, sizeof(command) / sizeof(wchar_t))) {
-            return ERROR_BAD_PATHNAME;
-        }
-        result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, 0, NULL,
-                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL,
-                                 &key, NULL);
-        if (result != ERROR_SUCCESS) return result;
-        result = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)command,
-                                (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
-        RegCloseKey(key);
-    } else {
-        result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME);
-        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
-    }
+    LONG result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME);
+    if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
     if (result != ERROR_SUCCESS) return result;
-
-    /* Drop any disabled marker so turning the option on takes effect and
-       turning it off leaves nothing behind. */
     result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY_W,
                                 APP_NAME);
     return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
 }
 
-/* Only a changed toggle touches the Run entry, so an entry for another copy
-   of the executable is left alone unless the user turns this on. */
+/* The executable requests elevation so its hooks, hotkeys and paste injection
+   also work over administrator windows and elevated keyboard-sharing proxies.
+   Windows skips elevated programs in Run: sign-in therefore uses a per-user
+   highest-privilege interactive task, never a stored password or SYSTEM. */
+static BOOL IsStartWithWindowsEnabled(void)
+{
+    BOOL present = FALSE, enabled = FALSE;
+    if (ReadStartupTask(&present, &enabled) != ERROR_SUCCESS) return FALSE;
+    return enabled;
+}
+
+static LONG SetStartWithWindows(BOOL enable)
+{
+    LONG result = WriteStartupTask(enable);
+    if (result != ERROR_SUCCESS) return result;
+    /* A task must exist before an enabled legacy entry is removed. Another
+       copy's Run entry is never part of this migration. */
+    if (IsLegacyStartWithWindowsEnabled())
+        result = RemoveLegacyStartupEntry();
+    return result;
+}
+
+static void MigrateStartWithWindows(void)
+{
+    BOOL present = FALSE, enabled = FALSE;
+    LONG result = ReadStartupTask(&present, &enabled);
+    if (result == ERROR_SUCCESS && !present && IsLegacyStartWithWindowsEnabled())
+        result = SetStartWithWindows(TRUE);
+    else if (result == ERROR_SUCCESS && enabled && IsLegacyStartWithWindowsEnabled())
+        result = RemoveLegacyStartupEntry();
+    if (result != ERROR_SUCCESS)
+        LogMessage("WARNING: Could not migrate start with Windows (error %ld)", result);
+}
+
+/* Saving an unchanged toggle does not overwrite another copy's task or undo
+   a task that the user disabled in Task Scheduler. */
 static void ApplyStartWithWindows(BOOL enable)
 {
-    LONG result;
-
-    if (enable == IsStartWithWindowsEnabled()) return;
-    result = SetStartWithWindows(enable);
+    BOOL present = FALSE, enabled = FALSE;
+    LONG result = ReadStartupTask(&present, &enabled);
+    if (result == ERROR_SUCCESS && enable == enabled) return;
+    if (result == ERROR_SUCCESS) result = SetStartWithWindows(enable);
     if (result != ERROR_SUCCESS) {
         LogMessage("WARNING: Could not %s start with Windows (error %ld)",
                    enable ? "enable" : "disable", result);
@@ -6918,9 +6932,9 @@ static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
         return ERROR_BAD_EXE_FORMAT;
     }
 
-    // The helper is elevated only for file replacement. Preserve a primary
-    // token from the original process so the restarted launcher normally
-    // returns to the user's non-elevated session.
+    // Preserve a primary token from the original process before replacement
+    // so the restarted launcher normally
+    // returns to the same user and interactive session, retaining elevation.
     HANDLE launchToken = DuplicateUpdateLaunchToken(oldProcess);
 
     // Only let the parent exit once this helper has verified every path and
@@ -9858,6 +9872,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     LogMessage("ImagePaster %s started", APP_VERSION_A);
     LogMessage("GDI+ initialized");
+    MigrateStartWithWindows();
     LogMessage("Title match keywords: %s", g_configTitleMatch);
     LogMessage("Paste method: %s", g_configPasteMethod == PASTE_METHOD_HTTP ? "HTTP" : "base64");
     LogMessage("Text paste shortcut: %s",
