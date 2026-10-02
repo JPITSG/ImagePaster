@@ -199,9 +199,12 @@ GpStatus __stdcall GdipMeasureString(GpGraphics *graphics, const WCHAR *text,
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define APP_NAME          L"ImagePaster"
-#define APP_VERSION_A     "1.0.46"
-#define APP_VERSION_W     L"1.0.46"
+#define APP_VERSION_A     "1.0.47"
+#define APP_VERSION_W     L"1.0.47"
 #define MUTEX_NAME        L"ImagePaster_SingleInstance"
+#define ID_TIMER_TRAY_RETRY 1011
+#define TRAY_RETRY_MS 2000
+
 #define WM_TRAYICON       (WM_USER + 1)
 #define WM_DO_PASTE       (WM_APP + 1)
 #define WM_HTTP_EVENT      (WM_APP + 2)
@@ -356,6 +359,13 @@ static ULONG_PTR g_gdipToken;
 static HANDLE    g_hMutex;
 static HICON     g_hAppIcon;
 static NOTIFYICONDATAW g_nid;
+static UINT g_WM_TASKBARCREATED = 0;
+static BOOL g_trayActive = FALSE;
+static BOOL g_trayRegistered = FALSE;
+static BOOL g_trayRetryPending = FALSE;
+static void PublishTrayIcon(void);
+static void StopTrayRegistration(void);
+static void RegisterTaskbarMessage(HWND hwnd);
 static HMENU     g_hMenu;
 
 static BOOL g_writingClipboardText = FALSE;
@@ -5901,6 +5911,55 @@ static BOOL IsPasteRequestCurrent(HWND target, DWORD clipboardSequence)
 
 /* ── System tray icon ──────────────────────────────────────────────────── */
 
+/* All registration state belongs to the window thread. Keep the latest icon
+ * and tooltip even while Explorer is absent; retry only until it accepts them. */
+static void PublishTrayIcon(void) {
+    if (!g_trayActive || !g_nid.hWnd) return;
+    NOTIFYICONDATAW data = g_nid;
+    /* Tooltip/icon-only updates must never turn a later ADD into a partial one. */
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    BOOL wasRegistered = g_trayRegistered;
+    DWORD command = wasRegistered ? NIM_MODIFY : NIM_ADD;
+    BOOL accepted = Shell_NotifyIconW(command, &data);
+    /* A rebuilt taskbar can either retain or discard our old identity. */
+    if (!accepted) {
+        accepted = Shell_NotifyIconW(wasRegistered ? NIM_ADD : NIM_MODIFY, &data);
+    }
+    g_trayRegistered = accepted;
+    if (accepted) {
+        if (!wasRegistered) LogMessage("Tray icon registered");
+        KillTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY);
+        g_trayRetryPending = FALSE;
+    } else if (!g_trayRetryPending) {
+        LogMessage("Tray registration failed; retrying when Explorer is ready");
+        g_trayRetryPending = SetTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY,
+                                      TRAY_RETRY_MS, NULL) != 0;
+        if (!g_trayRetryPending) LogMessage("Could not start tray registration retry timer");
+    }
+}
+
+static void StopTrayRegistration(void) {
+    BOOL wasActive = g_trayActive;
+    /* KillTimer does not remove an already queued WM_TIMER. */
+    g_trayActive = FALSE;
+    g_trayRegistered = FALSE;
+    g_trayRetryPending = FALSE;
+    if (g_nid.hWnd) {
+        KillTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY);
+        if (wasActive) Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    }
+}
+
+static void RegisterTaskbarMessage(HWND hwnd) {
+    g_WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+    /* An elevated app must also receive the unelevated shell's broadcast.
+     * Resolve dynamically for SDKs targeting Windows Vista. */
+    typedef BOOL (WINAPI *FilterFn)(HWND, UINT, DWORD, void*);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    FilterFn allow = user32 ? (FilterFn)(void*)GetProcAddress(user32, "ChangeWindowMessageFilterEx") : NULL;
+    if (g_WM_TASKBARCREATED && allow) allow(hwnd, g_WM_TASKBARCREATED, 1 /* MSGFLT_ALLOW */, NULL);
+}
+
 static void InitTrayIcon(HWND hwnd)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -5911,7 +5970,8 @@ static void InitTrayIcon(HWND hwnd)
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = g_hAppIcon;
     wcscpy(g_nid.szTip, L"ImagePaster");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_trayActive = TRUE;
+    PublishTrayIcon();
 }
 
 static void UpdateTooltip(void)
@@ -5978,7 +6038,7 @@ static void UpdateTooltip(void)
              prefix, titleMatch, suffix);
     g_nid.szTip[tipCapacity - 1] = L'\0';
     g_nid.uFlags = NIF_TIP;
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    PublishTrayIcon();
 }
 
 static void CreateContextMenu(void)
@@ -9516,6 +9576,15 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (g_WM_TASKBARCREATED != 0 && msg == g_WM_TASKBARCREATED) {
+        g_trayRegistered = FALSE;
+        PublishTrayIcon();
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == ID_TIMER_TRAY_RETRY) {
+        if (g_trayRetryPending) PublishTrayIcon();
+        return 0;
+    }
     switch (msg) {
     case WM_TRAYICON:
         if (lParam == WM_LBUTTONDBLCLK) {
@@ -9565,6 +9634,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             ShowWebViewDialog("config", 560, 520);
             break;
         case ID_TRAY_EXIT:
+            StopTrayRegistration();
             LogMessage("User selected Exit");
             StopKeyboardHook();
             CancelScreenCapture("application is exiting");
@@ -9583,7 +9653,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             StopHistoryThumbnailWorker();
             if (fnRemoveClipboardFormatListener) fnRemoveClipboardFormatListener(hWnd);
             StopHttpServer();
-            Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hAppIcon) DestroyIcon(g_hAppIcon);
             if (g_hMenu) DestroyMenu(g_hMenu);
             DestroyImageCache();
@@ -9780,6 +9849,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_DESTROY:
+        StopTrayRegistration();
         PostQuitMessage(0);
         return 0;
     }
@@ -9856,9 +9926,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
 
-    /* Create hidden message window */
-    g_hWndMain = CreateWindowExW(0, L"ImagePasterMsgClass", L"ImagePaster", 0,
-                                  0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    /* Hidden top-level window receives TaskbarCreated broadcasts. */
+    g_hWndMain = CreateWindowExW(WS_EX_TOOLWINDOW, L"ImagePasterMsgClass", L"ImagePaster", 0,
+                                  0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!g_hWndMain) {
         MessageBoxW(NULL, L"Failed to create message window.", APP_NAME, MB_OK | MB_ICONERROR);
         GdiplusShutdown(g_gdipToken);
@@ -9866,6 +9936,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     /* System tray */
+    RegisterTaskbarMessage(g_hWndMain);
     InitTrayIcon(g_hWndMain);
     CreateContextMenu();
     UpdateTooltip();

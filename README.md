@@ -32,6 +32,7 @@ A Windows system tray utility that makes clipboard images usable in terminal app
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\ImagePaster`)
 - Optional start with Windows at sign-in using a per-user elevated interactive task
 - System tray icon with a live status tooltip and context menu
+- Tray icon registration retries while Explorer is starting and recovers automatically after an Explorer restart, preserving the current icon and tooltip; retries stop as soon as registration succeeds
 - Single-instance enforcement
 
 ## Requirements
@@ -357,6 +358,13 @@ replacement, relaunch, or real WIC decoding.
 └── release/
     └── ImagePaster.exe       # Built executable
 ```
+
+## Tray recovery checks
+
+Tray startup/recovery regression checks: `python3 tests/test_tray_registration.py`.
+These simulate delayed Explorer readiness, taskbar recreation, current icon/tooltip
+recovery, and shutdown with a retry already queued; a live sign-in/restart smoke
+test requires Windows.
 
 ## License
 
